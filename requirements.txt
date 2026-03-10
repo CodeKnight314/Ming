@@ -1,0 +1,9 @@
+# Ming dependencies - minimal set for migrated tools
+httpx
+langchain-core
+langchain-openrouter
+python-dotenv
+pytz
+requests
+tavily-python
+trafilatura

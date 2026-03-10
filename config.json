@@ -1,0 +1,73 @@
+{
+  "redis": {
+    "hostname": "localhost",
+    "port": 6379
+  },
+  "scout": {
+    "model": {
+      "provider": "openrouter",
+      "model_name": "qwen/qwen3.5-flash-02-23",
+      "temperature": 0.2,
+      "max_tokens": 512
+    },
+    "max_new_tokens": 512,
+    "temperature": 0.2,
+    "do_sample": false,
+    "use_cache": true,
+    "min_query_count": 3,
+    "max_query_count": 5,
+    "max_results_per_query": 3,
+    "max_landscape_results": 10,
+    "tool_configs": [
+      {
+        "type": "web_search_tool",
+        "max_results": 10,
+        "search_depth": "basic",
+        "topic": "general",
+        "include_raw_content": false
+      }
+    ]
+  },
+  "subagent": {
+    "model": {
+      "provider": "openrouter",
+      "model_name": "qwen/qwen3.5-flash-02-23",
+      "temperature": 0.7,
+      "max_tokens": 1024
+    },
+    "max_new_tokens": 1024,
+    "temperature": 0.7,
+    "do_sample": true,
+    "use_cache": true,
+    "max_context_len": 4096,
+    "min_query_count": 1,
+    "max_query_count": 4,
+    "max_iterations": 5,
+    "tool_configs": [
+      {
+        "type": "web_search_tool",
+        "max_results": 30,
+        "search_depth": "basic",
+        "topic": "general",
+        "include_raw_content": false
+      },
+      {
+        "type": "open_url_tool",
+        "name": "open_url_tool"
+      },
+      {
+        "type": "think_tool",
+        "model_config": {
+          "provider": "openrouter",
+          "model_name": "qwen/qwen3.5-flash-02-23",
+          "temperature": 0.7,
+          "max_tokens": 384
+        },
+        "max_new_tokens": 384,
+        "temperature": 0.7,
+        "do_sample": false,
+        "use_cache": true
+      }
+    ]
+  }
+}

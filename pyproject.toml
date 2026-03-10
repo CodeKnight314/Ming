@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ming"
+version = "0.1.0"
+description = "Ming: Agentic solution migrated from Coolie"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx",
+    "redis",
+    "langchain-core",
+    "langgraph",
+    "langchain-openrouter",
+    "python-dotenv",
+    "pytz",
+    "requests",
+    "tavily-python",
+    "trafilatura",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ming*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: marks tests that hit external URLs (deselect with -m 'not integration')",
+]
