@@ -9,6 +9,7 @@ from typing import List, Union
 from ming.extraction.ner_module import Chunk, Entity, NERModule
 from ming.extraction.re_module import REModule, RERunResult, REUsage, Relationship
 from ming.models import OpenRouterModelConfig
+from ming.extraction.selection_policy import calculate_source_score, calculate_entity_density
 
 
 @dataclass
@@ -103,12 +104,14 @@ class NERREPipeline:
 
     def run(self, text: str) -> PipelineResult:
         chunks = self.ner.run(text)
+        densities = calculate_entity_density(chunks)
+        source_score = calculate_source_score(densities)
         entities = [e for c in chunks for e in c.entities]
 
         # Filter to chunks that have entities (skip empty chunks for RE)
         chunks_with_entities = [c for c in chunks if c.entities]
 
-        if not chunks_with_entities:
+        if not chunks_with_entities or source_score < 4.5:
             return PipelineResult(
                 entities=entities,
                 relationships=[],
@@ -117,7 +120,7 @@ class NERREPipeline:
             )
 
         max_workers = min(self.max_workers, len(chunks_with_entities))
-        results_by_chunk: dict[int, ChunkExtraction] = {}
+        results_by_chunk = {}
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
