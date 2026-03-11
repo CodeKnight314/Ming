@@ -1,11 +1,13 @@
 import json
 import logging
 import re
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Union
 
+from json_repair import repair_json
 from ming.models import create_model_from_spec, OpenRouterModelConfig
 
 logger = logging.getLogger(__name__)
@@ -103,7 +105,7 @@ class REModule:
 
     def _parse_json_response(self, response: str, input_prompt: str = "") -> List[dict]:
         """Parse JSON from model response, stripping markdown fences if present.
-        Handles truncated or malformed output by attempting recovery or returning []."""
+        Uses json-repair for malformed output; returns [] if repair fails."""
         text = response.strip()
         fence_match = re.search(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", text, re.DOTALL)
         if fence_match:
@@ -113,36 +115,42 @@ class REModule:
             raw = json.loads(text)
             return raw if isinstance(raw, list) else []
         except json.JSONDecodeError as e:
-            logger.warning("JSON parse failed (%s), attempting recovery", e)
-            recovered = self._try_recover_truncated_json(text, e)
-            if recovered is not None:
-                return recovered
-            logger.warning("JSON recovery failed, returning empty list")
-            self._write_json_error(input_prompt, response, e)
-            return []
+            salvaged = self._salvage_truncated_array(response)
+            if salvaged is not None:
+                return salvaged
 
-    def _try_recover_truncated_json(self, text: str, error: json.JSONDecodeError) -> List[dict] | None:
-        """Try to salvage partial results from truncated JSON (e.g. hit max_tokens)."""
-        # Find last complete object boundary: "},{" indicates two complete objects
-        last_boundary = text.rfind("},{")
-        if last_boundary >= 0:
-            # Truncate after the first complete object, close the array
-            truncated = text[: last_boundary + 1] + "]"
             try:
-                raw = json.loads(truncated)
+                raw = repair_json(text, return_objects=True)
                 return raw if isinstance(raw, list) else []
-            except json.JSONDecodeError:
-                pass
-        # Try extracting just the first complete object
-        first_obj_end = text.find("}")
-        if first_obj_end >= 0 and text.strip().startswith("["):
-            truncated = text[: first_obj_end + 1] + "]"
+            except (json.JSONDecodeError, Exception) as repair_err:
+                logger.warning("json-repair failed (%s), returning empty list", repair_err)
+                self._write_json_error(input_prompt, response, e)
+                return []
+
+    def _salvage_truncated_array(self, response: str) -> list[dict] | None:
+        if not response:
+            return None
+
+        start = response.find("[")
+        if start == -1:
+            return None
+
+        array_text = response[start:]
+
+        last_good: list[dict] | None = None
+        for idx, ch in enumerate(array_text):
+            if ch != "}":
+                continue
+            prefix = array_text[: idx + 1]
+            candidate = prefix + "]"
             try:
-                raw = json.loads(truncated)
-                return raw if isinstance(raw, list) else []
+                parsed = json.loads(candidate)
+                if isinstance(parsed, list):
+                    last_good = parsed
             except json.JSONDecodeError:
-                pass
-        return None
+                continue
+
+        return last_good
 
     def _extract_usage(self, metadata: dict[str, Any] | None) -> REUsage:
         if not metadata:
