@@ -1,5 +1,6 @@
 # Ming dependencies - minimal set for migrated tools
 httpx
+json-repair
 langchain-core
 langchain-openrouter
 python-dotenv
@@ -7,3 +8,5 @@ pytz
 requests
 tavily-python
 trafilatura
+numpy
+sentence-transformers
