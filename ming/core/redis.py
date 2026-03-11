@@ -1,17 +1,19 @@
 import redis
 from dataclasses import dataclass
 from uuid import uuid4
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 _URL_INDEX_PREFIX = "url:"
 _URL_LOCK_PREFIX = "url:lock:"
 _URL_LOCK_TTL = 120  # seconds
+_QUERIES_PREFIX = "queries:"
 
 
 @dataclass
 class RedisDatabaseConfig:
     hostname: str
     port: int
+    db: int = 0
 
 
 class RedisDatabase:
@@ -19,6 +21,7 @@ class RedisDatabase:
         self.client = redis.Redis(
             host=config.hostname,
             port=config.port,
+            db=config.db,
             decode_responses=True,
         )
         self.config = config
@@ -54,4 +57,49 @@ class RedisDatabase:
         self.client.delete(_URL_LOCK_PREFIX + url)
 
     def close(self):
+        self.client.close()
+
+
+@dataclass
+class QueryStoreConfig:
+    """Config for QueryStore. Uses a separate Redis DB or instance to store search queries."""
+    hostname: str
+    port: int
+    db: int = 1
+
+
+class QueryStore:
+    """Stores search queries per topic. Used to avoid repeating queries and to provide context for generation."""
+
+    def __init__(self, config: QueryStoreConfig):
+        self.client = redis.Redis(
+            host=config.hostname,
+            port=config.port,
+            db=config.db,
+            decode_responses=True,
+        )
+        self.config = config
+
+    def _key(self, topic: str) -> str:
+        return _QUERIES_PREFIX + topic.strip().lower()
+
+    def add_queries(self, topic: str, queries: List[str]) -> None:
+        """Add queries to the store for a topic. Deduplicates automatically."""
+        if not topic or not queries:
+            return
+        key = self._key(topic)
+        for q in queries:
+            q_clean = (q or "").strip()
+            if q_clean:
+                self.client.sadd(key, q_clean)
+
+    def get_queries(self, topic: str) -> List[str]:
+        """Return all stored queries for a topic."""
+        if not topic:
+            return []
+        key = self._key(topic)
+        members = self.client.smembers(key)
+        return sorted(members) if members else []
+
+    def close(self) -> None:
         self.client.close()

@@ -8,12 +8,18 @@ Your job is to quickly orient the system to the topic before deeper planning beg
 
 User topic:
 {topic}
+{previous_queries_section}
 
 Generate {query_count} short, broad web search queries that:
 - repair obvious typos or malformed wording in the user topic when needed
 - identify the primary entity/topic the user likely means
 - map the main angles, themes, or current landscape of the topic
+- cover truly diverse subtopics (not variations of the same query)
 - avoid overly narrow or prematurely detailed framing
+- do NOT repeat any query already listed above, and do NOT generate queries that are semantically similar to them (e.g., paraphrases, near-synonyms, or rewordings that ask the same thing)
+
+Search rules: NEVER pass a URL as a query. Write self-contained queries—each must make sense on its own as a web search.
+When the topic is in a non-English language, include at least half of your queries in that language.
 
 Wrap each query in <query>...</query> tags.
 """
@@ -30,13 +36,27 @@ Scout search evidence:
 
 Write a compact scout brief that helps a planner decide what to research next.
 Return structured text with exactly these sections:
+
+TASK_ANALYSIS:
+- User intent, explicit requirements, implicit requirements, out of scope, language
+
 LIKELY_TOPIC:
+- Primary entity/topic the user likely means
+
 AMBIGUITIES:
+- Terms that sources define differently; unstated assumptions; where sources disagree
+
 LANDSCAPE:
+- Main angles, themes, dimensions; source richness per area (abundant vs thin vs vendor-heavy)
+
 FOLLOW_UP_AREAS:
+- Gaps, tensions, or angles that need deeper research
+
 REPRESENTATIVE_SOURCES:
+- Notable sources found (title, URL)
 
 Keep it concise and operational. Do not write a final answer to the user.
+Match the language of the user topic in your output.
 """
 
 GENERATE_QUERIES_PROMPT = """
@@ -50,17 +70,28 @@ Topic: {topic}
 
 Generate {min_queries}-{max_queries} distinct search queries. {guidance}
 Use the scout brief to widen or clarify coverage before going deep.
+Vary query types: factual (numbers, data), causal (why, mechanisms), comparative (X vs Y), critical (limitations, failures), trend (recent changes, predictions).
+Each query must be self-contained—it will run as a web search with no additional context.
+Do NOT repeat or semantically duplicate any query already listed above—avoid paraphrases, near-synonyms, or rewordings that ask the same thing.
+
+Search rules: NEVER pass a URL as a query. Write self-contained queries. When the topic is non-English, include queries in that language.
 Wrap them in <query>...</query> tags for each distinct query.
 """
 
 THINK_PROMPT = """
 You are a research assistant. Synthesize the following retrieved content into a coherent, well-structured answer.
-Use the evidence to support your claims and cite sources when relevant.
 
 Retrieved content:
 {context}
 
-Provide a clear, comprehensive response based on the evidence above.
+Synthesis guidelines:
+- Use evidence to support your claims. Cite sources inline as [1], [2], [3] and end with a ## Sources section listing [N] Title: URL.
+- Reconcile conflicting information: when sources disagree, present both and assess credibility (methodology, recency, authority).
+- Explain significance: why does a number matter, what does a trend imply, how does it compare to expectations?
+- Write in flowing analytical paragraphs. No self-referential language ("I found", "My research"). No meta-commentary.
+- Match the language of the topic in your output.
+
+Provide a clear, comprehensive synthesis based on the evidence above.
 """
 
 DECISION_PROMPT = """
@@ -69,6 +100,10 @@ Decide whether to continue searching or stop.
 
 Your prior synthesis and findings:
 {history}
+
+For each major requirement or angle of the topic, consider: SATISFIED / PARTIALLY / UNSATISFIED.
+- If critical gaps remain (UNSATISFIED or important PARTIALLY), continue.
+- If coverage is sufficient to answer the research question, stop.
 
 Base your decision on the TOPIC and SUBSTANCE only:
 - Are there gaps in topic coverage, contradictions, or missing angles that need more evidence?
