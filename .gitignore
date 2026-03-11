@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+artifacts/
+ai_q_prompts/
+re_json_errors/

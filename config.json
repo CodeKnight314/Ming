@@ -3,6 +3,10 @@
     "hostname": "localhost",
     "port": 6379
   },
+  "queries_redis": {
+    "hostname": "localhost",
+    "port": 6380
+  },
   "scout": {
     "model": {
       "provider": "openrouter",
