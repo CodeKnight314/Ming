@@ -18,7 +18,7 @@ from ming.core.prompts import (
     GENERATE_QUERIES_PROMPT,
     THINK_PROMPT,
 )
-from ming.core.redis import RedisDatabase
+from ming.core.redis import QueryStore, RedisDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +44,16 @@ class ResearchSubagentState(TypedDict, total=False):
 class ResearchSubagent:
     _MIN_CONTEXT_CHARS = 200
 
-    def __init__(self, config: ResearchSubagentConfig, database: RedisDatabase):
-        
+    def __init__(
+        self,
+        config: ResearchSubagentConfig,
+        database: RedisDatabase,
+        query_store: QueryStore | None = None,
+    ):
         self.model = create_model_from_spec(config.get("model"))
-    
         self.config = config
         self.database = database
+        self.query_store = query_store
 
         self._tool_map = {}
         for tool_config in (config.get("tool_configs") or []):
@@ -118,10 +122,19 @@ class ResearchSubagent:
         else:
             scout_section = ""
 
-        if all_queries:
+        previous_queries_list = list(all_queries)
+        if self.query_store:
+            stored = self.query_store.get_queries(topic)
+            seen = set(q.lower() for q in previous_queries_list)
+            for q in stored:
+                if q.lower() not in seen:
+                    seen.add(q.lower())
+                    previous_queries_list.append(q)
+
+        if previous_queries_list:
             previous_queries_section = (
                 "Queries already run (avoid repeating; fill gaps or explore new angles):\n"
-                + "\n".join(f"- {q}" for q in all_queries)
+                + "\n".join(f"- {q}" for q in previous_queries_list)
                 + "\n\n"
             )
         else:
@@ -256,6 +269,11 @@ class ResearchSubagent:
         self.statistics["total_searches"] += len(queries)
         self.statistics["total_queries"] += len(queries)
 
+        if self.query_store:
+            topic = state.get("topic", "")
+            if topic:
+                self.query_store.add_queries(topic, queries)
+
         new_context_ids = []
         if web_results:
             with ThreadPoolExecutor(max_workers=max(1, len(web_results))) as executor:
@@ -284,6 +302,7 @@ class ResearchSubagent:
     def _think(self, state: ResearchSubagentState) -> Dict[str, Any]:
         context_ids = state.get("context_ids") or []
         all_queries = state.get("all_queries") or []
+        topic = state.get("topic", "")
         max_context_len = self.config.get("max_context_len", 4096)
 
         if not context_ids:
@@ -294,9 +313,19 @@ class ResearchSubagent:
 
         context_parts = []
 
-        if all_queries:
+        queries_for_context = list(all_queries)
+        if self.query_store and topic:
+            stored = self.query_store.get_queries(topic)
+            seen = set(q.lower() for q in queries_for_context)
+            for q in stored:
+                if q.lower() not in seen:
+                    seen.add(q.lower())
+                    queries_for_context.append(q)
+
+        if queries_for_context:
             context_parts.append(
-                "Queries run so far:\n" + "\n".join(f"- {q}" for q in all_queries)
+                "Queries run so far (including prior sessions):\n"
+                + "\n".join(f"- {q}" for q in queries_for_context)
             )
 
         with ThreadPoolExecutor(max_workers=max(1, len(context_ids))) as executor:
@@ -578,10 +607,8 @@ class ResearchSubagent:
         return self.statistics
 
 if __name__ == "__main__":
-    from ming.core.config import load_config, create_redis_from_config
-    config = load_config()
-    database = create_redis_from_config(config)
-    subagent = ResearchSubagent(config.get("subagent"), database)
+    from ming.core.config import create_subagent_from_config
+    subagent = create_subagent_from_config()
     topic = "Sino-Soviet relations in the 1960s"
     result = subagent.run(topic)
     print(result)

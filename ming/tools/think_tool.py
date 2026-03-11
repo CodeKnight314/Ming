@@ -32,15 +32,19 @@ class ThinkTool(BaseTool):
         }
 
         self.system_prompt = """
-        Stop and think. Do not summarize or report. Reason over what you have done so far in relation to the query.
+        Synthesize the retrieved content below into a coherent research synthesis.
 
-        Before planning or acting, take a moment to genuinely reflect:
+        Reflect on:
         - What is the core question or goal?
-        - What assumptions am I making? Are they valid?
-        - What alternative approaches or angles have I not considered?
-        - If I'm stuck, what would help me get unstuck?
+        - Where do findings agree or disagree? Reconcile conflicts with methodology/recency/authority.
+        - What mechanisms or causes explain the facts?
+        - What patterns emerge across sources? What gaps remain?
 
-        Think step by step. Challenge your own reasoning. Only after this reflection should you decide what to do next.
+        Output guidelines:
+        - Cite sources inline as [1], [2], [3]. End with ## Sources listing [N] Title: URL.
+        - Explain significance: why numbers matter, what trends imply.
+        - Write in flowing paragraphs. No self-referential language. Match the topic language.
+        - Produce synthesis that informs whether more research is needed.
 
         Current context: {context}
         """

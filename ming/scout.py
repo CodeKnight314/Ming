@@ -1,9 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import re
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 from ming.core.prompts import SCOUT_QUERY_PROMPT, SCOUT_SUMMARY_PROMPT
+from ming.core.redis import QueryStore
 from ming.models import create_model_from_spec
 from ming.tools import create_tool_from_spec
 
@@ -31,9 +32,14 @@ class ScoutResult(TypedDict, total=False):
 
 
 class ScoutSubagent:
-    def __init__(self, config: ScoutSubagentConfig):
+    def __init__(
+        self,
+        config: ScoutSubagentConfig,
+        query_store: Optional[QueryStore] = None,
+    ):
         self.config = config
         self.model = create_model_from_spec(config.get("model"))
+        self.query_store = query_store
 
         self._tool_map = {}
         for tool_config in (config.get("tool_configs") or []):
@@ -81,8 +87,19 @@ class ScoutSubagent:
         min_q = max(1, int(self.config.get("min_query_count", 3)))
         max_q = max(min_q, int(self.config.get("max_query_count", 5)))
 
+        previous_queries_section = ""
+        if self.query_store:
+            stored = self.query_store.get_queries(topic)
+            if stored:
+                previous_queries_section = (
+                    "\nQueries already run for this topic (avoid repeating):\n"
+                    + "\n".join(f"- {q}" for q in stored)
+                    + "\n\n"
+                )
+
         prompt = SCOUT_QUERY_PROMPT.format(
             topic=topic,
+            previous_queries_section=previous_queries_section,
             query_count=max_q,
         )
         response = self.model.generate(
@@ -159,6 +176,9 @@ class ScoutSubagent:
             ),
             **self._generation_kwargs(max_new_tokens=512),
         ).strip()
+
+        if self.query_store:
+            self.query_store.add_queries(topic, queries)
 
         return {
             "topic": topic,
