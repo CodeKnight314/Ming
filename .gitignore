@@ -4,3 +4,5 @@ __pycache__/
 artifacts/
 ai_q_prompts/
 re_json_errors/
+scripts/
+.DS_Store
