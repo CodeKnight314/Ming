@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from threading import local
 from typing import List, Union
 
-from ming.extraction.ner_module import Entity, NERModule
+from ming.extraction.ner_module import Chunk, Entity, NERModule
 from ming.extraction.re_module import REModule, RERunResult, REUsage, Relationship
 from ming.models import OpenRouterModelConfig
 
@@ -20,10 +20,22 @@ class SentenceExtraction:
 
 
 @dataclass
+class ChunkExtraction:
+    """RE extraction result for a single chunk."""
+
+    chunk_text: str
+    start: int
+    end: int
+    entities: List[Entity]
+    relationships: List[Relationship]
+    usage: REUsage
+
+
+@dataclass
 class PipelineResult:
     entities: List[Entity]
     relationships: List[Relationship]
-    sentence_extractions: List[SentenceExtraction]
+    chunk_extractions: List[ChunkExtraction]
     usage: REUsage
 
     def to_dict(self) -> dict:
@@ -49,29 +61,26 @@ class NERREPipeline:
             self._re_local.module = module
         return module
 
-    def _group_entities_by_sentence(self, entities: List[Entity]) -> List[SentenceExtraction]:
-        grouped: OrderedDict[str, List[Entity]] = OrderedDict()
-        for entity in entities:
-            grouped.setdefault(entity.sentence, []).append(entity)
-
-        return [
-            SentenceExtraction(
-                sentence=sentence,
-                entities=sentence_entities,
+    def _extract_chunk_relationships(self, chunk: Chunk) -> ChunkExtraction:
+        """Extract relationships for a chunk: one API call with chunk text and its entities."""
+        target_entities = list(OrderedDict.fromkeys(e.text for e in chunk.entities))
+        if not target_entities:
+            return ChunkExtraction(
+                chunk_text=chunk.text,
+                start=chunk.start,
+                end=chunk.end,
+                entities=chunk.entities,
                 relationships=[],
                 usage=REUsage(),
             )
-            for sentence, sentence_entities in grouped.items()
-        ]
-
-    def _extract_sentence_relationships(self, sentence_extraction: SentenceExtraction) -> SentenceExtraction:
-        target_entities = list(OrderedDict.fromkeys(entity.text for entity in sentence_extraction.entities))
         re_result: RERunResult = self._get_re_module().run_with_metadata(
-            sentence_extraction.sentence, target_entities
+            chunk.text, target_entities
         )
-        return SentenceExtraction(
-            sentence=sentence_extraction.sentence,
-            entities=sentence_extraction.entities,
+        return ChunkExtraction(
+            chunk_text=chunk.text,
+            start=chunk.start,
+            end=chunk.end,
+            entities=chunk.entities,
             relationships=re_result.relationships,
             usage=re_result.usage,
         )
@@ -93,103 +102,52 @@ class NERREPipeline:
         return deduped
 
     def run(self, text: str) -> PipelineResult:
-        entities = self.ner.run(text)
-        sentence_extractions = self._group_entities_by_sentence(entities)
+        chunks = self.ner.run(text)
+        entities = [e for c in chunks for e in c.entities]
 
-        if not sentence_extractions:
+        # Filter to chunks that have entities (skip empty chunks for RE)
+        chunks_with_entities = [c for c in chunks if c.entities]
+
+        if not chunks_with_entities:
             return PipelineResult(
-                entities=[],
+                entities=entities,
                 relationships=[],
-                sentence_extractions=[],
+                chunk_extractions=[],
                 usage=REUsage(),
             )
 
-        max_workers = min(self.max_workers, len(sentence_extractions))
-        results_by_sentence = {}
+        max_workers = min(self.max_workers, len(chunks_with_entities))
+        results_by_chunk: dict[int, ChunkExtraction] = {}
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
-                executor.submit(self._extract_sentence_relationships, sentence_extraction): sentence_extraction.sentence
-                for sentence_extraction in sentence_extractions
+                executor.submit(self._extract_chunk_relationships, chunk): id(chunk)
+                for chunk in chunks_with_entities
             }
             for future in as_completed(future_map):
-                sentence = future_map[future]
-                results_by_sentence[sentence] = future.result()
+                chunk_id = future_map[future]
+                results_by_chunk[chunk_id] = future.result()
 
-        ordered_sentence_extractions = [
-            results_by_sentence[sentence_extraction.sentence] for sentence_extraction in sentence_extractions
+        ordered_chunk_extractions = [
+            results_by_chunk[id(c)] for c in chunks_with_entities
         ]
         all_relationships = self._dedupe_relationships(
             [
-                relationship
-                for sentence_extraction in ordered_sentence_extractions
-                for relationship in sentence_extraction.relationships
+                rel
+                for extraction in ordered_chunk_extractions
+                for rel in extraction.relationships
             ]
         )
         total_usage = REUsage(
-            input_tokens=sum(item.usage.input_tokens for item in ordered_sentence_extractions),
-            output_tokens=sum(item.usage.output_tokens for item in ordered_sentence_extractions),
-            total_tokens=sum(item.usage.total_tokens for item in ordered_sentence_extractions),
-            cost=sum(item.usage.cost for item in ordered_sentence_extractions),
+            input_tokens=sum(e.usage.input_tokens for e in ordered_chunk_extractions),
+            output_tokens=sum(e.usage.output_tokens for e in ordered_chunk_extractions),
+            total_tokens=sum(e.usage.total_tokens for e in ordered_chunk_extractions),
+            cost=sum(e.usage.cost for e in ordered_chunk_extractions),
         )
 
         return PipelineResult(
             entities=entities,
             relationships=all_relationships,
-            sentence_extractions=ordered_sentence_extractions,
+            chunk_extractions=ordered_chunk_extractions,
             usage=total_usage,
         )
-
-if __name__ == "__main__":
-    import glob
-    import json
-    import os
-
-    from tqdm import tqdm
-
-    re_config = {
-        "provider": "openrouter",
-        "model_name": "qwen/qwen3.5-flash-02-23",
-        "temperature": 0.0,
-        "max_tokens": 256,
-        "model_kwargs": {
-            "reasoning": {"enabled": False},
-        },
-    }
-    ner_model_name = "en_core_web_sm"
-    max_workers = 4
-    pipeline = NERREPipeline(re_config, ner_model_name, max_workers)
-
-    file_paths = glob.glob("/Users/richardtang/Desktop/IC_Projects/Rae/artifacts/sino_soviet_relations_in_the_1960s_url_texts/*.txt")
-    os.makedirs("results", exist_ok=True)
-    total_cost = 0.0
-    total_input_tokens = 0
-    total_output_tokens = 0
-
-    for file in tqdm(file_paths):
-        with open(file, "r") as f:
-            text = f.read()
-            if len(text.split()) < 200:
-                continue
-            print(f"Processing {file}...")
-            result = pipeline.run(text)
-            total_cost += result.usage.cost
-            total_input_tokens += result.usage.input_tokens
-            total_output_tokens += result.usage.output_tokens
-            with open(os.path.join("results", os.path.basename(file).replace(".txt", ".json")), "w") as f:
-                json.dump(result.to_dict(), f, indent=2)
-            print(
-                "File usage: "
-                f"input_tokens={result.usage.input_tokens}, "
-                f"output_tokens={result.usage.output_tokens}, "
-                f"cost=${result.usage.cost:.6f}"
-            )
-            print(
-                "Running total: "
-                f"input_tokens={total_input_tokens}, "
-                f"output_tokens={total_output_tokens}, "
-                f"cost=${total_cost:.6f}"
-            )
-            print(f"Result saved to {os.path.join('results', os.path.basename(file).replace('.txt', '.json'))}")
-
-        break

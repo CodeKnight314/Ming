@@ -1,8 +1,10 @@
-from ming.extraction.ner_module import Entity, NERModule
+from ming.extraction.ner_module import Chunk, Entity, NERModule
 from ming.extraction.re_module import REModule, RERunResult, REUsage, Relationship
-from ming.extraction.ner_re_pipeline import NERREPipeline, PipelineResult, SentenceExtraction
+from ming.extraction.ner_re_pipeline import ChunkExtraction, NERREPipeline, PipelineResult, SentenceExtraction
 
 __all__ = [
+    "Chunk",
+    "ChunkExtraction",
     "Entity",
     "NERModule",
     "REModule",

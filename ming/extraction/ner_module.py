@@ -4,20 +4,24 @@ from dataclasses import dataclass
 import re
 
 @dataclass
-class Chunk: 
+class Entity:
+    """Entity with global document positions."""
+
     text: str
-    start: int
-    end: int
+    label: str
+    global_start: int  # start offset in document
+    global_end: int  # end offset in document
+
 
 @dataclass
-class Entity: 
-    text: str 
-    label: str
-    sentence: str
-    start: int
-    end: int
-    global_start: int
-    global_end: int
+class Chunk:
+    """Chunk with global document positions and its discovered entities."""
+
+    text: str
+    start: int  # global start offset in document
+    end: int  # global end offset in document
+    entities: List[Entity]
+
 
 class NERModule:
     _ENTITY_OF_INTEREST = {"ORG", "PERSON", "GPE", "PRODUCT", "EVENT", "FAC", "WORK_OF_ART", "LAW"}
@@ -31,8 +35,9 @@ class NERModule:
         "external links",
     }
 
-    def __init__(self, model_name: str = "en_core_web_sm"):
+    def __init__(self, model_name: str = "en_core_web_sm", chunk_sentence_limit: int = 5):
         self.nlp = spacy.load(model_name)
+        self.chunk_sentence_limit = chunk_sentence_limit
 
     def clean_formula(self, text: str) -> str:
         formula_pattern = r'\\\[(.*?)\\\]'
@@ -123,34 +128,61 @@ class NERModule:
 
         return True
 
-    def extract_entities(self, chunks: List[Chunk]) -> List[Entity]:
-        seen_entities = set()
-        entities = []
+    def _extract_entities_for_chunks(self, chunks: List[Chunk]) -> None:
+        """Populate each chunk's entities list. Mutates chunks in place."""
+        seen_global_spans = set()
         for chunk in chunks:
+            chunk.entities = []
             doc = self.nlp(chunk.text)
             for ent in doc.ents:
-                if ent.label_ in self._ENTITY_OF_INTEREST:
-                    if not self.is_valid_entity(ent.text, ent.label_):
-                        continue
-                    if ent.text in seen_entities:
-                        continue
-                    seen_entities.add(ent.text)
-                    entities.append(
-                        Entity(
-                            text=ent.text,
-                            label=ent.label_,
-                            sentence=" ".join(ent.sent.text.split()),
-                            start=ent.start_char,
-                            end=ent.end_char, 
-                            global_start=chunk.start + ent.start_char,
-                            global_end=chunk.start + ent.end_char
-                        )
+                if ent.label_ not in self._ENTITY_OF_INTEREST:
+                    continue
+                if not self.is_valid_entity(ent.text, ent.label_):
+                    continue
+                global_start = chunk.start + ent.start_char
+                global_end = chunk.start + ent.end_char
+                span_key = (ent.text, ent.label_, global_start, global_end)
+                if span_key in seen_global_spans:
+                    continue
+                seen_global_spans.add(span_key)
+                chunk.entities.append(
+                    Entity(
+                        text=ent.text,
+                        label=ent.label_,
+                        global_start=global_start,
+                        global_end=global_end,
                     )
+                )
 
-        return entities
+    def split_text_into_chunks(self, text: str) -> List[Chunk]:
+        doc = self.nlp(text)
+        chunks = []
+        chunk_sents = []
+        chunk_start = None
 
-    def run(self, text: str) -> List[Entity]:
+        for sent in doc.sents:
+            if chunk_start is None:
+                chunk_start = sent.start_char
+            chunk_sents.append(sent)
+            if len(chunk_sents) >= self.chunk_sentence_limit:
+                chunk_end = chunk_sents[-1].end_char
+                chunk_text = text[chunk_start:chunk_end]
+                chunks.append(
+                    Chunk(text=chunk_text, start=chunk_start, end=chunk_end, entities=[])
+                )
+                chunk_sents = []
+                chunk_start = None
+
+        if chunk_sents:
+            chunk_end = chunk_sents[-1].end_char
+            chunk_text = text[chunk_start:chunk_end]
+            chunks.append(
+                Chunk(text=chunk_text, start=chunk_start, end=chunk_end, entities=[])
+            )
+        return chunks
+
+    def run(self, text: str) -> List[Chunk]:
         text = self.preprocess_text(text)
-        chunk = Chunk(text=text, start=0, end=len(text))
-        return self.extract_entities([chunk])
-
+        chunks = self.split_text_into_chunks(text)
+        self._extract_entities_for_chunks(chunks)
+        return chunks
