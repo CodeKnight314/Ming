@@ -10,3 +10,4 @@ tavily-python
 trafilatura
 numpy
 sentence-transformers
+datasketch
