@@ -6,6 +6,8 @@ from ming.extraction.ner_re_pipeline import (
     PipelineResult,
     SentenceExtraction,
 )
+from ming.extraction.kg_module import KGRedisStore, ERConfig
+from ming.extraction.kg_schema import Entity as KGEntity, Chunk as KGChunk, CanonicalEntity
 
 __all__ = [
     "Chunk",
@@ -17,4 +19,9 @@ __all__ = [
     "NERREPipeline",
     "PipelineResult",
     "SentenceExtraction",
+    "KGRedisStore",
+    "ERConfig",
+    "KGEntity",
+    "KGChunk",
+    "CanonicalEntity",
 ]
