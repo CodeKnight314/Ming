@@ -23,3 +23,16 @@ else
   echo "Creating and starting queries Redis container..."
   docker run -d -p 6380:6379 --name redis-queries redis:latest
 fi
+
+# KG Redis (knowledge graph extraction, entities, relationships)
+if docker ps -a --format '{{.Names}}' | grep -q '^redis-kg$'; then
+  if docker ps --format '{{.Names}}' | grep -q '^redis-kg$'; then
+    echo "KG Redis is already running."
+  else
+    echo "Starting existing KG Redis container..."
+    docker start redis-kg
+  fi
+else
+  echo "Creating and starting KG Redis container..."
+  docker run -d -p 6381:6379 --name redis-kg redis:latest
+fi
