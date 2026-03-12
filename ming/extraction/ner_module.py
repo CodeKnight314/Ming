@@ -5,21 +5,17 @@ import re
 
 @dataclass
 class Entity:
-    """Entity with global document positions."""
-
     text: str
     label: str
-    global_start: int  # start offset in document
-    global_end: int  # end offset in document
+    global_start: int
+    global_end: int
 
 
 @dataclass
 class Chunk:
-    """Chunk with global document positions and its discovered entities."""
-
     text: str
-    start: int  # global start offset in document
-    end: int  # global end offset in document
+    start: int
+    end: int
     entities: List[Entity]
 
 

@@ -3,39 +3,16 @@ import logging
 import re
 import sys
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Union
 
 from json_repair import repair_json
-from ming.models import create_model_from_spec, OpenRouterModelConfig
+from ming.models import OpenRouterModelConfig, create_model_from_spec
+from ming.extraction.kg_schema import Relationship
 
 logger = logging.getLogger(__name__)
 
 RE_JSON_ERROR_DIR = Path("re_json_errors")
-
-
-@dataclass
-class Relationship:
-    subject: str
-    predicate: str
-    object: str
-    object_type: str
-    confidence: float
-
-
-@dataclass
-class REUsage:
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-    cost: float = 0.0
-
-
-@dataclass
-class RERunResult:
-    relationships: List[Relationship]
-    usage: REUsage
 
 
 def _config_to_spec(config: Union[dict, OpenRouterModelConfig]) -> dict:
@@ -56,7 +33,10 @@ def _config_to_spec(config: Union[dict, OpenRouterModelConfig]) -> dict:
 
 
 class REModule:
-    def __init__(self, config: Union[dict, OpenRouterModelConfig]):
+    def __init__(
+        self,
+        config: Union[dict, OpenRouterModelConfig],
+    ):
         spec = _config_to_spec(config)
         self.model = create_model_from_spec(spec)
 
@@ -152,49 +132,34 @@ class REModule:
 
         return last_good
 
-    def _extract_usage(self, metadata: dict[str, Any] | None) -> REUsage:
-        if not metadata:
-            return REUsage()
-
-        usage_metadata = metadata.get("usage_metadata") or {}
-        response_metadata = metadata.get("response_metadata") or {}
-        cost = response_metadata.get("cost", 0.0) or 0.0
-
-        return REUsage(
-            input_tokens=int(usage_metadata.get("input_tokens", 0) or 0),
-            output_tokens=int(usage_metadata.get("output_tokens", 0) or 0),
-            total_tokens=int(usage_metadata.get("total_tokens", 0) or 0),
-            cost=float(cost),
-        )
-
-    def run_with_metadata(
+    def run(
         self, text: str, target_entities: List[str]
-    ) -> RERunResult:
+    ) -> List[Relationship]:
         if not target_entities:
-            return RERunResult(relationships=[], usage=REUsage())
+            return []
 
         prompt = self.prompt_template.format(
             text=text,
             target_entities=", ".join(target_entities),
         )
 
-        metadata: dict[str, Any] | None = None
         if hasattr(self.model, "generate_with_metadata"):
-            response, metadata = self.model.generate_with_metadata(prompt)
+            response, _ = self.model.generate_with_metadata(prompt)
         else:
             response = self.model.generate(prompt)
 
         raw = self._parse_json_response(response, prompt)
 
         if not isinstance(raw, list):
-            return RERunResult(relationships=[], usage=self._extract_usage(metadata))
+            return []
 
-        relationships = []
+        relationships: List[Relationship] = []
         for item in raw:
             if not isinstance(item, dict):
                 continue
             try:
                 rel = Relationship(
+                    relationship_id=uuid.uuid4().hex,
                     subject=str(item.get("subject", "")),
                     predicate=str(item.get("predicate", "")),
                     object=str(item.get("object", "")),
@@ -205,12 +170,4 @@ class REModule:
             except (TypeError, ValueError):
                 continue
 
-        return RERunResult(
-            relationships=relationships,
-            usage=self._extract_usage(metadata),
-        )
-
-    def run(
-        self, text: str, target_entities: List[str]
-    ) -> List[Relationship]:
-        return self.run_with_metadata(text, target_entities).relationships
+        return relationships
