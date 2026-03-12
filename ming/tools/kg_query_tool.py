@@ -4,14 +4,9 @@ from typing import Any, Dict, Tuple, List
 from ming.core.redis import RedisDatabase
 from ming.extraction.kg_module import KGRedisStore, ERConfig
 
-@dataclass
-class KGQueryToolConfig:
-    pass
-
 class KGQueryTool(BaseTool):
-    def __init__(self, config: KGQueryToolConfig, kg_store: KGRedisStore, name: str = "kg_query_tool"):
+    def __init__(self, kg_store: KGRedisStore, name: str = "kg_query_tool"):
         super().__init__(name)
-        self.config = config
         self.kg_store = kg_store
 
     def validate_parameters(self, parameters: Dict[str, Any]) -> Tuple[bool, str]:
