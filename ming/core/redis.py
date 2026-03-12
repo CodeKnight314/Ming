@@ -1,3 +1,4 @@
+import json
 import redis
 from dataclasses import dataclass
 from uuid import uuid4
@@ -28,7 +29,7 @@ class RedisDatabase:
 
     def create_entry(self, entry: dict[str, Any]) -> str:
         uuid = str(uuid4())
-        self.client.hset(uuid, mapping=entry)
+        self.client.hset(uuid, mapping=self._serialize_entry(entry))
         return uuid
 
     def get_entry(self, uuid: str) -> dict[str, Any]:
@@ -38,7 +39,24 @@ class RedisDatabase:
         self.client.delete(uuid)
 
     def update_entry(self, uuid: str, entry: dict[str, Any]):
-        self.client.hset(uuid, mapping=entry)
+        self.client.hset(uuid, mapping=self._serialize_entry(entry))
+
+    @staticmethod
+    def _serialize_value(value: Any) -> Any:
+        """Serialize non-scalar values to Redis-compatible strings."""
+        if value is None:
+            return ""
+        if isinstance(value, (str, bytes, int, float)):
+            return value
+        if isinstance(value, set):
+            return json.dumps(sorted(value))
+        if isinstance(value, (list, dict, tuple)):
+            return json.dumps(value)
+        return str(value)
+
+    @classmethod
+    def _serialize_entry(cls, entry: dict[str, Any]) -> dict[str, Any]:
+        return {key: cls._serialize_value(value) for key, value in entry.items()}
 
     def get_context_id_by_url(self, url: str) -> Optional[str]:
         """Return the context ID (UUID) for a cached URL, or None if not cached."""
