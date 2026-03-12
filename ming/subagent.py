@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
+import json
 import logging
 from math import ceil
 from pathlib import Path
@@ -10,8 +11,9 @@ from typing import Any, Dict, List, Optional, Union
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.state import CompiledStateGraph
 from typing_extensions import TypedDict
+from dataclasses import asdict, dataclass
 
-from ming.models import BaseModel, create_model_from_spec
+from ming.models import BaseModel, create_model_from_spec, OpenRouterModelConfig
 from ming.tools import BaseTool, ToolConfig, create_tool_from_spec
 from ming.core.prompts import (
     DECISION_PROMPT,
@@ -67,7 +69,7 @@ class ResearchSubagent:
             except Exception as e:
                 logger.warning("Skipping tool %s: %s", tool_config, e)
 
-        self.max_iterations = config.get("max_iterations")
+        self.max_iterations = config.get("max_iterations", 3)
         self.graph = self._build_graph()
         self.statistics = self._empty_statistics()
 
@@ -410,186 +412,6 @@ class ResearchSubagent:
             "history": state["history"],
         }
 
-    def _count_words(self, text: str) -> int:
-        return len(re.findall(r"\b\w+\b", text or ""))
-
-    def get_url_word_counts(self, context_ids: List[str]) -> List[Dict[str, Union[str, int]]]:
-        if not context_ids:
-            return []
-
-        entries: List[dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=max(1, len(context_ids))) as executor:
-            futures = [executor.submit(self.database.get_entry, cid) for cid in context_ids]
-            for future in as_completed(futures):
-                entry = future.result()
-                if entry:
-                    entries.append(entry)
-
-        word_counts: List[Dict[str, Union[str, int]]] = []
-        seen_urls = set()
-        for entry in entries:
-            url = (entry.get("url") or "").strip()
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            content = (entry.get("raw_content") or entry.get("content") or "").strip()
-            word_counts.append(
-                {
-                    "url": url,
-                    "title": entry.get("title", "Untitled"),
-                    "word_count": self._count_words(content),
-                }
-            )
-
-        return sorted(word_counts, key=lambda item: int(item["word_count"]))
-
-    def save_url_word_count_distribution(
-        self,
-        context_ids: List[str],
-        topic: str,
-        output_dir: Optional[Union[str, Path]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        word_counts = self.get_url_word_counts(context_ids)
-        if not word_counts:
-            return None
-
-        base_dir = Path(output_dir or Path.cwd() / "artifacts")
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-        slug = re.sub(r"[^a-z0-9]+", "_", topic.lower()).strip("_") or "topic"
-        csv_path = base_dir / f"{slug}_url_word_counts.csv"
-        svg_path = base_dir / f"{slug}_url_word_count_distribution.svg"
-
-        with csv_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["url", "title", "word_count"])
-            writer.writeheader()
-            writer.writerows(word_counts)
-
-        values = [int(item["word_count"]) for item in word_counts]
-        min_value = min(values)
-        max_value = max(values)
-        bin_count = min(20, max(8, ceil(len(values) ** 0.75)))
-        span = max(1, max_value - min_value)
-        bin_width = max(1, ceil((span + 1) / bin_count))
-
-        bins = []
-        for index in range(bin_count):
-            start = min_value + index * bin_width
-            end = start + bin_width - 1
-            bins.append({"start": start, "end": end, "count": 0})
-
-        for value in values:
-            bin_index = min((value - min_value) // bin_width, bin_count - 1)
-            bins[int(bin_index)]["count"] += 1
-
-        width = 1000
-        height = 600
-        margin_left = 70
-        margin_right = 30
-        margin_top = 50
-        margin_bottom = 120
-        plot_width = width - margin_left - margin_right
-        plot_height = height - margin_top - margin_bottom
-        bar_gap = 12
-        bar_width = max(20, (plot_width - bar_gap * (bin_count - 1)) / max(1, bin_count))
-        max_bin_count = max(bin["count"] for bin in bins) or 1
-
-        bars = []
-        labels = []
-        for index, bin_data in enumerate(bins):
-            bar_height = 0 if max_bin_count == 0 else (bin_data["count"] / max_bin_count) * plot_height
-            x = margin_left + index * (bar_width + bar_gap)
-            y = margin_top + (plot_height - bar_height)
-            bars.append(
-                f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_width:.1f}" height="{bar_height:.1f}" fill="#2f6db2" />'
-            )
-            label = f'{bin_data["start"]}-{bin_data["end"]}'
-            labels.append(
-                f'<text x="{x + bar_width / 2:.1f}" y="{height - 80}" font-size="12" text-anchor="end" transform="rotate(-35 {x + bar_width / 2:.1f},{height - 80})">{label}</text>'
-            )
-            labels.append(
-                f'<text x="{x + bar_width / 2:.1f}" y="{max(margin_top + 14, y - 8):.1f}" font-size="12" text-anchor="middle">{bin_data["count"]}</text>'
-            )
-
-        y_ticks = []
-        for tick in range(5):
-            tick_value = round(max_bin_count * tick / 4) if max_bin_count > 1 else tick
-            tick_y = margin_top + plot_height - (tick / 4) * plot_height
-            y_ticks.append(
-                f'<line x1="{margin_left}" y1="{tick_y:.1f}" x2="{width - margin_right}" y2="{tick_y:.1f}" stroke="#d0d7de" stroke-width="1" />'
-            )
-            y_ticks.append(
-                f'<text x="{margin_left - 10}" y="{tick_y + 4:.1f}" font-size="12" text-anchor="end">{tick_value}</text>'
-            )
-
-        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
-<rect width="100%" height="100%" fill="#ffffff" />
-<text x="{width / 2}" y="28" font-size="22" text-anchor="middle" font-family="Arial, sans-serif">Word Count Distribution per URL</text>
-<text x="{width / 2}" y="48" font-size="13" text-anchor="middle" fill="#555" font-family="Arial, sans-serif">{topic}</text>
-<line x1="{margin_left}" y1="{margin_top}" x2="{margin_left}" y2="{margin_top + plot_height}" stroke="#222" stroke-width="2" />
-<line x1="{margin_left}" y1="{margin_top + plot_height}" x2="{width - margin_right}" y2="{margin_top + plot_height}" stroke="#222" stroke-width="2" />
-{''.join(y_ticks)}
-{''.join(bars)}
-{''.join(labels)}
-<text x="{width / 2}" y="{height - 24}" font-size="14" text-anchor="middle" font-family="Arial, sans-serif">Word-count bins</text>
-<text x="22" y="{margin_top + plot_height / 2}" font-size="14" text-anchor="middle" transform="rotate(-90 22,{margin_top + plot_height / 2})" font-family="Arial, sans-serif">URLs in bin</text>
-</svg>
-"""
-        svg_path.write_text(svg, encoding="utf-8")
-
-        return {
-            "csv_path": str(csv_path),
-            "plot_path": str(svg_path),
-            "url_count": len(word_counts),
-            "min_word_count": min_value,
-            "max_word_count": max_value,
-        }
-
-    def export_contexts_as_text_files(
-        self,
-        context_ids: List[str],
-        topic: str,
-        output_dir: Optional[Union[str, Path]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        word_counts = self.get_url_word_counts(context_ids)
-        if not word_counts:
-            return None
-
-        base_dir = Path(output_dir or Path.cwd() / "artifacts")
-        slug = re.sub(r"[^a-z0-9]+", "_", topic.lower()).strip("_") or "topic"
-        text_dir = base_dir / f"{slug}_url_texts"
-        text_dir.mkdir(parents=True, exist_ok=True)
-
-        exported_files = []
-        for index, item in enumerate(word_counts, start=1):
-            entry_id = self.database.get_context_id_by_url(str(item["url"]))
-            if entry_id is None:
-                continue
-            entry = self.database.get_entry(entry_id)
-            if not entry:
-                continue
-
-            file_slug = re.sub(r"[^a-z0-9]+", "_", str(item["title"]).lower()).strip("_")
-            if not file_slug:
-                file_slug = f"url_{index:03d}"
-            file_path = text_dir / f"{index:03d}_{file_slug[:80]}.txt"
-
-            body = (entry.get("raw_content") or entry.get("content") or "").strip()
-            text = (
-                f"URL: {item['url']}\n"
-                f"Title: {item['title']}\n"
-                f"Word Count: {item['word_count']}\n\n"
-                f"{body}\n"
-            )
-            file_path.write_text(text, encoding="utf-8")
-            exported_files.append(str(file_path))
-
-        return {
-            "text_dir": str(text_dir),
-            "file_count": len(exported_files),
-            "files": exported_files,
-        }
-
     def run(self, topic: str, scout_report: str = "") -> Dict[str, Any]:
         self.statistics = self._empty_statistics()
         initial_state: ResearchSubagentState = {
@@ -605,6 +427,172 @@ class ResearchSubagent:
 
     def get_statistics(self) -> Dict[str, Any]:
         return self.statistics
+
+
+@dataclass
+class AgentConfig:
+    model: dict[str, Any]
+    system_prompt: str
+    tools: List[ToolConfig] | None = None
+    max_iterations: int = 15
+
+
+class AgentMessage(TypedDict):
+    role: str
+    content: str
+
+
+class AgentState(TypedDict, total=False):
+    messages: List[AgentMessage]
+    output: str
+    iteration: int
+
+
+class Agent:
+    _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+    def __init__(self, config: AgentConfig):
+        model_spec = config.model
+        if isinstance(model_spec, OpenRouterModelConfig):
+            model_spec = asdict(model_spec)
+            model_spec["provider"] = "openrouter"
+        self.model = create_model_from_spec(model_spec)
+        self._tool_map: Dict[str, BaseTool] = {}
+        for tool_config in (config.tools or []):
+            try:
+                if isinstance(tool_config, BaseTool):
+                    tool = tool_config
+                else:
+                    tool = create_tool_from_spec(tool_config)
+                if tool.preflight_check():
+                    self._tool_map[tool.get_name()] = tool
+            except Exception as e:
+                logger.warning("Skipping tool %s: %s", tool_config, e)
+        self.system_prompt = config.system_prompt
+        self.max_iterations = config.max_iterations
+        self.graph = self._build_graph()
+
+    def _format_tools_for_prompt(self) -> str:
+        if not self._tool_map:
+            return ""
+        sections = [tool.format_for_prompt() for tool in self._tool_map.values()]
+        return (
+            "# Available Tools\n\n"
+            + "\n\n".join(sections)
+            + "\n\n"
+            "To use a tool, include in your response:\n"
+            '<tool_call>{"name": "tool_name", "parameters": {"param": "value"}}</tool_call>\n\n'
+            "You may invoke multiple tools in one response.\n"
+            "When you have enough information, respond without any <tool_call> tags."
+        )
+
+    def _build_system_message(self) -> str:
+        parts = [self.system_prompt]
+        tools_section = self._format_tools_for_prompt()
+        if tools_section:
+            parts.append(tools_section)
+        return "\n\n".join(parts)
+
+    def _messages_to_prompt(self, messages: List[AgentMessage]) -> str:
+        parts: List[str] = []
+        for msg in messages:
+            role, content = msg["role"], msg["content"]
+            if role == "system":
+                parts.append(content)
+            elif role == "user":
+                parts.append(f"\nUser:\n{content}")
+            elif role == "assistant":
+                parts.append(f"\nAssistant:\n{content}")
+            elif role == "tool_result":
+                parts.append(f"\nTool Results:\n{content}")
+        parts.append("\nAssistant:\n")
+        return "\n".join(parts)
+
+    def _parse_tool_calls(self, text: str) -> List[Dict[str, Any]]:
+        calls: List[Dict[str, Any]] = []
+        for match in self._TOOL_CALL_RE.finditer(text):
+            try:
+                payload = json.loads(match.group(1).strip())
+                if isinstance(payload, dict) and "name" in payload:
+                    calls.append(payload)
+            except json.JSONDecodeError:
+                logger.warning("Malformed tool_call JSON: %s", match.group(1)[:120])
+        return calls
+
+    def _strip_tool_calls(self, text: str) -> str:
+        return self._TOOL_CALL_RE.sub("", text).strip()
+
+    def _call_model(self, state: AgentState) -> Dict[str, Any]:
+        prompt = self._messages_to_prompt(state["messages"])
+        response = self.model.generate(prompt)
+        messages = state["messages"] + [{"role": "assistant", "content": response}]
+        return {"messages": messages, "output": response}
+
+    def _execute_tools(self, state: AgentState) -> Dict[str, Any]:
+        last_response = state.get("output", "")
+        tool_calls = self._parse_tool_calls(last_response)
+
+        results: List[str] = []
+        for call in tool_calls:
+            name = call.get("name", "")
+            params = call.get("parameters", {})
+            tool = self._tool_map.get(name)
+            if tool is None:
+                results.append(f"[{name}] Error: unknown tool.")
+                continue
+            valid, err = tool.validate_parameters(params)
+            if not valid:
+                results.append(f"[{name}] Validation error: {err}")
+                continue
+            try:
+                result = tool.run(**params)
+                results.append(f"[{name}]\n{result}")
+            except Exception as exc:
+                results.append(f"[{name}] Error: {exc}")
+
+        tool_content = "\n\n".join(results)
+        messages = state["messages"] + [{"role": "tool_result", "content": tool_content}]
+        return {"messages": messages, "iteration": state.get("iteration", 0) + 1}
+
+    def _route_after_model(self, state: AgentState) -> str:
+        if state.get("iteration", 0) >= self.max_iterations:
+            return "end"
+        if self._parse_tool_calls(state.get("output", "")):
+            return "continue"
+        return "end"
+
+    def _build_graph(self) -> CompiledStateGraph:
+        workflow = StateGraph(AgentState)
+        workflow.add_node("call_model", self._call_model)
+        workflow.add_node("execute_tools", self._execute_tools)
+
+        workflow.add_edge(START, "call_model")
+        workflow.add_conditional_edges(
+            "call_model",
+            self._route_after_model,
+            {"continue": "execute_tools", "end": END},
+        )
+        workflow.add_edge("execute_tools", "call_model")
+
+        return workflow.compile()
+
+    def run(self, user_input: str) -> str:
+        system_msg = self._build_system_message()
+        initial: AgentState = {
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_input},
+            ],
+            "output": "",
+            "iteration": 0,
+        }
+
+        if not self._tool_map:
+            prompt = self._messages_to_prompt(initial["messages"])
+            return self.model.generate(prompt)
+
+        result = self.graph.invoke(initial)
+        return self._strip_tool_calls(result.get("output", ""))
 
 if __name__ == "__main__":
     from ming.core.config import create_subagent_from_config
