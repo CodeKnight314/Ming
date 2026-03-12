@@ -20,6 +20,7 @@ dependencies = [
     "requests",
     "tavily-python",
     "trafilatura",
+    "datasketch"
 ]
 
 [project.optional-dependencies]
