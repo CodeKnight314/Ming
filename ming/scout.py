@@ -35,11 +35,9 @@ class ScoutSubagent:
     def __init__(
         self,
         config: ScoutSubagentConfig,
-        query_store: Optional[QueryStore] = None,
     ):
         self.config = config
         self.model = create_model_from_spec(config.get("model"))
-        self.query_store = query_store
 
         self._tool_map = {}
         for tool_config in (config.get("tool_configs") or []):
@@ -88,14 +86,7 @@ class ScoutSubagent:
         max_q = max(min_q, int(self.config.get("max_query_count", 5)))
 
         previous_queries_section = ""
-        if self.query_store:
-            stored = self.query_store.get_queries(topic)
-            if stored:
-                previous_queries_section = (
-                    "\nQueries already run for this topic (avoid repeating):\n"
-                    + "\n".join(f"- {q}" for q in stored)
-                    + "\n\n"
-                )
+
 
         prompt = SCOUT_QUERY_PROMPT.format(
             topic=topic,
@@ -176,9 +167,6 @@ class ScoutSubagent:
             ),
             **self._generation_kwargs(max_new_tokens=512),
         ).strip()
-
-        if self.query_store:
-            self.query_store.add_queries(topic, queries)
 
         return {
             "topic": topic,
