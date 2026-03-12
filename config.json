@@ -7,6 +7,10 @@
     "hostname": "localhost",
     "port": 6380
   },
+  "kg_redis": {
+    "hostname": "localhost",
+    "port": 6381
+  },
   "scout": {
     "model": {
       "provider": "openrouter",
