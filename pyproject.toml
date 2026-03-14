@@ -20,7 +20,8 @@ dependencies = [
     "requests",
     "tavily-python",
     "trafilatura",
-    "datasketch"
+    "datasketch",
+    "faiss-cpu"
 ]
 
 [project.optional-dependencies]

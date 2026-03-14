@@ -11,3 +11,5 @@ trafilatura
 numpy
 sentence-transformers
 datasketch
+faiss-cpu
+python-louvain
