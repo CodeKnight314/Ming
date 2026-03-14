@@ -1,15 +1,28 @@
 {
   "redis": {
     "hostname": "localhost",
-    "port": 6379
+    "port": 6379,
+    "db": 0
   },
   "queries_redis": {
     "hostname": "localhost",
-    "port": 6380
+    "port": 6380,
+    "db": 1
   },
   "kg_redis": {
     "hostname": "localhost",
-    "port": 6381
+    "port": 6381,
+    "db": 2
+  },
+  "num_research_subagents": 4,
+  "draft_output_path": "reports/draft.md",
+  "outline_max_context_ids": 64,
+  "outline_context_token_budget": 128000,
+  "outline_source_char_limit": 3000,
+  "writer_model": {
+    "model_name": "qwen/qwen3.5-plus-02-15",
+    "temperature": 0.2,
+    "max_tokens": 4096
   },
   "scout": {
     "model": {
