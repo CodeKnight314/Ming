@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from dataclasses import asdict, field, dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass, fields
+from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, get_origin
 from uuid import uuid4
 
 from ming.core.redis import RedisDatabase
 from ming.extraction.kg_schema import Chunk, Entity, Relationship, CanonicalEntity
 from datasketch import MinHash, MinHashLSH
+
+T = TypeVar("T")
 
 @dataclass
 class ERConfig: 
@@ -92,24 +94,75 @@ class KGRedisStore:
         
         self.save_entities(new_entities)
         self.save_canonical_entities(canonical_entities)
+
+    def _deserialize_entry(self, data: Dict[str, Any], model: Type[T]) -> T:
+        parsed: Dict[str, Any] = {}
+        for schema_field in fields(model):
+            value = data.get(schema_field.name)
+            if value is None:
+                continue
+            if get_origin(schema_field.type) is list:
+                parsed[schema_field.name] = json.loads(value) if isinstance(value, str) and value else []
+            elif schema_field.type is float:
+                parsed[schema_field.name] = float(value) if value not in ("", None) else 0.0
+            else:
+                parsed[schema_field.name] = value
+        return model(**parsed)
     
     def search_entity_by_id(self, entity_id: str) -> Entity:
-        return self.database.get_entry(entity_id)
+        return self._deserialize_entry(self.database.get_entry(entity_id), Entity)
 
     def search_entities_by_text(self, text: str) -> List[Entity]:
-        return [e for e in self.database.get_entries() if e.text == text]
+        _, entities, _, _ = self._scan_all_entries()
+        text_lower = text.lower()
+        return [
+            self._deserialize_entry(entity_data, Entity)
+            for entity_data in entities.values()
+            if entity_data.get("text", "").lower() == text_lower
+        ]
     
     def search_chunk_by_id(self, chunk_id: str) -> Chunk:
-        return self.database.get_entry(chunk_id)
+        return self._deserialize_entry(self.database.get_entry(chunk_id), Chunk)
     
     def search_relationship_by_id(self, relationship_id: str) -> Relationship:
-        return self.database.get_entry(relationship_id)
+        return self._deserialize_entry(self.database.get_entry(relationship_id), Relationship)
 
     def search_relationship_by_subject(self, subject: str) -> List[Relationship]:
-        return [r for r in self.database.get_entries() if r.subject == subject]
+        relationships, _, _, _ = self._scan_all_entries()
+        subject_lower = subject.lower()
+        return [
+            self._deserialize_entry(rel_data, Relationship)
+            for rel_data in relationships.values()
+            if rel_data.get("subject", "").lower() == subject_lower
+        ]
     
     def search_relationship_by_object(self, object: str) -> List[Relationship]:
-        return [r for r in self.database.get_entries() if r.object == object]
+        relationships, _, _, _ = self._scan_all_entries()
+        object_lower = object.lower()
+        return [
+            self._deserialize_entry(rel_data, Relationship)
+            for rel_data in relationships.values()
+            if rel_data.get("object", "").lower() == object_lower
+        ]
+
+    def get_entities(self) -> List[Entity]:
+        _, entities, _, _ = self._scan_all_entries()
+        return [self._deserialize_entry(entity_data, Entity) for entity_data in entities.values()]
+
+    def get_relationships(self) -> List[Relationship]:
+        relationships, _, _, _ = self._scan_all_entries()
+        return [self._deserialize_entry(rel_data, Relationship) for rel_data in relationships.values()]
+
+    def get_chunks(self) -> List[Chunk]:
+        _, _, chunks, _ = self._scan_all_entries()
+        return [self._deserialize_entry(chunk_data, Chunk) for chunk_data in chunks.values()]
+
+    def get_canonical_entities(self) -> List[CanonicalEntity]:
+        _, _, _, canonical_entities = self._scan_all_entries()
+        return [
+            self._deserialize_entry(canonical_entity_data, CanonicalEntity)
+            for canonical_entity_data in canonical_entities.values()
+        ]
 
     # ── Query helpers ──────────────────────────────────────────────────
 
@@ -157,15 +210,16 @@ class KGRedisStore:
         rel_id: str,
         entities: Dict[str, Dict],
         chunks: Dict[str, Dict],
-    ) -> str:
+    ) -> Tuple[str, str]:
+        """Returns (chunk_text, url) for a relationship."""
         for ent_data in entities.values():
             rels_raw = ent_data.get("relationships", "[]")
             rels = json.loads(rels_raw) if isinstance(rels_raw, str) else rels_raw
             if rel_id in rels:
                 chunk_data = chunks.get(ent_data.get("chunk_id", ""))
                 if chunk_data:
-                    return chunk_data.get("text", "")
-        return ""
+                    return chunk_data.get("text", ""), chunk_data.get("url", "")
+        return "", ""
 
     @staticmethod
     def _format_rel_line(rel_data: Dict[str, str]) -> str:
@@ -180,7 +234,7 @@ class KGRedisStore:
         return line
 
     @staticmethod
-    def _group_by_chunk(pairs: List[Tuple[Dict, str]]) -> List[str]:
+    def _group_by_chunk(pairs: List[Tuple[Dict, str, str]]) -> List[str]:
         """Consolidate relationships that share the same chunk into one entry.
 
         Returns one string per unique chunk:
@@ -188,21 +242,24 @@ class KGRedisStore:
             <rel line 2>
             ...
             <chunk text>
+            URL: <url>
         """
-        chunk_to_rels: Dict[str, List[str]] = {}
-        chunk_order: List[str] = []
+        # key is (chunk_text, url)
+        chunk_to_rels: Dict[Tuple[str, str], List[str]] = {}
+        chunk_order: List[Tuple[str, str]] = []
 
-        for rel_data, chunk_text in pairs:
+        for rel_data, chunk_text, url in pairs:
             rel_line = KGRedisStore._format_rel_line(rel_data)
-            if chunk_text not in chunk_to_rels:
-                chunk_to_rels[chunk_text] = []
-                chunk_order.append(chunk_text)
-            chunk_to_rels[chunk_text].append(rel_line)
+            key = (chunk_text, url)
+            if key not in chunk_to_rels:
+                chunk_to_rels[key] = []
+                chunk_order.append(key)
+            chunk_to_rels[key].append(rel_line)
 
         results: List[str] = []
-        for chunk_text in chunk_order:
-            rel_lines = "\n".join(chunk_to_rels[chunk_text])
-            results.append(f"{rel_lines}\n{chunk_text}")
+        for chunk_text, url in chunk_order:
+            rel_lines = "\n".join(chunk_to_rels[(chunk_text, url)])
+            results.append(f"{rel_lines}\n{chunk_text}\nURL: {url}")
         return results
 
     def get_neighbors(self, subject: str) -> List[str]:
@@ -218,17 +275,17 @@ class KGRedisStore:
             rel_ids = json.loads(rel_ids_raw) if isinstance(rel_ids_raw, str) else rel_ids_raw
             target_rel_ids.update(rel_ids)
         
-        # 2. Collect pairs (rel_data, chunk_text)
-        pairs: List[Tuple[Dict, str]] = []
+        # 2. Collect pairs (rel_data, chunk_text, url)
+        pairs: List[Tuple[Dict, str, str]] = []
         subject_lower = subject.lower()
 
         for rel_id, rel_data in relationships.items():
             # Match if ID is in canonical list OR if raw subject matches
             if rel_id in target_rel_ids or rel_data.get("subject", "").lower() == subject_lower:
-                chunk_text = self._chunk_text_for_relationship(
+                chunk_text, url = self._chunk_text_for_relationship(
                     rel_data["relationship_id"], entities, chunks,
                 )
-                pairs.append((rel_data, chunk_text))
+                pairs.append((rel_data, chunk_text, url))
 
         return self._group_by_chunk(pairs)
 
@@ -264,12 +321,12 @@ class KGRedisStore:
         while queue:
             current, path = queue.popleft()
             if current == end_key and path:
-                pairs: List[Tuple[Dict, str]] = []
+                pairs: List[Tuple[Dict, str, str]] = []
                 for rel_data in path:
-                    chunk_text = self._chunk_text_for_relationship(
+                    chunk_text, url = self._chunk_text_for_relationship(
                         rel_data["relationship_id"], entities, chunks,
                     )
-                    pairs.append((rel_data, chunk_text))
+                    pairs.append((rel_data, chunk_text, url))
                 return self._group_by_chunk(pairs)
 
             for rel_data, neighbor in adj.get(current, []):

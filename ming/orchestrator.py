@@ -7,8 +7,8 @@ from typing import Any, Dict, List
 from ming.core.config import create_queries_store_from_config, create_redis_from_config
 from ming.core.outline_parser import extract_outline_block, outline_to_sections
 from ming.core.redis import QueryStoreConfig, RedisDatabaseConfig
-from ming.scout import ScoutSubagent, ScoutSubagentConfig
-from ming.subagent import ResearchSubagent, Agent, AgentConfig, ResearchSubagentConfig
+from ming.scout import ScoutSubagent
+from ming.subagent import ResearchSubagent, Agent, AgentConfig, AgentResult
 from ming.extraction.kg_module import KGRedisStore, ERConfig
 from ming.tools.kg_query_tool import KGQueryTool
 from ming.writer_agent import WriterAgent, WriterAgentConfig
@@ -30,9 +30,9 @@ class MingDeepResearchConfig:
     writer_model: OpenRouterModelConfig | None = None
     draft_output_path: str | None = None
     num_research_subagents: int = 3
-    outline_max_context_ids: int = 64
+    outline_max_context_ids: int = 180
     outline_context_token_budget: int = 128_000
-    outline_source_char_limit: int = 3000
+    outline_source_char_limit: int = 2500
 
 
 class MingDeepResearch:
@@ -120,11 +120,18 @@ class MingDeepResearch:
         )
 
     @staticmethod
-    def _parse_planning_result(planning_result: str) -> Dict[str, Any]:
+    def _extract_agent_output(result: str | AgentResult) -> str:
+        if isinstance(result, AgentResult):
+            return result.output
+        return result
+
+    @staticmethod
+    def _parse_planning_result(planning_result: str | AgentResult) -> Dict[str, Any]:
         # Parse the planning result using xml.etree.ElementTree
+        raw_output = MingDeepResearch._extract_agent_output(planning_result)
         try:
             # Handle potential markdown wrapping or extra whitespace
-            cleaned = planning_result.strip()
+            cleaned = raw_output.strip()
             if cleaned.startswith("```"):
                 # Remove markdown fences if present
                 lines = cleaned.split("\n")
@@ -136,7 +143,7 @@ class MingDeepResearch:
             
             root = xml.etree.ElementTree.fromstring(cleaned)
         except xml.etree.ElementTree.ParseError as e:
-            logger.error(f"Failed to parse planning result XML: {e}\nResult: {planning_result}")
+            logger.error(f"Failed to parse planning result XML: {e}\nResult: {raw_output}")
             # Return a minimal valid structure to prevent total failure
             return {"research_angles": [], "constraints": ""}
 
@@ -313,6 +320,9 @@ class MingDeepResearch:
         self.kg_store.perform_entity_resolution(all_kg_entities)
         end_time = time.time()
         logger.info(f"Entity resolution took {round(end_time - start_time, 2)} seconds")
+        logger.info(f"Number of relationships active in the knowledge graph: {len(self.kg_store.get_relationships())}")
+        logger.info(f"Number of chunks active in the knowledge graph: {len(self.kg_store.get_chunks())}")
+        logger.info(f"Number of canonical entities active in the knowledge graph: {len(self.kg_store.get_canonical_entities())}")
 
         # final report
         logger.info("Generating final report...")
@@ -332,7 +342,7 @@ class MingDeepResearch:
         for attempt in range(1, max_iterations + 1):
             outline_result = self.outline_agent.run(initial_context)
             try:
-                outline_xml = extract_outline_block(outline_result)
+                outline_xml = extract_outline_block(self._extract_agent_output(outline_result))
                 report_title, constraints_paragraph, sections = outline_to_sections(
                     outline_xml
                 )
@@ -344,6 +354,7 @@ class MingDeepResearch:
                     max_iterations,
                     e,
                 )
+
         if len(sections) == 0:
             logger.error(
                 "Failed to generate report outline after %d iterations",

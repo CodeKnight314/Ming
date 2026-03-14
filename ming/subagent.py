@@ -448,6 +448,13 @@ class AgentState(TypedDict, total=False):
     iteration: int
 
 
+@dataclass
+class AgentResult:
+    output: str
+    messages: List[AgentMessage]
+    iteration: int
+
+
 class Agent:
     # Match only well-formed tool calls whose payload is a JSON object.
     # This avoids treating nested stray <tool_call> tags as the payload.
@@ -578,7 +585,7 @@ class Agent:
 
         return workflow.compile()
 
-    def run(self, user_input: str) -> str:
+    def run(self, user_input: str) -> AgentResult:
         system_msg = self._build_system_message()
         initial: AgentState = {
             "messages": [
@@ -591,10 +598,19 @@ class Agent:
 
         if not self._tool_map:
             prompt = self._messages_to_prompt(initial["messages"])
-            return self.model.generate(prompt)
+            output = self.model.generate(prompt)
+            return AgentResult(
+                output=output,
+                messages=initial["messages"] + [{"role": "assistant", "content": output}],
+                iteration=0
+            )
 
         result = self.graph.invoke(initial)
-        return self._strip_tool_calls(result.get("output", ""))
+        return AgentResult(
+            output=self._strip_tool_calls(result.get("output", "")),
+            messages=result.get("messages", initial["messages"]),
+            iteration=result.get("iteration", 0),
+        )
 
 if __name__ == "__main__":
     from ming.core.config import create_subagent_from_config
