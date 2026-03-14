@@ -2,6 +2,7 @@ import base64
 import logging
 import mimetypes
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
@@ -130,13 +131,30 @@ class OpenRouterModel(BaseModel):
         if images:
             images = self._validate_images(images)
         content = self._build_message_content(prompt, images)
-
-        response = self.client.invoke([HumanMessage(content=content)])
+        logger.info(
+            "Calling OpenRouter model=%s prompt_chars=%d images=%d",
+            self.config.model_name,
+            len(prompt),
+            len(images or []),
+        )
+        start_time = time.time()
+        try:
+            response = self.client.invoke([HumanMessage(content=content)])
+        except Exception:
+            logger.exception("OpenRouter request failed for model=%s", self.config.model_name)
+            raise
+        elapsed = time.time() - start_time
         response_text = response.content if isinstance(response.content, str) else str(response.content)
         metadata = {
             "usage_metadata": getattr(response, "usage_metadata", None),
             "response_metadata": getattr(response, "response_metadata", None) or {},
         }
+        logger.info(
+            "OpenRouter response received model=%s elapsed=%.2fs usage=%s",
+            self.config.model_name,
+            elapsed,
+            metadata["usage_metadata"],
+        )
         return response_text, metadata
 
     def __call__(self, prompt: str, images: Optional[List[str]] = None, **generation_kwargs: Any) -> str:

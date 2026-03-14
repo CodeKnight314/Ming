@@ -278,7 +278,7 @@ class ResearchSubagent:
 
         new_context_ids = []
         if web_results:
-            with ThreadPoolExecutor(max_workers=max(1, len(web_results))) as executor:
+            with ThreadPoolExecutor(max_workers=min(8, len(web_results))) as executor:
                 futures = [
                     executor.submit(
                         self._get_or_fetch_url_context_id,
@@ -330,7 +330,7 @@ class ResearchSubagent:
                 + "\n".join(f"- {q}" for q in queries_for_context)
             )
 
-        with ThreadPoolExecutor(max_workers=max(1, len(context_ids))) as executor:
+        with ThreadPoolExecutor(max_workers=min(16, len(context_ids))) as executor:
             futures = [executor.submit(self.database.get_entry, cid) for cid in context_ids]
             for future in as_completed(futures):
                 entry = future.result()
@@ -449,7 +449,9 @@ class AgentState(TypedDict, total=False):
 
 
 class Agent:
-    _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+    # Match only well-formed tool calls whose payload is a JSON object.
+    # This avoids treating nested stray <tool_call> tags as the payload.
+    _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
     def __init__(self, config: AgentConfig):
         model_spec = config.model
