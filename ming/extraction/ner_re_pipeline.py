@@ -5,7 +5,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from threading import local
-from typing import List, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 from ming.extraction.ner_module import Chunk, Entity, NERModule
 from ming.extraction.re_module import REModule, Relationship
@@ -13,9 +13,12 @@ from ming.models import OpenRouterModelConfig
 from ming.extraction.selection_policy import (
     calculate_entity_density,
     calculate_source_score,
+    chunk_optimization,
 )
 from ming.extraction.kg_module import KGRedisStore
 from ming.extraction.kg_schema import Chunk as KGChunk, Entity as KGEntity
+
+SOURCE_SCORE_CUTOFF = 6.0
 
 
 @dataclass
@@ -47,6 +50,14 @@ class PipelineResult:
         return asdict(self)
 
 
+@dataclass
+class SourceChunkCollection:
+    text: str
+    url: str
+    chunks: List[Chunk]
+    source_score: float
+
+
 class NERREPipeline:
     def __init__(
         self,
@@ -68,7 +79,39 @@ class NERREPipeline:
             self._re_local.module = module
         return module
 
-    def _extract_chunk_relationships(self, chunk: Chunk, url: str) -> ChunkExtraction:
+    def collect_source_chunks(self, text: str, url: str) -> SourceChunkCollection:
+        chunks = self.ner.run(text, url)
+        densities = calculate_entity_density(chunks)
+        source_score = calculate_source_score(densities)
+        return SourceChunkCollection(
+            text=text,
+            url=url,
+            chunks=chunks,
+            source_score=source_score,
+        )
+
+    def collect_sources(
+        self, sources: Iterable[tuple[str, str]]
+    ) -> List[SourceChunkCollection]:
+        return [self.collect_source_chunks(text, url) for text, url in sources]
+
+    def select_chunks_for_re(
+        self,
+        sources: List[SourceChunkCollection],
+        source_score_cutoff: float = SOURCE_SCORE_CUTOFF,
+    ) -> List[Chunk]:
+        accepted_chunks: List[Chunk] = []
+        for source in sources:
+            if source.source_score < source_score_cutoff:
+                continue
+            accepted_chunks.extend(source.chunks)
+
+        if not accepted_chunks:
+            return []
+
+        return chunk_optimization(accepted_chunks)
+
+    def _extract_chunk_relationships(self, chunk: Chunk) -> ChunkExtraction:
         """Extract relationships for a chunk: one API call with chunk text and its entities."""
         target_entities = list(OrderedDict.fromkeys(e.text for e in chunk.entities))
         if not target_entities:
@@ -78,7 +121,7 @@ class NERREPipeline:
                 end=chunk.end,
                 entities=chunk.entities,
                 relationships=[],
-                url=url,
+                url=chunk.url,
             )
         relationships = self._get_re_module().run(
             chunk.text, target_entities
@@ -89,7 +132,7 @@ class NERREPipeline:
             end=chunk.end,
             entities=chunk.entities,
             relationships=relationships,
-            url=url,
+            url=chunk.url,
         )
 
     def _dedupe_relationships(self, relationships: List[Relationship]) -> List[Relationship]:
@@ -108,16 +151,16 @@ class NERREPipeline:
             deduped.append(relationship)
         return deduped
 
-    def run(self, text: str, url: str) -> None:
-        chunks = self.ner.run(text)
-        
+    def _build_kg_records(
+        self, chunks: List[Chunk]
+    ) -> tuple[List[KGChunk], List[KGEntity], Dict[tuple[int, str], List[KGEntity]]]:
         kg_chunks = []
         kg_entities = []
-        entity_map = {} # (chunk_idx, entity_text) -> List[KGEntity]
-        
+        entity_map: Dict[tuple[int, str], List[KGEntity]] = {}
+
         for i, chunk in enumerate(chunks):
             chunk_id = uuid.uuid4().hex
-            
+
             entity_ids = []
             for entity in chunk.entities:
                 entity_id = uuid.uuid4().hex
@@ -130,36 +173,39 @@ class NERREPipeline:
                 )
                 kg_entities.append(kg_entity)
                 entity_ids.append(entity_id)
-                
+
                 if (i, entity.text) not in entity_map:
                     entity_map[(i, entity.text)] = []
                 entity_map[(i, entity.text)].append(kg_entity)
-            
+
             kg_chunk = KGChunk(
                 chunk_id=chunk_id,
                 text=chunk.text,
                 entities=entity_ids,
-                url=url
+                url=chunk.url,
             )
             kg_chunks.append(kg_chunk)
 
-        densities = calculate_entity_density(chunks)
-        source_score = calculate_source_score(densities)
+        return kg_chunks, kg_entities, entity_map
 
-        # Filter to chunks that have entities (skip empty chunks for RE)
+    def run_re_on_chunks(self, chunks: List[Chunk]) -> List[KGEntity]:
+        if not chunks:
+            return []
+
+        kg_chunks, kg_entities, entity_map = self._build_kg_records(chunks)
         chunks_with_entities_indices = [i for i, c in enumerate(chunks) if c.entities]
 
-        if not chunks_with_entities_indices or source_score < 4.5:
+        if not chunks_with_entities_indices:
             self.kg_store.save_chunks(kg_chunks)
             self.kg_store.save_entities(kg_entities)
-            return
+            return kg_entities
 
         max_workers = min(self.max_workers, len(chunks_with_entities_indices))
         results_by_chunk_idx = {}
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
-                executor.submit(self._extract_chunk_relationships, chunks[idx], url): idx
+                executor.submit(self._extract_chunk_relationships, chunks[idx]): idx
                 for idx in chunks_with_entities_indices
             }
             for future in as_completed(future_map):
@@ -167,31 +213,24 @@ class NERREPipeline:
                 results_by_chunk_idx[idx] = future.result()
 
         all_relationships = []
-        # Temporary storage to link relationships back to entities after deduping
-        rel_to_entities = [] # List of (Relationship, KGEntity)
+        rel_to_entities = []
 
         for idx in chunks_with_entities_indices:
             extraction = results_by_chunk_idx.get(idx)
             if not extraction:
                 continue
             for rel in extraction.relationships:
-                # Find all entities in this chunk that match the subject
                 matching_entities = entity_map.get((idx, rel.subject), [])
                 for me in matching_entities:
                     rel_to_entities.append((rel, me))
                 all_relationships.append(rel)
 
-        # Dedupe relationships while maintaining links
-        seen_rels = {} # key -> Relationship
-        final_relationships = []
-        
-        for rel in all_relationships:
-            key = (rel.subject, rel.predicate, rel.object, rel.object_type)
-            if key not in seen_rels:
-                seen_rels[key] = rel
-                final_relationships.append(rel)
-            
-        # Update KGEntity objects with the deduped relationship IDs
+        final_relationships = self._dedupe_relationships(all_relationships)
+        seen_rels = {
+            (rel.subject, rel.predicate, rel.object, rel.object_type): rel
+            for rel in final_relationships
+        }
+
         for rel, entity in rel_to_entities:
             key = (rel.subject, rel.predicate, rel.object, rel.object_type)
             representative_rel = seen_rels[key]
@@ -201,4 +240,27 @@ class NERREPipeline:
         self.kg_store.save_chunks(kg_chunks)
         self.kg_store.save_entities(kg_entities)
         self.kg_store.save_relationships(final_relationships)
-        self.kg_store.perform_entity_resolution(kg_entities)
+        return kg_entities
+
+    def run_batch(
+        self,
+        sources: Iterable[tuple[str, str]],
+        source_score_cutoff: float = SOURCE_SCORE_CUTOFF,
+    ) -> List[KGEntity]:
+        collected_sources = self.collect_sources(sources)
+        optimized_chunks = self.select_chunks_for_re(
+            collected_sources,
+            source_score_cutoff=source_score_cutoff,
+        )
+        return self.run_re_on_chunks(optimized_chunks)
+
+    def run(
+        self,
+        text: str,
+        url: str,
+        source_score_cutoff: float = SOURCE_SCORE_CUTOFF,
+    ) -> List[KGEntity]:
+        return self.run_batch(
+            [(text, url)],
+            source_score_cutoff=source_score_cutoff,
+        )

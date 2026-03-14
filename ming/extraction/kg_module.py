@@ -42,6 +42,7 @@ class KGRedisStore:
 
         lsh = MinHashLSH(threshold=self.er_config.threshold, num_perm=self.er_config.num_perm)
         minhashes = {}
+        entities_by_id = {entity.entity_id: entity for entity in new_entities}
 
         for ent in new_entities:
             m = MinHash(num_perm=self.er_config.num_perm)
@@ -61,7 +62,7 @@ class KGRedisStore:
             cluster_members = [eid for eid in result if eid not in visited]
             final_cluster = []
             for eid in cluster_members:
-                target_ent = next((e for e in new_entities if e.entity_id == eid), None)
+                target_ent = entities_by_id.get(eid)
                 if target_ent and target_ent.label == ent.label:
                     final_cluster.append(target_ent)
                     visited.add(eid)
@@ -114,11 +115,12 @@ class KGRedisStore:
 
     def _scan_all_entries(
         self,
-    ) -> Tuple[Dict[str, Dict], Dict[str, Dict], Dict[str, Dict]]:
+    ) -> Tuple[Dict[str, Dict], Dict[str, Dict], Dict[str, Dict], Dict[str, Dict]]:
         """Scan Redis and categorise every KG entry by type."""
         relationships = {}
         entities = {}
         chunks = {}
+        canonical_entities = {}
 
         cursor = 0
         while True:
@@ -129,7 +131,9 @@ class KGRedisStore:
                 data = self.database.get_entry(key)
                 if not data:
                     continue
-                if "relationship_id" in data:
+                if "canonical_id" in data:
+                    canonical_entities[key] = data
+                elif "relationship_id" in data:
                     relationships[key] = data
                 elif "entity_id" in data:
                     entities[key] = data
@@ -138,7 +142,15 @@ class KGRedisStore:
             if cursor == 0:
                 break
 
-        return relationships, entities, chunks
+        return relationships, entities, chunks, canonical_entities
+
+    def _find_canonical_entity(self, text: str, canonical_entities: Dict[str, Dict]) -> Optional[Dict[str, Any]]:
+        """Find a canonical entity whose name matches (case-insensitive) the query text."""
+        text_lower = text.lower()
+        for ce in canonical_entities.values():
+            if ce.get("text", "").lower() == text_lower:
+                return ce
+        return None
 
     def _chunk_text_for_relationship(
         self,
@@ -194,13 +206,25 @@ class KGRedisStore:
         return results
 
     def get_neighbors(self, subject: str) -> List[str]:
-        """All relationships whose *subject* matches, grouped by context chunk."""
-        relationships, entities, chunks = self._scan_all_entries()
-        subject_lower = subject.lower()
+        """All relationships for a canonical entity or raw string match, grouped by chunk."""
+        relationships, entities, chunks, canonical_entities = self._scan_all_entries()
+        
+        # 1. Try to find a canonical entity for this subject
+        ce = self._find_canonical_entity(subject, canonical_entities)
+        
+        target_rel_ids = set()
+        if ce:
+            rel_ids_raw = ce.get("relationships", "[]")
+            rel_ids = json.loads(rel_ids_raw) if isinstance(rel_ids_raw, str) else rel_ids_raw
+            target_rel_ids.update(rel_ids)
+        
+        # 2. Collect pairs (rel_data, chunk_text)
         pairs: List[Tuple[Dict, str]] = []
+        subject_lower = subject.lower()
 
-        for rel_data in relationships.values():
-            if rel_data.get("subject", "").lower() == subject_lower:
+        for rel_id, rel_data in relationships.items():
+            # Match if ID is in canonical list OR if raw subject matches
+            if rel_id in target_rel_ids or rel_data.get("subject", "").lower() == subject_lower:
                 chunk_text = self._chunk_text_for_relationship(
                     rel_data["relationship_id"], entities, chunks,
                 )
@@ -209,24 +233,37 @@ class KGRedisStore:
         return self._group_by_chunk(pairs)
 
     def find_connection(self, subject: str, object_text: str) -> List[str]:
-        """BFS shortest path from *subject* to *object_text*, grouped by chunk."""
-        relationships, entities, chunks = self._scan_all_entries()
+        """BFS shortest path using canonical entities when available."""
+        relationships, entities, chunks, canonical_entities = self._scan_all_entries()
 
+        # Build adjacency: node -> list of (rel_data, next_node_text)
         adj: Dict[str, List[Tuple[Dict, str]]] = {}
-        for rel_data in relationships.values():
+        for rel_id, rel_data in relationships.items():
             src = rel_data.get("subject", "").lower()
             tgt = rel_data.get("object", "").lower()
-            adj.setdefault(src, []).append((rel_data, tgt))
+            
+            # If subject is resolved, use canonical name for more connections
+            ce_src = self._find_canonical_entity(src, canonical_entities)
+            src_key = ce_src["text"].lower() if ce_src else src
+            
+            ce_tgt = self._find_canonical_entity(tgt, canonical_entities)
+            tgt_key = ce_tgt["text"].lower() if ce_tgt else tgt
 
-        subject_lower = subject.lower()
-        object_lower = object_text.lower()
+            adj.setdefault(src_key, []).append((rel_data, tgt_key))
 
-        queue: deque[Tuple[str, List[Dict]]] = deque([(subject_lower, [])])
-        visited = {subject_lower}
+        # Resolve starting and ending nodes
+        ce_start = self._find_canonical_entity(subject, canonical_entities)
+        start_key = ce_start["text"].lower() if ce_start else subject.lower()
+        
+        ce_end = self._find_canonical_entity(object_text, canonical_entities)
+        end_key = ce_end["text"].lower() if ce_end else object_text.lower()
+
+        queue: deque[Tuple[str, List[Dict]]] = deque([(start_key, [])])
+        visited = {start_key}
 
         while queue:
             current, path = queue.popleft()
-            if current == object_lower and path:
+            if current == end_key and path:
                 pairs: List[Tuple[Dict, str]] = []
                 for rel_data in path:
                     chunk_text = self._chunk_text_for_relationship(

@@ -65,7 +65,22 @@ class KGQueryTool(BaseTool):
             ]
         }
 
-    def run(self, parameters: Dict[str, Any]) -> List[str]:
+    def run(
+        self,
+        action: str | Dict[str, Any],
+        subject: str | None = None,
+        object: str | None = None,
+        **kwargs: Any,
+    ) -> List[str]:
+        if isinstance(action, dict):
+            parameters = dict(action)
+        else:
+            parameters = {"action": action, "subject": subject, "object": object, **kwargs}
+
+        is_valid, error = self.validate_parameters(parameters)
+        if not is_valid:
+            raise ValueError(error)
+
         action = parameters["action"]
         if action == "get_neighbors":
             return self._get_neighbors(parameters["subject"])

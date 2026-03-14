@@ -1,5 +1,5 @@
 import spacy
-from typing import List
+from typing import List, Optional, Set
 from dataclasses import dataclass
 import re
 
@@ -17,7 +17,9 @@ class Chunk:
     start: int
     end: int
     entities: List[Entity]
-
+    url: str
+    embedding: Optional[List[float]] = None
+    tfidf_embedding: Optional[List[float]] = None
 
 class NERModule:
     _ENTITY_OF_INTEREST = {"ORG", "PERSON", "GPE", "PRODUCT", "EVENT", "FAC", "WORK_OF_ART", "LAW"}
@@ -150,7 +152,7 @@ class NERModule:
                     )
                 )
 
-    def split_text_into_chunks(self, text: str) -> List[Chunk]:
+    def split_text_into_chunks(self, text: str, url: str) -> List[Chunk]:
         doc = self.nlp(text)
         chunks = []
         chunk_sents = []
@@ -164,7 +166,7 @@ class NERModule:
                 chunk_end = chunk_sents[-1].end_char
                 chunk_text = text[chunk_start:chunk_end]
                 chunks.append(
-                    Chunk(text=chunk_text, start=chunk_start, end=chunk_end, entities=[])
+                    Chunk(text=chunk_text, start=chunk_start, end=chunk_end, entities=[], url=url)
                 )
                 chunk_sents = []
                 chunk_start = None
@@ -173,12 +175,12 @@ class NERModule:
             chunk_end = chunk_sents[-1].end_char
             chunk_text = text[chunk_start:chunk_end]
             chunks.append(
-                Chunk(text=chunk_text, start=chunk_start, end=chunk_end, entities=[])
+                Chunk(text=chunk_text, start=chunk_start, end=chunk_end, entities=[], url=url)
             )
         return chunks
 
-    def run(self, text: str) -> List[Chunk]:
+    def run(self, text: str, url: str) -> List[Chunk]:
         text = self.preprocess_text(text)
-        chunks = self.split_text_into_chunks(text)
+        chunks = self.split_text_into_chunks(text, url)
         self._extract_entities_for_chunks(chunks)
         return chunks
