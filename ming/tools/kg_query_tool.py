@@ -53,13 +53,13 @@ class KGQueryTool(BaseTool):
                 {
                     "name": "subject",
                     "type": "string",
-                    "description": "The entity to query the knowledge graph for information. Required for 'get_neighbors' and 'find_connection' queries.",
+                    "description": "The entity to query the knowledge graph for information. You can search for entities in both English and Chinese. Required for 'get_neighbors' and 'find_connection' queries.",
                     "required": True,
                 },
                 {
                     "name": "object",
                     "type": "string",
-                    "description": "The object to query the knowledge graph for information. Required for 'find_connection' queries.",
+                    "description": "The object to query the knowledge graph for information. You can search for entities in both English and Chinese. IMPORTANT: The 'subject' and 'object' must be in the same language. Required for 'find_connection' queries.",
                     "required": False,
                 }
             ]

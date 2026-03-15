@@ -70,7 +70,6 @@ class MingDeepResearch:
         self.nerre_pipeline = NERREPipeline(
             re_config=OpenRouterModelConfig(model_name="google/gemini-2.5-flash-lite"),
             kg_store=self.kg_store,
-            ner_model_name="en_core_web_sm",
             max_workers=32,
         )
 
@@ -387,6 +386,6 @@ if __name__ == "__main__":
     orchestrator = MingDeepResearch(config)
     import time
     start_time = time.time()
-    result = orchestrator.run("Acting as an expert in K-12 education research and an experienced frontline teacher, research and analyze global case studies on the practical application of AIGC (AI-Generated Content) in primary and secondary school classrooms. Identify, categorize, and analyze various application approaches and their corresponding examples. The final report should present an overall framework, detailed category discussions, practical implementation methods, future trends, and recommendations for educators.")
+    result = orchestrator.run("为我调研AI算法能否提升现有电子学读出时幅修正方法")
     end_time = time.time()
     print(f"\n\nTime taken: {round(end_time - start_time, 2)/60} minutes")

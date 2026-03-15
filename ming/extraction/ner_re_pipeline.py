@@ -63,10 +63,9 @@ class NERREPipeline:
         self,
         re_config: Union[dict, OpenRouterModelConfig],
         kg_store: KGRedisStore,
-        ner_model_name: str = "en_core_web_sm",
         max_workers: int = 4,
     ):
-        self.ner = NERModule(model_name=ner_model_name)
+        self.ner = NERModule()
         self.re_config = re_config
         self.kg_store = kg_store
         self.max_workers = max(1, max_workers)

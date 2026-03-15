@@ -229,6 +229,7 @@ You must follow a strict two-phase process for this entire section:
     - **Content**: Write dense, analytical prose. Use the gathered evidence to support every claim.
     - **Citations**: When using evidence from the KG tool, cite the source URL exactly as `[URL]`. Do NOT use numbers.
     - **Style**: Professional, objective, and evidence-grounded. No self-reference (e.g., "I found", "The KG shows").
+    - **Language**: Match the language of the provided report title and section plan in your output.
 
 ## Critical Rules
 - **No Markdown Fences**: Do not wrap your final response in ```markdown or ``` blocks.

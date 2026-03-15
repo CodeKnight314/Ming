@@ -12,8 +12,12 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OMP_NUM_THREADS"] = "1"
 
-def tokenize(text: str):
-    return text.split()
+def tokenize(text: str) -> List[str]:
+    # Simple robust tokenizer: use split() if spaces exist, otherwise fallback to characters (for Chinese/Japanese/etc.)
+    tokens = text.lower().split()
+    if len(tokens) <= 1 and len(text) > 1:
+        return list(text.lower())
+    return tokens
 
 
 def unique_entities(chunk: Chunk) -> Set[str]:
@@ -137,8 +141,8 @@ def redundancy_score(chunk_a, chunk_b) -> float:
     )
     
     # 3. Token Jaccard (new – catches paraphrases)
-    tokens_a = set(chunk_a.text.lower().split())  # or proper tokenizer + stopword removal
-    tokens_b = set(chunk_b.text.lower().split())
+    tokens_a = set(tokenize(chunk_a.text))
+    tokens_b = set(tokenize(chunk_b.text))
     token_jac = jaccard_sim(tokens_a, tokens_b)
     
     # 4. Entity Jaccard (new – huge win for history/research chunks; you already extract .entities)
@@ -157,7 +161,7 @@ def chunk_optimization(chunks: List[Chunk], k: int = 20, sim_threshold: float = 
         return list(chunks)
 
     model = SentenceTransformer("all-MiniLM-L6-v2")
-    tfidf_model = TfidfVectorizer()
+    tfidf_model = TfidfVectorizer(tokenizer=tokenize, token_pattern=None)
     
     corpus = [chunk.text for chunk in chunks]
     tfidf_model.fit(corpus)

@@ -48,7 +48,15 @@ class KGRedisStore:
 
         for ent in new_entities:
             m = MinHash(num_perm=self.er_config.num_perm)
-            for d in set(ent.text.lower().split()):
+            text = ent.text.lower()
+            # If text has no spaces, it might be Chinese or a single word.
+            # For entity resolution of Chinese names/terms, character-level n-grams or just characters are better.
+            tokens = text.split()
+            if len(tokens) <= 1 and len(text) > 1:
+                # Fallback to characters if no spaces (e.g. Chinese)
+                tokens = list(text)
+            
+            for d in set(tokens):
                 m.update(d.encode('utf8'))
             minhashes[ent.entity_id] = m
             lsh.insert(ent.entity_id, m)

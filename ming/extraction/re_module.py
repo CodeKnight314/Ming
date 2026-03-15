@@ -40,7 +40,32 @@ class REModule:
         spec = _config_to_spec(config)
         self.model = create_model_from_spec(spec)
 
-        self.prompt_template = """You are a relationship extraction system. Given a text passage and one or more target entities, extract factual relationships each target entity has in the passage. The object of a relationship can be another named entity, a concept, or a descriptive attribute.
+        self.prompt_template_zh = """你是一个关系抽取系统。给定一段文本和一个或多个目标实体，提取该文本中目标实体的所有事实关系。关系的宾语可以是另一个命名实体、概念或描述性属性。
+
+        仅返回符合此模式的 JSON 数组：
+        [
+            {{
+                "subject": "目标实体名称",
+                "predicate": "关系动词或类型",
+                "object": "相关的实体、概念或属性",
+                "object_type": "entity" | "concept" | "attribute",
+                "confidence": 0.0-1.0
+            }}
+        ]
+
+        规则：
+        - 仅为提供的目标实体提取关系，不要提取文中其他实体的关系。
+        - 每个目标实体可以有零个或多个关系。
+        - 如果目标实体没有任何有意义的关系，返回 []。
+
+        不要使用 markdown 代码块，不要有前言，不要有解释。
+
+        文本片段：
+        {text}
+
+        目标实体：{target_entities}
+        """
+        self.prompt_template_en = """You are a relationship extraction system. Given a text passage and one or more target entities, extract factual relationships each target entity has in the passage. The object of a relationship can be another named entity, a concept, or a descriptive attribute.
 
         Return ONLY a JSON array with this schema:
         [
@@ -65,6 +90,9 @@ class REModule:
 
         Target entities: {target_entities}
         """
+
+    def _is_chinese(self, text: str) -> bool:
+        return any('\u4e00' <= char <= '\u9fff' for char in text)
 
     def _write_json_error(
         self, input_prompt: str, raw_output: str, error: json.JSONDecodeError
@@ -138,7 +166,10 @@ class REModule:
         if not target_entities:
             return []
 
-        prompt = self.prompt_template.format(
+        is_chinese = self._is_chinese(text)
+        prompt_template = self.prompt_template_zh if is_chinese else self.prompt_template_en
+
+        prompt = prompt_template.format(
             text=text,
             target_entities=", ".join(target_entities),
         )
