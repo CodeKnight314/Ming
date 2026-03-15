@@ -21,6 +21,7 @@ from ming.core.prompts import (
     THINK_PROMPT,
 )
 from ming.core.redis import QueryStore, RedisDatabase
+from ming.core.text_metrics import count_language_aware_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class ResearchSubagentConfig(TypedDict, total=False):
     model: dict[str, Any]
     tool_configs: List[dict[str, Any]]
     max_iterations: Optional[int]
+    source_min_tokens: int
 
 class ResearchSubagentState(TypedDict, total=False):
     topic: str
@@ -44,8 +46,6 @@ class ResearchSubagentState(TypedDict, total=False):
 
 
 class ResearchSubagent:
-    _MIN_CONTEXT_CHARS = 200
-
     def __init__(
         self,
         config: ResearchSubagentConfig,
@@ -70,6 +70,7 @@ class ResearchSubagent:
                 logger.warning("Skipping tool %s: %s", tool_config, e)
 
         self.max_iterations = config.get("max_iterations", 3)
+        self.source_min_tokens = max(1, int(config.get("source_min_tokens", 400)))
         self.graph = self._build_graph()
         self.statistics = self._empty_statistics()
 
@@ -183,7 +184,7 @@ class ResearchSubagent:
         if content is None:
             return False
         cleaned = content.strip()
-        if len(cleaned) < self._MIN_CONTEXT_CHARS:
+        if count_language_aware_tokens(cleaned) < self.source_min_tokens:
             return False
 
         lowered = cleaned.lower()
@@ -233,6 +234,7 @@ class ResearchSubagent:
                     "title": web_result.get("title", "Untitled"),
                     "content": web_result.get("content", ""),
                     "raw_content": wb_raw.get("content", ""),
+                    "token_count": count_language_aware_tokens(wb_raw.get("content", "")),
                 }
                 context_id = self.database.create_entry(entry)
                 self.database.set_url_index(url, context_id)
@@ -435,6 +437,7 @@ class AgentConfig:
     system_prompt: str
     tools: List[ToolConfig] | None = None
     max_iterations: int = 15
+    max_tool_calls_per_turn: int = 8
 
 
 class AgentMessage(TypedDict):
@@ -479,6 +482,7 @@ class Agent:
                 logger.warning("Skipping tool %s: %s", tool_config, e)
         self.system_prompt = config.system_prompt
         self.max_iterations = config.max_iterations
+        self.max_tool_calls_per_turn = max(1, config.max_tool_calls_per_turn)
         self.graph = self._build_graph()
 
     def _format_tools_for_prompt(self) -> str:
@@ -525,7 +529,7 @@ class Agent:
                 if isinstance(payload, dict) and "name" in payload:
                     calls.append(payload)
             except json.JSONDecodeError:
-                logger.warning("Malformed tool_call JSON: %s", match.group(1)[:120])
+                continue
         return calls
 
     def _strip_tool_calls(self, text: str) -> str:
@@ -542,24 +546,26 @@ class Agent:
         tool_calls = self._parse_tool_calls(last_response)
 
         results: List[str] = []
+        executed = 0
         for call in tool_calls:
             name = call.get("name", "")
             params = call.get("parameters", {})
             tool = self._tool_map.get(name)
             if tool is None:
-                results.append(f"[{name}] Error: unknown tool.")
                 continue
-            valid, err = tool.validate_parameters(params)
+            valid, _ = tool.validate_parameters(params)
             if not valid:
-                results.append(f"[{name}] Validation error: {err}")
                 continue
             try:
                 result = tool.run(**params)
                 results.append(f"[{name}]\n{result}")
+                executed += 1
+                if executed >= self.max_tool_calls_per_turn:
+                    break
             except Exception as exc:
                 results.append(f"[{name}] Error: {exc}")
 
-        tool_content = "\n\n".join(results)
+        tool_content = "\n\n".join(results) if results else "No valid tool calls executed."
         messages = state["messages"] + [{"role": "tool_result", "content": tool_content}]
         return {"messages": messages, "iteration": state.get("iteration", 0) + 1}
 

@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, get_origin
 from uuid import uuid4
 
 from ming.core.redis import RedisDatabase
+from ming.core.reference_cleanup import canonicalize_url
+from ming.core.text_metrics import normalize_whitespace, tokenize_for_overlap
 from ming.extraction.kg_schema import Chunk, Entity, Relationship, CanonicalEntity
 from datasketch import MinHash, MinHashLSH
 
@@ -230,6 +232,61 @@ class KGRedisStore:
         return "", ""
 
     @staticmethod
+    def _normalize_predicate(predicate: str) -> str:
+        return normalize_whitespace(predicate).lower()
+
+    @staticmethod
+    def _truncate_excerpt(text: str, max_chars: int = 280) -> str:
+        cleaned = normalize_whitespace(text)
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[:max_chars].rstrip() + "..."
+
+    def _build_resolved_name_lookup(
+        self,
+        entities: Dict[str, Dict],
+        canonical_entities: Dict[str, Dict],
+    ) -> Dict[str, str]:
+        resolved: Dict[str, str] = {}
+        for entity_data in entities.values():
+            raw_text = normalize_whitespace(entity_data.get("text", ""))
+            if not raw_text:
+                continue
+            resolved_id = entity_data.get("resolved_id", "")
+            canonical_name = ""
+            if resolved_id:
+                canonical_name = normalize_whitespace(
+                    canonical_entities.get(resolved_id, {}).get("text", "")
+                )
+            if canonical_name:
+                resolved.setdefault(raw_text.lower(), canonical_name)
+        return resolved
+
+    def _canonical_name(
+        self,
+        text: str,
+        *,
+        canonical_entities: Dict[str, Dict],
+        resolved_lookup: Dict[str, str],
+    ) -> str:
+        normalized = normalize_whitespace(text)
+        if not normalized:
+            return ""
+        direct = self._find_canonical_entity(normalized, canonical_entities)
+        if direct:
+            return normalize_whitespace(direct.get("text", "")) or normalized
+        return resolved_lookup.get(normalized.lower(), normalized)
+
+    @staticmethod
+    def _query_overlap_score(query_tokens: set[str], *texts: str) -> int:
+        if not query_tokens:
+            return 0
+        haystack_tokens: set[str] = set()
+        for text in texts:
+            haystack_tokens.update(tokenize_for_overlap(text))
+        return len(query_tokens & haystack_tokens)
+
+    @staticmethod
     def _format_rel_line(rel_data: Dict[str, str]) -> str:
         subj = rel_data.get("subject", "")
         pred = rel_data.get("predicate", "")
@@ -267,7 +324,8 @@ class KGRedisStore:
         results: List[str] = []
         for chunk_text, url in chunk_order:
             rel_lines = "\n".join(chunk_to_rels[(chunk_text, url)])
-            results.append(f"{rel_lines}\n{chunk_text}\nURL: {url}")
+            formatted_url = canonicalize_url(url) if url else url
+            results.append(f"{rel_lines}\n{chunk_text}\nURL: {formatted_url}")
         return results
 
     def get_neighbors(self, subject: str) -> List[str]:
@@ -343,3 +401,233 @@ class KGRedisStore:
                     queue.append((neighbor, path + [rel_data]))
 
         return []
+
+    def search_evidence(
+        self,
+        query: str,
+        limit: int = 10,
+        diversify_by_url: bool = True,
+    ) -> Dict[str, Any]:
+        relationships, entities, chunks, canonical_entities = self._scan_all_entries()
+        if not relationships:
+            return {
+                "query": query,
+                "limit": limit,
+                "thin_pool": True,
+                "unique_url_count": 0,
+                "cards": [],
+            }
+
+        resolved_lookup = self._build_resolved_name_lookup(entities, canonical_entities)
+        rel_to_chunk: Dict[str, Dict[str, Any]] = {}
+        for entity_data in entities.values():
+            rel_ids_raw = entity_data.get("relationships", "[]")
+            rel_ids = json.loads(rel_ids_raw) if isinstance(rel_ids_raw, str) else rel_ids_raw
+            chunk_id = entity_data.get("chunk_id", "")
+            chunk_data = chunks.get(chunk_id)
+            if not chunk_data:
+                continue
+            for rel_id in rel_ids:
+                existing = rel_to_chunk.get(rel_id)
+                if existing is None or float(chunk_data.get("chunk_score", 0.0) or 0.0) > float(
+                    existing.get("chunk_score", 0.0) or 0.0
+                ):
+                    rel_to_chunk[rel_id] = chunk_data
+
+        query_tokens = set(tokenize_for_overlap(query))
+        grouped: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
+
+        for rel_data in relationships.values():
+            chunk_data = rel_to_chunk.get(rel_data.get("relationship_id", ""))
+            if not chunk_data:
+                continue
+
+            canonical_subject = self._canonical_name(
+                rel_data.get("subject", ""),
+                canonical_entities=canonical_entities,
+                resolved_lookup=resolved_lookup,
+            )
+            canonical_object = self._canonical_name(
+                rel_data.get("object", ""),
+                canonical_entities=canonical_entities,
+                resolved_lookup=resolved_lookup,
+            ) or normalize_whitespace(rel_data.get("object", ""))
+            predicate_norm = self._normalize_predicate(rel_data.get("predicate", ""))
+            object_type = normalize_whitespace(rel_data.get("object_type", "")) or "attribute"
+
+            fact_key = (canonical_subject, predicate_norm, canonical_object, object_type)
+            fact_text = f"{canonical_subject} {predicate_norm} {canonical_object}".strip()
+            excerpt = self._truncate_excerpt(chunk_data.get("text", ""))
+            overlap_score = self._query_overlap_score(query_tokens, fact_text, excerpt)
+
+            if query_tokens and overlap_score == 0:
+                continue
+
+            raw_url = normalize_whitespace(chunk_data.get("url", ""))
+            if not raw_url:
+                continue
+            canonical_url = canonicalize_url(raw_url)
+            chunk_score = float(chunk_data.get("chunk_score", 0.0) or 0.0)
+            source_score = float(chunk_data.get("source_score", 0.0) or 0.0)
+            confidence = float(rel_data.get("confidence", 0.0) or 0.0)
+
+            group = grouped.setdefault(
+                fact_key,
+                {
+                    "fact": f"{canonical_subject} -[{predicate_norm}]-> {canonical_object} ({object_type})",
+                    "support_by_url": {},
+                    "query_relevance": 0,
+                    "confidence_sum": 0.0,
+                    "confidence_count": 0,
+                    "best_source_score": 0.0,
+                },
+            )
+            group["query_relevance"] = max(group["query_relevance"], overlap_score)
+            group["confidence_sum"] += confidence
+            group["confidence_count"] += 1
+            group["best_source_score"] = max(group["best_source_score"], source_score)
+
+            existing_support = group["support_by_url"].get(canonical_url)
+            support_payload = {
+                "url": canonical_url,
+                "excerpt": excerpt,
+                "chunk_score": chunk_score,
+                "source_score": source_score,
+                "confidence": confidence,
+            }
+            if existing_support is None or (
+                chunk_score,
+                source_score,
+                confidence,
+            ) > (
+                existing_support["chunk_score"],
+                existing_support["source_score"],
+                existing_support["confidence"],
+            ):
+                group["support_by_url"][canonical_url] = support_payload
+
+        if not grouped:
+            for rel_data in relationships.values():
+                chunk_data = rel_to_chunk.get(rel_data.get("relationship_id", ""))
+                if not chunk_data:
+                    continue
+                canonical_subject = self._canonical_name(
+                    rel_data.get("subject", ""),
+                    canonical_entities=canonical_entities,
+                    resolved_lookup=resolved_lookup,
+                )
+                canonical_object = self._canonical_name(
+                    rel_data.get("object", ""),
+                    canonical_entities=canonical_entities,
+                    resolved_lookup=resolved_lookup,
+                ) or normalize_whitespace(rel_data.get("object", ""))
+                predicate_norm = self._normalize_predicate(rel_data.get("predicate", ""))
+                object_type = normalize_whitespace(rel_data.get("object_type", "")) or "attribute"
+                fact_key = (canonical_subject, predicate_norm, canonical_object, object_type)
+                raw_url = normalize_whitespace(chunk_data.get("url", ""))
+                if not raw_url:
+                    continue
+                canonical_url = canonicalize_url(raw_url)
+                chunk_score = float(chunk_data.get("chunk_score", 0.0) or 0.0)
+                source_score = float(chunk_data.get("source_score", 0.0) or 0.0)
+                grouped.setdefault(
+                    fact_key,
+                    {
+                        "fact": f"{canonical_subject} -[{predicate_norm}]-> {canonical_object} ({object_type})",
+                        "support_by_url": {
+                            canonical_url: {
+                                "url": canonical_url,
+                                "excerpt": self._truncate_excerpt(chunk_data.get("text", "")),
+                                "chunk_score": chunk_score,
+                                "source_score": source_score,
+                                "confidence": float(rel_data.get("confidence", 0.0) or 0.0),
+                            }
+                        },
+                        "query_relevance": 0,
+                        "confidence_sum": float(rel_data.get("confidence", 0.0) or 0.0),
+                        "confidence_count": 1,
+                        "best_source_score": source_score,
+                    },
+                )
+                if len(grouped) >= max(limit * 3, 16):
+                    break
+
+        unique_urls = {
+            url
+            for group in grouped.values()
+            for url in group["support_by_url"].keys()
+        }
+        cards: List[Dict[str, Any]] = []
+        for group in grouped.values():
+            supports = sorted(
+                group["support_by_url"].values(),
+                key=lambda item: (
+                    item["source_score"],
+                    item["chunk_score"],
+                    item["confidence"],
+                    item["url"],
+                ),
+                reverse=True,
+            )
+            avg_confidence = (
+                group["confidence_sum"] / group["confidence_count"]
+                if group["confidence_count"]
+                else 0.0
+            )
+            cards.append(
+                {
+                    "fact": group["fact"],
+                    "supporting_urls": [support["url"] for support in supports],
+                    "chunks": [
+                        {"url": support["url"], "excerpt": support["excerpt"]}
+                        for support in supports
+                    ],
+                    "support_count": len(supports),
+                    "query_relevance": group["query_relevance"],
+                    "best_source_score": group["best_source_score"],
+                    "avg_confidence": avg_confidence,
+                }
+            )
+
+        cards.sort(
+            key=lambda card: (
+                card["query_relevance"],
+                card["support_count"],
+                card["best_source_score"],
+                card["avg_confidence"],
+                card["fact"],
+            ),
+            reverse=True,
+        )
+
+        if diversify_by_url and cards:
+            buckets: Dict[str, List[Dict[str, Any]]] = {}
+            bucket_order: List[str] = []
+            for card in cards:
+                dominant_url = card["supporting_urls"][0] if card["supporting_urls"] else "__no_url__"
+                if dominant_url not in buckets:
+                    buckets[dominant_url] = []
+                    bucket_order.append(dominant_url)
+                buckets[dominant_url].append(card)
+
+            diversified: List[Dict[str, Any]] = []
+            while len(diversified) < len(cards):
+                progressed = False
+                for dominant_url in bucket_order:
+                    bucket = buckets[dominant_url]
+                    if not bucket:
+                        continue
+                    diversified.append(bucket.pop(0))
+                    progressed = True
+                if not progressed:
+                    break
+            cards = diversified
+
+        limited_cards = cards[: max(1, limit)]
+        return {
+            "query": query,
+            "limit": limit,
+            "thin_pool": len(unique_urls) < 8,
+            "unique_url_count": len(unique_urls),
+            "cards": limited_cards,
+        }

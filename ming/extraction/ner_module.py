@@ -18,6 +18,8 @@ class Chunk:
     end: int
     entities: List[Entity]
     url: str
+    chunk_score: float = 0.0
+    source_score: float = 0.0
     embedding: Optional[List[float]] = None
     tfidf_embedding: Optional[List[float]] = None
 

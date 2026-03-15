@@ -17,6 +17,7 @@ from ming.extraction.selection_policy import (
 )
 from ming.extraction.kg_module import KGRedisStore
 from ming.extraction.kg_schema import Chunk as KGChunk, Entity as KGEntity
+from ming.core.text_metrics import count_language_aware_tokens
 
 SOURCE_SCORE_CUTOFF = 6.0
 
@@ -56,6 +57,8 @@ class SourceChunkCollection:
     url: str
     chunks: List[Chunk]
     source_score: float
+    context_id: str = ""
+    token_count: int = 0
 
 
 class NERREPipeline:
@@ -78,32 +81,87 @@ class NERREPipeline:
             self._re_local.module = module
         return module
 
-    def collect_source_chunks(self, text: str, url: str) -> SourceChunkCollection:
+    def collect_source_chunks(
+        self,
+        text: str,
+        url: str,
+        context_id: str = "",
+    ) -> SourceChunkCollection:
         chunks = self.ner.run(text, url)
         densities = calculate_entity_density(chunks)
         source_score = calculate_source_score(densities)
+        for chunk, chunk_score in zip(chunks, densities):
+            chunk.chunk_score = chunk_score
+            chunk.source_score = source_score
         return SourceChunkCollection(
             text=text,
             url=url,
+            context_id=context_id,
+            token_count=count_language_aware_tokens(text),
             chunks=chunks,
             source_score=source_score,
         )
 
     def collect_sources(
-        self, sources: Iterable[tuple[str, str]]
+        self, sources: Iterable[tuple[str, str] | tuple[str, str, str]]
     ) -> List[SourceChunkCollection]:
-        return [self.collect_source_chunks(text, url) for text, url in sources]
+        collected: List[SourceChunkCollection] = []
+        for source in sources:
+            if len(source) == 2:
+                text, url = source
+                context_id = ""
+            else:
+                text, url, context_id = source
+            collected.append(self.collect_source_chunks(text, url, context_id=context_id))
+        return collected
+
+    def filter_sources(
+        self,
+        sources: List[SourceChunkCollection],
+        *,
+        min_tokens: int = 400,
+        source_score_cutoff: float = SOURCE_SCORE_CUTOFF,
+        source_budget: Optional[int] = None,
+    ) -> List[SourceChunkCollection]:
+        retained = [
+            source
+            for source in sources
+            if source.token_count >= min_tokens and source.source_score >= source_score_cutoff
+        ]
+        retained.sort(
+            key=lambda source: (source.source_score, source.token_count, source.url),
+            reverse=True,
+        )
+        if source_budget is not None and source_budget > 0:
+            retained = retained[:source_budget]
+        return retained
+
+    @staticmethod
+    def _top_chunks_for_source(
+        source: SourceChunkCollection,
+        *,
+        max_chunks_per_source: int,
+    ) -> List[Chunk]:
+        ranked_chunks = sorted(
+            source.chunks,
+            key=lambda chunk: (chunk.chunk_score, len(chunk.text), len(chunk.entities)),
+            reverse=True,
+        )
+        return ranked_chunks[:max_chunks_per_source]
 
     def select_chunks_for_re(
         self,
         sources: List[SourceChunkCollection],
-        source_score_cutoff: float = SOURCE_SCORE_CUTOFF,
+        max_chunks_per_source: int = 8,
     ) -> List[Chunk]:
         accepted_chunks: List[Chunk] = []
         for source in sources:
-            if source.source_score < source_score_cutoff:
-                continue
-            accepted_chunks.extend(source.chunks)
+            accepted_chunks.extend(
+                self._top_chunks_for_source(
+                    source,
+                    max_chunks_per_source=max(1, max_chunks_per_source),
+                )
+            )
 
         if not accepted_chunks:
             return []
@@ -182,6 +240,8 @@ class NERREPipeline:
                 text=chunk.text,
                 entities=entity_ids,
                 url=chunk.url,
+                chunk_score=chunk.chunk_score,
+                source_score=chunk.source_score,
             )
             kg_chunks.append(kg_chunk)
 
@@ -243,13 +303,23 @@ class NERREPipeline:
 
     def run_batch(
         self,
-        sources: Iterable[tuple[str, str]],
+        sources: Iterable[tuple[str, str] | tuple[str, str, str]],
+        *,
+        min_tokens: int = 400,
         source_score_cutoff: float = SOURCE_SCORE_CUTOFF,
+        source_budget: Optional[int] = None,
+        max_chunks_per_source: int = 8,
     ) -> List[KGEntity]:
         collected_sources = self.collect_sources(sources)
-        optimized_chunks = self.select_chunks_for_re(
+        retained_sources = self.filter_sources(
             collected_sources,
+            min_tokens=min_tokens,
             source_score_cutoff=source_score_cutoff,
+            source_budget=source_budget,
+        )
+        optimized_chunks = self.select_chunks_for_re(
+            retained_sources,
+            max_chunks_per_source=max_chunks_per_source,
         )
         return self.run_re_on_chunks(optimized_chunks)
 
@@ -257,9 +327,16 @@ class NERREPipeline:
         self,
         text: str,
         url: str,
+        *,
+        min_tokens: int = 400,
         source_score_cutoff: float = SOURCE_SCORE_CUTOFF,
+        source_budget: Optional[int] = None,
+        max_chunks_per_source: int = 8,
     ) -> List[KGEntity]:
         return self.run_batch(
             [(text, url)],
+            min_tokens=min_tokens,
             source_score_cutoff=source_score_cutoff,
+            source_budget=source_budget,
+            max_chunks_per_source=max_chunks_per_source,
         )

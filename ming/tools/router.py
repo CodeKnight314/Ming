@@ -50,6 +50,9 @@ def create_tool_from_spec(spec: ToolConfig) -> BaseTool:
         return WebSearchTool(config=config)
 
     if tool_type == "open_url_tool":
-        return OpenUrlTool(name=spec.get("name", "open_url_tool"))
+        return OpenUrlTool(
+            name=spec.get("name", "open_url_tool"),
+            min_tokens=int(spec.get("min_tokens", 400)),
+        )
 
     raise ValueError(f"Unsupported tool type '{tool_type}'.")

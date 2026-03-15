@@ -12,14 +12,14 @@ def _clean_url(raw_url: str) -> str:
     url = raw_url.strip()
 
     # The writer can leak trailing quotes, brackets, and commas.
-    while url and url[-1] in "',\"]":
+    while url and url[-1] in ".,;:')\"]":
         url = url[:-1].rstrip()
 
     return url
 
 
-def _canonicalize_url(url: str) -> str:
-    parts = urlsplit(url)
+def canonicalize_url(url: str) -> str:
+    parts = urlsplit(_clean_url(url))
     normalized_path = parts.path.rstrip("/")
     return urlunsplit(
         (
@@ -46,7 +46,7 @@ def _extract_unique_urls(lines: list[str]) -> list[str]:
             raise ValueError(f"Unsupported reference line: {line.rstrip()}")
 
         url = _clean_url(match.group(2))
-        key = _canonicalize_url(url)
+        key = canonicalize_url(url)
         if key not in seen_keys:
             seen_keys.add(key)
             unique_urls.append(url)
@@ -94,12 +94,12 @@ def normalize_markdown_references(markdown_text: str, heading: str = "## Referen
 
     unique_urls = _extract_unique_urls(reference_lines)
     url_to_index = {
-        _canonicalize_url(url): index for index, url in enumerate(unique_urls, start=1)
+        canonicalize_url(url): index for index, url in enumerate(unique_urls, start=1)
     }
 
     def replace_inline_url(match: re.Match[str]) -> str:
         url = _clean_url(match.group(1))
-        key = _canonicalize_url(url)
+        key = canonicalize_url(url)
         if key not in url_to_index:
             url_to_index[key] = len(unique_urls) + 1
             unique_urls.append(url)

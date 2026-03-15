@@ -4,6 +4,8 @@ from trafilatura import fetch_url, extract
 from typing import Dict, Any, Tuple
 from urllib.parse import urlparse
 
+from ming.core.text_metrics import count_language_aware_tokens
+
 class OpenUrlTool(BaseTool):
     _UNSUPPORTED_DOMAINS = {
         "youtube.com",
@@ -24,10 +26,9 @@ class OpenUrlTool(BaseTool):
         "www.facebook.com",
     }
 
-    _MIN_CONTENT_CHARS = 200
-
-    def __init__(self, name: str = "open_url_tool"):
+    def __init__(self, name: str = "open_url_tool", min_tokens: int = 400):
         super().__init__(name)
+        self.min_tokens = max(1, int(min_tokens))
 
     def validate_parameters(self, parameters: Dict[str, Any]) -> Tuple[bool, str]:
         url = parameters.get("url")
@@ -101,7 +102,8 @@ class OpenUrlTool(BaseTool):
                 return result
 
             cleaned = content.strip()
-            if len(cleaned) < self._MIN_CONTENT_CHARS:
+            token_count = count_language_aware_tokens(cleaned)
+            if token_count < self.min_tokens:
                 result.update(
                     {
                         "content": cleaned,
@@ -109,7 +111,7 @@ class OpenUrlTool(BaseTool):
                         "discard_reason": "low_content",
                         "retrieval_notes": (
                             f"Extracted content below minimum threshold: "
-                            f"{len(cleaned)} < {self._MIN_CONTENT_CHARS}"
+                            f"{token_count} < {self.min_tokens} language-aware tokens"
                         ),
                     }
                 )
@@ -121,7 +123,9 @@ class OpenUrlTool(BaseTool):
                     "status": "success",
                     "discard": False,
                     "discard_reason": None,
-                    "retrieval_notes": f"Extracted {len(cleaned)} characters",
+                    "retrieval_notes": (
+                        f"Extracted {len(cleaned)} characters and {token_count} language-aware tokens"
+                    ),
                 }
             )
             return result

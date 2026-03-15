@@ -29,6 +29,8 @@ class Chunk:
     text: str
     entities: List[str]
     url: str
+    chunk_score: float = 0.0
+    source_score: float = 0.0
 
 
 @dataclass
@@ -39,4 +41,3 @@ class Relationship:
     object: str
     object_type: str
     confidence: float
-

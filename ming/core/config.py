@@ -77,7 +77,20 @@ def create_subagent_from_config(
     if query_store is None:
         query_store = create_queries_store_from_config(config)
 
-    subagent_cfg = config.get("subagent", {})
+    subagent_cfg = dict(config.get("subagent", {}))
+    if "source_min_tokens" in config:
+        subagent_cfg["source_min_tokens"] = int(config["source_min_tokens"])
+    tool_configs = []
+    for tool_config in subagent_cfg.get("tool_configs", []) or []:
+        if isinstance(tool_config, dict):
+            normalized = dict(tool_config)
+            if normalized.get("type") == "open_url_tool" and "source_min_tokens" in config:
+                normalized.setdefault("min_tokens", int(config["source_min_tokens"]))
+            tool_configs.append(normalized)
+        else:
+            tool_configs.append(tool_config)
+    if tool_configs:
+        subagent_cfg["tool_configs"] = tool_configs
     subagent_config: ResearchSubagentConfig = {
         k: v for k, v in subagent_cfg.items() if v is not None
     }
@@ -175,6 +188,9 @@ def create_ming_deep_research_config(
             config.get("outline_context_token_budget", 128_000)
         ),
         outline_source_char_limit=int(config.get("outline_source_char_limit", 3000)),
+        source_min_tokens=int(config.get("source_min_tokens", 400)),
+        research_source_budget=int(config.get("research_source_budget", 250)),
+        max_chunks_per_source=int(config.get("max_chunks_per_source", 8)),
     )
 
 

@@ -16,13 +16,16 @@
   },
   "num_research_subagents": 4,
   "draft_output_path": "reports/draft.md",
-  "outline_max_context_ids": 64,
+  "source_min_tokens": 400,
+  "research_source_budget": 250,
+  "max_chunks_per_source": 8,
+  "outline_max_context_ids": 200,
   "outline_context_token_budget": 128000,
   "outline_source_char_limit": 3000,
   "writer_model": {
     "model_name": "qwen/qwen3.5-plus-02-15",
     "temperature": 0.2,
-    "max_tokens": 4096
+    "max_tokens": 8192
   },
   "scout": {
     "model": {
@@ -74,7 +77,8 @@
       },
       {
         "type": "open_url_tool",
-        "name": "open_url_tool"
+        "name": "open_url_tool",
+        "min_tokens": 400
       },
       {
         "type": "think_tool",

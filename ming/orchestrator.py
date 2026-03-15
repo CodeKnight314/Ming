@@ -1,19 +1,18 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import logging
-import re
 from typing import Any, Dict, List
 
 from ming.core.config import create_queries_store_from_config, create_redis_from_config
 from ming.core.outline_parser import extract_outline_block, outline_to_sections
 from ming.core.redis import QueryStoreConfig, RedisDatabaseConfig
 from ming.scout import ScoutSubagent
-from ming.subagent import ResearchSubagent, Agent, AgentConfig, AgentResult
+from ming.subagent import ResearchSubagent
 from ming.extraction.kg_module import KGRedisStore, ERConfig
 from ming.tools.kg_query_tool import KGQueryTool
 from ming.writer_agent import WriterAgent, WriterAgentConfig
 from ming.extraction.ner_re_pipeline import NERREPipeline
-from ming.models import OpenRouterModelConfig
+from ming.models import OpenRouterModel, OpenRouterModelConfig
 from ming.core.prompts import PLANNING_PROMPT, OUTLINE_PROMPT
 import xml.etree.ElementTree
 from tqdm import tqdm
@@ -33,6 +32,9 @@ class MingDeepResearchConfig:
     outline_max_context_ids: int = 180
     outline_context_token_budget: int = 128_000
     outline_source_char_limit: int = 2500
+    source_min_tokens: int = 400
+    research_source_budget: int = 250
+    max_chunks_per_source: int = 8
 
 
 class MingDeepResearch:
@@ -77,31 +79,39 @@ class MingDeepResearch:
             config.scout_config
         )
 
+        subagent_config = dict(config.subagent_config)
+        subagent_config["source_min_tokens"] = config.source_min_tokens
+        normalized_tool_configs = []
+        for tool_config in subagent_config.get("tool_configs", []) or []:
+            if isinstance(tool_config, dict):
+                normalized = dict(tool_config)
+                if normalized.get("type") == "open_url_tool":
+                    normalized.setdefault("min_tokens", config.source_min_tokens)
+                normalized_tool_configs.append(normalized)
+            else:
+                normalized_tool_configs.append(tool_config)
+        subagent_config["tool_configs"] = normalized_tool_configs
+        self.subagent_config = subagent_config
+
         self.research_subagents = [ResearchSubagent(
-            config=config.subagent_config,
+            config=self.subagent_config,
             database=self.context_redis,
             query_store=self.queries_redis,
         ) for _ in range(config.num_research_subagents)]
 
-        self.planning_agent = Agent(
-            config=AgentConfig(
-                model=OpenRouterModelConfig(
-                    model_name="qwen/qwen3.5-plus-02-15",
-                    temperature=0.2,
-                    max_tokens=1024,
-                ),
-                system_prompt=PLANNING_PROMPT
+        self.planning_model = OpenRouterModel(
+            OpenRouterModelConfig(
+                model_name="qwen/qwen3.5-plus-02-15",
+                temperature=0.2,
+                max_tokens=1024,
             )
         )
 
-        self.outline_agent = Agent(
-            config=AgentConfig(
-                model=OpenRouterModelConfig(
-                    model_name="qwen/qwen3.5-plus-02-15",
-                    temperature=0.2,
-                    max_tokens=8192,
-                ),
-                system_prompt=OUTLINE_PROMPT
+        self.outline_model = OpenRouterModel(
+            OpenRouterModelConfig(
+                model_name="qwen/qwen3.5-plus-02-15",
+                temperature=0.2,
+                max_tokens=8192,
             )
         )
 
@@ -119,15 +129,27 @@ class MingDeepResearch:
         )
 
     @staticmethod
-    def _extract_agent_output(result: str | AgentResult) -> str:
-        if isinstance(result, AgentResult):
-            return result.output
-        return result
+    def _generate_with_system_prompt(
+        model: OpenRouterModel,
+        system_prompt: str,
+        user_input: str,
+    ) -> str:
+        prompt = "\n".join(
+            [
+                system_prompt.strip(),
+                "",
+                "User:",
+                user_input.strip(),
+                "",
+                "Assistant:",
+            ]
+        )
+        return model.generate(prompt).strip()
 
     @staticmethod
-    def _parse_planning_result(planning_result: str | AgentResult) -> Dict[str, Any]:
+    def _parse_planning_result(planning_result: str) -> Dict[str, Any]:
         # Parse the planning result using xml.etree.ElementTree
-        raw_output = MingDeepResearch._extract_agent_output(planning_result)
+        raw_output = planning_result
         try:
             # Handle potential markdown wrapping or extra whitespace
             cleaned = raw_output.strip()
@@ -244,7 +266,11 @@ class MingDeepResearch:
         # 2. Plan the research
         logger.info("Planning research angles...")
         start_time = time.time()
-        planning_result = self.planning_agent.run(scout_result["landscape_brief"])
+        planning_result = self._generate_with_system_prompt(
+            self.planning_model,
+            PLANNING_PROMPT,
+            scout_result["landscape_brief"],
+        )
         research_plan = self._parse_planning_result(planning_result)
         end_time = time.time()
         logger.info(f"Planning research angles took {round(end_time - start_time, 2)} seconds")
@@ -264,7 +290,7 @@ class MingDeepResearch:
                 )
                 
                 subagent = ResearchSubagent(
-                    config=self.config.subagent_config,
+                    config=self.subagent_config,
                     database=self.context_redis,
                     query_store=self.queries_redis,
                 )
@@ -305,10 +331,32 @@ class MingDeepResearch:
         for cid in tqdm(all_context_ids):
             entry = self.context_redis.get_entry(cid)
             if entry and entry.get("raw_content"):
-                source_inputs.append((entry["raw_content"], entry.get("url", "")))
+                source_inputs.append((entry["raw_content"], entry.get("url", ""), cid))
+
+        collected_sources = self.nerre_pipeline.collect_sources(source_inputs)
+        retained_sources = self.nerre_pipeline.filter_sources(
+            collected_sources,
+            min_tokens=self.config.source_min_tokens,
+            source_budget=self.config.research_source_budget,
+        )
+        retained_context_ids = [source.context_id for source in retained_sources if source.context_id]
+        logger.info(
+            "Retained %d/%d sources after minimum-length filtering, score cutoff, and budget pruning",
+            len(retained_sources),
+            len(collected_sources),
+        )
+        optimized_chunks = self.nerre_pipeline.select_chunks_for_re(
+            retained_sources,
+            max_chunks_per_source=self.config.max_chunks_per_source,
+        )
+        logger.info(
+            "Selected %d chunks across retained sources (max %d per source) for KG extraction",
+            len(optimized_chunks),
+            self.config.max_chunks_per_source,
+        )
 
         try:
-            all_kg_entities.extend(self.nerre_pipeline.run_batch(source_inputs))
+            all_kg_entities.extend(self.nerre_pipeline.run_re_on_chunks(optimized_chunks))
         except Exception as e:
             logger.warning(f"Batch NER/RE failed: {e}")
         end_time = time.time()
@@ -326,7 +374,7 @@ class MingDeepResearch:
         # final report
         logger.info("Generating final report...")
         initial_context = self._build_outline_context(
-            context_ids=all_context_ids,
+            context_ids=retained_context_ids,
             scout_brief=scout_result["landscape_brief"],
         )
 
@@ -339,9 +387,13 @@ class MingDeepResearch:
         constraints_paragraph = ""
         sections = []
         for attempt in range(1, max_iterations + 1):
-            outline_result = self.outline_agent.run(initial_context)
+            outline_result = self._generate_with_system_prompt(
+                self.outline_model,
+                OUTLINE_PROMPT,
+                initial_context,
+            )
             try:
-                outline_xml = extract_outline_block(self._extract_agent_output(outline_result))
+                outline_xml = extract_outline_block(outline_result)
                 report_title, constraints_paragraph, sections = outline_to_sections(
                     outline_xml
                 )

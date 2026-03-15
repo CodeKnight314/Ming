@@ -1,22 +1,25 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
 from dataclasses import dataclass
 import logging
 from pathlib import Path
 import re
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from tqdm import tqdm
 
 from ming.core.prompts import REPORT_SECTION_WRITER_PROMPT
-from ming.core.reference_cleanup import normalize_markdown_references
-from ming.core.outline_parser import SectionPlan, SubsectionPlan, strip_markdown_fences
+from ming.core.reference_cleanup import canonicalize_url, normalize_markdown_references
+from ming.core.outline_parser import SectionPlan, strip_markdown_fences
 from ming.models.openrouter_model import OpenRouterModelConfig
-from ming.subagent import Agent, AgentConfig, AgentResult
+from ming.subagent import Agent, AgentConfig
 from ming.tools.kg_query_tool import KGQueryTool
 
 logger = logging.getLogger(__name__)
+
+_URL_RE = re.compile(r"https?://[^\s\]\"'>,)]+")
 
 
 @dataclass
@@ -29,10 +32,12 @@ class WriterAgentConfig:
 
 
 class WriterAgent:
+    _INITIAL_EVIDENCE_LIMIT = 16
+    _MIN_UNIQUE_URLS = 8
+    _MAX_URL_SHARE = 0.35
+
     def __init__(self, config: WriterAgentConfig):
         self.config = config
-        # We don't initialize a single self.agent because we'll create them per section for parallelization
-        # to ensure state isolation if needed, or just reuse the logic.
 
     @staticmethod
     def _slugify_report_title(report_title: str) -> str:
@@ -72,7 +77,6 @@ class WriterAgent:
         return "\n\n".join(part for part in parts if part.strip()).strip() + "\n"
 
     def _create_agent(self) -> Agent:
-        # Increase max_tokens for full section generation
         model_config = self.config.model
         model_config.max_tokens = max(8192, model_config.max_tokens)
 
@@ -82,20 +86,102 @@ class WriterAgent:
                 system_prompt=REPORT_SECTION_WRITER_PROMPT,
                 tools=[self.config.kg_query_tool],
                 max_iterations=self.config.max_iterations,
+                max_tool_calls_per_turn=8,
             )
         )
+
+    def _build_initial_query(self, section: SectionPlan) -> str:
+        subsection_titles = ", ".join(subsection.title for subsection in section.subsections)
+        return "\n".join(
+            part
+            for part in [
+                f"Section title: {section.title}",
+                f"Subsection titles: {subsection_titles}",
+                f"Section instruction: {section.instruction}",
+            ]
+            if part.strip()
+        )
+
+    def _canonical_entities_context(self, limit: int = 1000) -> str:
+        canonical_entities = self.config.kg_query_tool.kg_store.get_canonical_entities()
+        seen: set[str] = set()
+        names: List[str] = []
+        for entity in canonical_entities:
+            name = " ".join((entity.text or "").split())
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+            if len(names) >= limit:
+                break
+        return ", ".join(names)
+
+    def _format_evidence_cards(self, evidence_result: Dict[str, Any]) -> str:
+        cards = evidence_result.get("cards") or []
+        if not cards:
+            return "No evidence cards were returned from the KG."
+
+        lines: List[str] = []
+        for index, card in enumerate(cards, start=1):
+            lines.append(f"[Evidence Card {index}]")
+            lines.append(f"Fact: {card.get('fact', '')}")
+            supporting_urls = card.get("supporting_urls") or []
+            if supporting_urls:
+                lines.append("Supporting URLs: " + ", ".join(supporting_urls[:6]))
+            for excerpt_index, chunk in enumerate(card.get("chunks") or [], start=1):
+                if excerpt_index > 3:
+                    break
+                lines.append(f"Excerpt {excerpt_index} ({chunk.get('url', '')}): {chunk.get('excerpt', '')}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _build_audit_feedback(
+        self,
+        *,
+        thin_pool: bool,
+        cited_unique_urls: int,
+        highest_url_share: float,
+        unused_urls: List[str],
+    ) -> str:
+        instructions: List[str] = []
+        if thin_pool:
+            instructions.append(
+                "Evidence in the KG is thin for this section. State that limitation plainly in the section prose instead of implying complete coverage."
+            )
+        if (
+            cited_unique_urls < self._MIN_UNIQUE_URLS
+            or highest_url_share > self._MAX_URL_SHARE
+        ) and unused_urls:
+            instructions.append(
+                "Diversify citations across the available surfaced evidence. Use more distinct URLs and avoid letting one source dominate the section."
+            )
+            instructions.append(
+                "Prefer these surfaced-but-unused URLs when they genuinely support the claim: "
+                + ", ".join(unused_urls[:12])
+            )
+        return "\n".join(f"- {instruction}" for instruction in instructions)
 
     def _build_section_prompt(
         self,
         report_title: str,
         constraints_paragraph: str,
         section: SectionPlan,
+        *,
+        initial_evidence_text: str,
+        canonical_entities_context: str,
+        audit_feedback: str = "",
     ) -> str:
         constraints = constraints_paragraph.strip() or "No additional constraints provided."
 
-        subsection_guidelines = "\n".join([
-            f"- {sub.title}: {sub.instruction}" for sub in section.subsections
-        ])
+        subsection_guidelines = "\n".join(
+            [f"- {sub.title}: {sub.instruction}" for sub in section.subsections]
+        )
+        audit_section = ""
+        if audit_feedback.strip():
+            audit_section = f"### Audit Feedback\n{audit_feedback.strip()}\n\n"
 
         return (
             f"## TASK ASSIGNMENT\n"
@@ -107,11 +193,16 @@ class WriterAgent:
             f"{subsection_guidelines}\n\n"
             f"### Global Report Constraints\n"
             f"{constraints}\n\n"
+            f"### Canonical KG Entities\n"
+            f"Canonical KG entities: {canonical_entities_context or 'None available.'}\n\n"
+            f"### Initial KG Evidence Cards\n"
+            f"{initial_evidence_text}\n\n"
+            f"{audit_section}"
             f"## INSTRUCTIONS\n"
             f"1. **Analyze**: Identify key entities and themes spanning all subsections of this section.\n"
-            f"2. **Research**: Use `kg_query_tool` iteratively to gather facts, numbers, and causal links for the entire section.\n"
+            f"2. **Research**: Start with the surfaced evidence cards above. If you need more detail, call `kg_query_tool` with `search_evidence` first for broader evidence and use `get_neighbors` or `find_connection` only for drill-down.\n"
             f"3. **Target Length**: This entire section should be approximately 2000-2500 words.\n"
-            f"4. **Citations**: Cite the URL using [URL] format from KG results.\n"
+            f"4. **Citations**: Cite source URLs using [URL] format from KG results. Cite multiple sources for one claim when corroboration or disagreement matters, using adjacent citations like [URL][URL].\n"
             f"5. **Write**: Output the full Markdown section starting with `## {section.title}` and including all `###` subsections."
         )
 
@@ -147,31 +238,84 @@ class WriterAgent:
         return cleaned.strip() + "\n"
 
     def _extract_urls_from_tool_results(self, messages: List[Dict[str, str]]) -> List[str]:
-        urls = []
-        url_pattern = re.compile(r"URL: (https?://\S+)")
+        urls: List[str] = []
         for msg in messages:
             if msg["role"] == "tool_result":
-                found = url_pattern.findall(msg["content"])
-                urls.extend(found)
-        return list(set(urls))
+                found = _URL_RE.findall(msg["content"])
+                urls.extend(canonicalize_url(url) for url in found)
+        return sorted(set(urls))
+
+    def _extract_cited_url_counts(self, markdown: str) -> Counter[str]:
+        counts: Counter[str] = Counter()
+        for url in _URL_RE.findall(markdown):
+            counts[canonicalize_url(url)] += 1
+        return counts
+
+    def _search_initial_evidence(self, section: SectionPlan) -> Dict[str, Any]:
+        return self.config.kg_query_tool.search_evidence(
+            query=self._build_initial_query(section),
+            limit=self._INITIAL_EVIDENCE_LIMIT,
+            diversify_by_url=True,
+        )
+
+    def _needs_audit_rerun(
+        self,
+        markdown: str,
+        *,
+        surfaced_urls: List[str],
+        thin_pool: bool,
+    ) -> tuple[bool, str]:
+        citation_counts = self._extract_cited_url_counts(markdown)
+        cited_unique_urls = len(citation_counts)
+        total_citations = sum(citation_counts.values())
+        highest_url_share = (
+            max(citation_counts.values()) / total_citations
+            if total_citations > 0
+            else 1.0
+        )
+        unused_urls = sorted(set(surfaced_urls) - set(citation_counts.keys()))
+        needs_diversification = (
+            (
+                cited_unique_urls < self._MIN_UNIQUE_URLS
+                or highest_url_share > self._MAX_URL_SHARE
+            )
+            and bool(unused_urls)
+        )
+        needs_rerun = thin_pool or needs_diversification
+        return needs_rerun, self._build_audit_feedback(
+            thin_pool=thin_pool,
+            cited_unique_urls=cited_unique_urls,
+            highest_url_share=highest_url_share,
+            unused_urls=unused_urls,
+        )
 
     def _write_section(
         self,
         report_title: str,
         constraints_paragraph: str,
         section: SectionPlan,
-    ) -> Tuple[int, str, List[str]]:
-        agent = self._create_agent()
+    ) -> Tuple[str, str, List[str]]:
+        initial_evidence = self._search_initial_evidence(section)
+        initial_evidence_text = self._format_evidence_cards(initial_evidence)
+        canonical_entities_context = self._canonical_entities_context()
+        surfaced_urls = sorted(
+            {
+                canonicalize_url(url)
+                for card in (initial_evidence.get("cards") or [])
+                for url in (card.get("supporting_urls") or [])
+            }
+        )
 
+        agent = self._create_agent()
         prompt = self._build_section_prompt(
             report_title=report_title,
             constraints_paragraph=constraints_paragraph,
             section=section,
+            initial_evidence_text=initial_evidence_text,
+            canonical_entities_context=canonical_entities_context,
         )
         result = agent.run(prompt)
-
-        # Extract URLs from tool history
-        urls = self._extract_urls_from_tool_results(result.messages)
+        urls = sorted(set(surfaced_urls + self._extract_urls_from_tool_results(result.messages)))
 
         markdown = self._clean_section_markdown(
             report_title=report_title,
@@ -179,28 +323,51 @@ class WriterAgent:
             raw_text=result.output,
         )
 
+        needs_rerun, audit_feedback = self._needs_audit_rerun(
+            markdown,
+            surfaced_urls=surfaced_urls,
+            thin_pool=bool(initial_evidence.get("thin_pool", False)),
+        )
+        if needs_rerun and audit_feedback.strip():
+            rerun_agent = self._create_agent()
+            rerun_prompt = self._build_section_prompt(
+                report_title=report_title,
+                constraints_paragraph=constraints_paragraph,
+                section=section,
+                initial_evidence_text=initial_evidence_text,
+                canonical_entities_context=canonical_entities_context,
+                audit_feedback=audit_feedback,
+            )
+            rerun_result = rerun_agent.run(rerun_prompt)
+            urls = sorted(set(urls + self._extract_urls_from_tool_results(rerun_result.messages)))
+            markdown = self._clean_section_markdown(
+                report_title=report_title,
+                section_title=section.title,
+                raw_text=rerun_result.output,
+            )
+
         return section.section_id, markdown, urls
-    def _process_citations(self, sections_text: List[str], all_urls: List[str]) -> Tuple[List[str], Dict[str, int]]:
-        # Unique URLs sorted for deterministic numbering
-        unique_urls = sorted(list(set(all_urls)))
+
+    def _process_citations(
+        self,
+        sections_text: List[str],
+        all_urls: List[str],
+    ) -> Tuple[List[str], Dict[str, int]]:
+        canonical_to_url: Dict[str, str] = {}
+        for url in all_urls:
+            canonical_url = canonicalize_url(url)
+            canonical_to_url.setdefault(canonical_url, canonical_url)
+
+        unique_urls = sorted(canonical_to_url.values())
         url_to_idx = {url: i + 1 for i, url in enumerate(unique_urls)}
 
         processed_sections = []
         for text in sections_text:
             processed_text = text
-            
-            # 1. Replace explicit [URL] citations
             for url, idx in url_to_idx.items():
                 escaped_url = re.escape(url)
-                # Matches [http://...] or [URL] 
                 processed_text = re.sub(rf"\[{escaped_url}\]", f"[{idx}]", processed_text)
-            
-            # 2. Heuristically catch raw URLs that the model might have missed brackets for
-            # but only if they are the exact URLs we found in the tool results
             for url, idx in url_to_idx.items():
-                # Avoid replacing URLs inside the final References section or if already bracketed
-                # This is a simple heuristic: replace only if preceded by a space or punctuation
-                # and not already inside brackets.
                 escaped_url = re.escape(url)
                 processed_text = re.sub(rf"(?<!\[){escaped_url}(?!\])", f"[{idx}]", processed_text)
 
