@@ -14,16 +14,22 @@
     "port": 6381,
     "db": 2
   },
-  "num_research_subagents": 4,
+  "num_research_subagents": 6,
   "draft_output_path": "reports/draft.md",
-  "source_min_tokens": 400,
-  "research_source_budget": 250,
-  "max_chunks_per_source": 8,
+  "source_min_tokens": 300,
+  "research_source_budget": 300,
+  "max_chunks_per_source": 30,
+  "source_score_cutoff": 4.5,
   "outline_max_context_ids": 200,
   "outline_context_token_budget": 128000,
   "outline_source_char_limit": 3000,
   "writer_model": {
     "model_name": "qwen/qwen3.5-plus-02-15",
+    "temperature": 0.2,
+    "max_tokens": 8192
+  },
+  "writer_fallback_model": {
+    "model_name": "qwen/qwen-plus-2025-07-28",
     "temperature": 0.2,
     "max_tokens": 8192
   },
@@ -39,16 +45,16 @@
     "do_sample": false,
     "use_cache": true,
     "min_query_count": 3,
-    "max_query_count": 5,
+    "max_query_count": 6,
     "max_results_per_query": 3,
     "max_landscape_results": 10,
     "tool_configs": [
       {
         "type": "web_search_tool",
-        "max_results": 10,
+        "max_results": 5,
         "search_depth": "basic",
         "topic": "general",
-        "include_raw_content": false
+        "include_raw_content": "text"
       }
     ]
   },
@@ -59,6 +65,12 @@
       "temperature": 0.7,
       "max_tokens": 1024
     },
+    "fallback_model": {
+      "provider": "openrouter",
+      "model_name": "qwen/qwen3.5-plus-02-15",
+      "temperature": 0.4,
+      "max_tokens": 1024
+    },
     "max_new_tokens": 1024,
     "temperature": 0.7,
     "do_sample": true,
@@ -66,19 +78,22 @@
     "max_context_len": 4096,
     "min_query_count": 1,
     "max_query_count": 4,
-    "max_iterations": 5,
+    "max_open_urls_per_iteration": 10,
+    "max_url_wait_seconds": 8,
+    "max_iterations": 6,
+    "recursion_limit": 40,
     "tool_configs": [
       {
         "type": "web_search_tool",
-        "max_results": 30,
+        "max_results": 20,
         "search_depth": "basic",
         "topic": "general",
-        "include_raw_content": false
+        "include_raw_content": "text"
       },
       {
         "type": "open_url_tool",
         "name": "open_url_tool",
-        "min_tokens": 400
+        "min_tokens": 300
       },
       {
         "type": "think_tool",
@@ -86,9 +101,15 @@
           "provider": "openrouter",
           "model_name": "qwen/qwen3.5-flash-02-23",
           "temperature": 0.7,
-          "max_tokens": 384
+          "max_tokens": 2048
         },
-        "max_new_tokens": 384,
+        "fallback_model_config": {
+          "provider": "openrouter",
+          "model_name": "qwen/qwen3.5-plus-02-15",
+          "temperature": 0.4,
+          "max_tokens": 2048
+        },
+        "max_new_tokens": 2048,
         "temperature": 0.7,
         "do_sample": false,
         "use_cache": true

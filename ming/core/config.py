@@ -164,6 +164,19 @@ def create_ming_deep_research_config(
     else:
         writer_model = None
 
+    writer_fallback_cfg = config.get("writer_fallback_model")
+    if writer_fallback_cfg:
+        writer_fallback_model = OpenRouterModelConfig(
+            model_name=writer_fallback_cfg.get("model_name", "qwen/qwen-plus-2025-07-28"),
+            temperature=float(writer_fallback_cfg.get("temperature", 0.2)),
+            max_tokens=int(writer_fallback_cfg.get("max_tokens", 4096)),
+            site_url=writer_fallback_cfg.get("site_url"),
+            site_name=writer_fallback_cfg.get("site_name"),
+            model_kwargs=writer_fallback_cfg.get("model_kwargs"),
+        )
+    else:
+        writer_fallback_model = None
+
     kg_cfg = config.get("kg_redis")
     if kg_cfg:
         kg_redis_config = RedisDatabaseConfig(
@@ -181,6 +194,7 @@ def create_ming_deep_research_config(
         queries_redis_config=queries_redis_config,
         kg_redis_config=kg_redis_config,
         writer_model=writer_model,
+        writer_fallback_model=writer_fallback_model,
         draft_output_path=config.get("draft_output_path"),
         num_research_subagents=int(config.get("num_research_subagents", 3)),
         outline_max_context_ids=int(config.get("outline_max_context_ids", 64)),
@@ -191,6 +205,7 @@ def create_ming_deep_research_config(
         source_min_tokens=int(config.get("source_min_tokens", 400)),
         research_source_budget=int(config.get("research_source_budget", 250)),
         max_chunks_per_source=int(config.get("max_chunks_per_source", 8)),
+        source_score_cutoff=float(config.get("source_score_cutoff", 4.5)),
     )
 
 
