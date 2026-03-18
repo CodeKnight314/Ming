@@ -19,7 +19,7 @@ from ming.extraction.kg_module import KGRedisStore
 from ming.extraction.kg_schema import Chunk as KGChunk, Entity as KGEntity
 from ming.core.text_metrics import count_language_aware_tokens
 
-SOURCE_SCORE_CUTOFF = 6.0
+SOURCE_SCORE_CUTOFF = 4.5
 
 
 @dataclass
@@ -67,12 +67,21 @@ class NERREPipeline:
         re_config: Union[dict, OpenRouterModelConfig],
         kg_store: KGRedisStore,
         max_workers: int = 4,
+        source_score_cutoff: float = SOURCE_SCORE_CUTOFF,
     ):
-        self.ner = NERModule()
         self.re_config = re_config
         self.kg_store = kg_store
         self.max_workers = max(1, max_workers)
+        self.source_score_cutoff = float(source_score_cutoff)
+        self._ner_local = local()
         self._re_local = local()
+
+    def _get_ner_module(self) -> NERModule:
+        module = getattr(self._ner_local, "module", None)
+        if module is None:
+            module = NERModule()
+            self._ner_local.module = module
+        return module
 
     def _get_re_module(self) -> REModule:
         module = getattr(self._re_local, "module", None)
@@ -87,7 +96,7 @@ class NERREPipeline:
         url: str,
         context_id: str = "",
     ) -> SourceChunkCollection:
-        chunks = self.ner.run(text, url)
+        chunks = self._get_ner_module().run(text, url)
         densities = calculate_entity_density(chunks)
         source_score = calculate_source_score(densities)
         for chunk, chunk_score in zip(chunks, densities):
@@ -105,14 +114,37 @@ class NERREPipeline:
     def collect_sources(
         self, sources: Iterable[tuple[str, str] | tuple[str, str, str]]
     ) -> List[SourceChunkCollection]:
+        normalized_sources = list(sources)
+        if not normalized_sources:
+            return []
+
+        max_workers = min(self.max_workers, len(normalized_sources))
+        collected_by_index: Dict[int, SourceChunkCollection] = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {}
+            for idx, source in enumerate(normalized_sources):
+                if len(source) == 2:
+                    text, url = source
+                    context_id = ""
+                else:
+                    text, url, context_id = source
+                future = executor.submit(
+                    self.collect_source_chunks,
+                    text,
+                    url,
+                    context_id,
+                )
+                future_map[future] = idx
+
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                collected_by_index[idx] = future.result()
+
         collected: List[SourceChunkCollection] = []
-        for source in sources:
-            if len(source) == 2:
-                text, url = source
-                context_id = ""
-            else:
-                text, url, context_id = source
-            collected.append(self.collect_source_chunks(text, url, context_id=context_id))
+        for idx in range(len(normalized_sources)):
+            collected.append(collected_by_index[idx])
+
         return collected
 
     def filter_sources(
@@ -120,20 +152,40 @@ class NERREPipeline:
         sources: List[SourceChunkCollection],
         *,
         min_tokens: int = 400,
-        source_score_cutoff: float = SOURCE_SCORE_CUTOFF,
+        source_score_cutoff: Optional[float] = None,
         source_budget: Optional[int] = None,
     ) -> List[SourceChunkCollection]:
-        retained = [
+        # First filter by minimum token requirement only.
+        eligible = [
             source
             for source in sources
-            if source.token_count >= min_tokens and source.source_score >= source_score_cutoff
+            if source.token_count >= min_tokens
         ]
+
+        # Determine the effective score cutoff. If none is provided, fall back to the
+        # pipeline-level default configured at construction time.
+        cutoff = self.source_score_cutoff if source_score_cutoff is None else float(source_score_cutoff)
+
+        # Prefer sources that clear the score cutoff.
+        retained = [
+            source
+            for source in eligible
+            if source.source_score >= cutoff
+        ]
+
+        # If nothing survives the cutoff, fall back to taking the best-scoring
+        # sources by score alone so that we don't waste all retrieved URLs.
+        if not retained:
+            retained = list(eligible)
+
         retained.sort(
             key=lambda source: (source.source_score, source.token_count, source.url),
             reverse=True,
         )
+
         if source_budget is not None and source_budget > 0:
             retained = retained[:source_budget]
+
         return retained
 
     @staticmethod
@@ -269,7 +321,16 @@ class NERREPipeline:
             }
             for future in as_completed(future_map):
                 idx = future_map[future]
-                results_by_chunk_idx[idx] = future.result()
+                try:
+                    results_by_chunk_idx[idx] = future.result()
+                except Exception as exc:
+                    chunk = chunks[idx]
+                    logger.warning(
+                        "Skipping RE extraction for chunk idx=%d url=%s due to error: %s",
+                        idx,
+                        getattr(chunk, "url", ""),
+                        exc,
+                    )
 
         all_relationships = []
         rel_to_entities = []

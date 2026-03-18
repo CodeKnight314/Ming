@@ -11,6 +11,11 @@ from ming.core.reference_cleanup import canonicalize_url
 from ming.core.text_metrics import normalize_whitespace, tokenize_for_overlap
 from ming.extraction.kg_schema import Chunk, Entity, Relationship, CanonicalEntity
 from datasketch import MinHash, MinHashLSH
+import re
+from collections import Counter
+import numpy as np
+import faiss 
+from sentence_transformers import SentenceTransformer
 
 T = TypeVar("T")
 
@@ -18,6 +23,9 @@ T = TypeVar("T")
 class ERConfig: 
     threshold: float = 0.5
     num_perm: int = 128     
+    embedding_model_name: str = "all-MiniLM-L6-v2"
+    embedding_threshold: float = 0.78
+    embedding_top_k: int = 12
 
 class KGRedisStore:
     def __init__(self, database: RedisDatabase, er_config: ERConfig):
@@ -44,64 +52,191 @@ class KGRedisStore:
         if not new_entities:
             return
 
+        def _normalize_entity_text(text: str) -> str:
+            return normalize_whitespace(text or "").strip()
+
+        def _labels_compatible(a: str, b: str) -> bool:
+            if not a or not b:
+                return False
+            if a == b:
+                return True
+            compatible = {
+                ("ORG", "PRODUCT"),
+                ("PRODUCT", "ORG"),
+                ("GPE", "LOC"),
+                ("LOC", "GPE"),
+            }
+            return (a, b) in compatible
+
+        def _minhash_tokens(text: str) -> set[str]:
+            t = _normalize_entity_text(text).lower()
+            if not t:
+                return set()
+            parts = t.split()
+            if len(parts) > 1:
+                return set(parts)
+            # single token: use character 3-grams (better for typos/variations than whole-token Jaccard)
+            compact = re.sub(r"\s+", "", t)
+            if len(compact) <= 3:
+                return {compact}
+            return {compact[i : i + 3] for i in range(0, len(compact) - 2)}
+
+        def _canonical_name_choice(texts: List[str]) -> str:
+            # Prefer natural names over bloated or acronym-only strings.
+            candidates = [_normalize_entity_text(t) for t in texts if _normalize_entity_text(t)]
+            if not candidates:
+                return ""
+
+            def score(name: str) -> tuple[float, float, float]:
+                n = name.strip()
+                lower = n.lower()
+                length = len(n)
+                words = n.split()
+                has_space = 1.0 if len(words) >= 2 else 0.0
+                is_acronym = 1.0 if (n.isupper() and length <= 6) else 0.0
+                starts_with_the = 1.0 if lower.startswith("the ") else 0.0
+                # Prefer moderate length; penalize very long names.
+                ideal = 18.0
+                length_term = -abs(length - ideal) / ideal
+                long_penalty = -max(0.0, (length - 32) / 32)
+                return (
+                    has_space * 2.0 + length_term + long_penalty - is_acronym * 1.5 - starts_with_the * 0.8,
+                    -is_acronym,
+                    -length,
+                )
+
+            # Best score wins; tiebreaker favors shorter (less bloated) via score's last term.
+            return max(candidates, key=score)
+
+        entities_by_id: Dict[str, Entity] = {entity.entity_id: entity for entity in new_entities}
+        ids = [e.entity_id for e in new_entities]
+
+        # Union-Find for merges
+        parent: Dict[str, str] = {eid: eid for eid in ids}
+        rank: Dict[str, int] = {eid: 0 for eid in ids}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return
+            if rank[ra] < rank[rb]:
+                parent[ra] = rb
+            elif rank[ra] > rank[rb]:
+                parent[rb] = ra
+            else:
+                parent[rb] = ra
+                rank[ra] += 1
+
+        # Phase 1: MinHash LSH
         lsh = MinHashLSH(threshold=self.er_config.threshold, num_perm=self.er_config.num_perm)
-        minhashes = {}
-        entities_by_id = {entity.entity_id: entity for entity in new_entities}
+        minhashes: Dict[str, MinHash] = {}
 
         for ent in new_entities:
             m = MinHash(num_perm=self.er_config.num_perm)
-            text = ent.text.lower()
-            # If text has no spaces, it might be Chinese or a single word.
-            # For entity resolution of Chinese names/terms, character-level n-grams or just characters are better.
-            tokens = text.split()
-            if len(tokens) <= 1 and len(text) > 1:
-                # Fallback to characters if no spaces (e.g. Chinese)
-                tokens = list(text)
-            
-            for d in set(tokens):
-                m.update(d.encode('utf8'))
+            for token in _minhash_tokens(ent.text):
+                if token:
+                    m.update(token.encode("utf8"))
             minhashes[ent.entity_id] = m
             lsh.insert(ent.entity_id, m)
 
-        clusters = []
-        visited = set()
-
         for ent in new_entities:
-            if ent.entity_id in visited:
-                continue
-            
-            result = lsh.query(minhashes[ent.entity_id])
-            cluster_members = [eid for eid in result if eid not in visited]
-            final_cluster = []
-            for eid in cluster_members:
-                target_ent = entities_by_id.get(eid)
-                if target_ent and target_ent.label == ent.label:
-                    final_cluster.append(target_ent)
-                    visited.add(eid)
-            
-            if final_cluster:
-                clusters.append(final_cluster)
+            hits = lsh.query(minhashes[ent.entity_id])
+            for other_id in hits:
+                if other_id == ent.entity_id:
+                    continue
+                other = entities_by_id.get(other_id)
+                if other is None:
+                    continue
+                if _labels_compatible(ent.label, other.label):
+                    union(ent.entity_id, other_id)
 
-        canonical_entities = []
-        for cluster in clusters:
-            canonical_name = max([e.text for e in cluster], key=len)
+        # Phase 2: Embedding-based merges (abbreviations, acronyms, semantic equivalents)
+        if (
+            SentenceTransformer is not None
+            and np is not None
+            and faiss is not None
+            and float(self.er_config.embedding_threshold) > 0.0
+        ):
+            # Build representative texts per current UF component.
+            rep_to_ids: Dict[str, List[str]] = {}
+            for eid in ids:
+                rep_to_ids.setdefault(find(eid), []).append(eid)
+
+            reps: List[str] = list(rep_to_ids.keys())
+            rep_texts: List[str] = []
+            rep_labels: List[str] = []
+            for rep in reps:
+                member_texts = [entities_by_id[eid].text for eid in rep_to_ids[rep]]
+                rep_texts.append(_canonical_name_choice(member_texts) or entities_by_id[rep_to_ids[rep][0]].text)
+                labels = [entities_by_id[eid].label for eid in rep_to_ids[rep] if entities_by_id[eid].label]
+                rep_labels.append(Counter(labels).most_common(1)[0][0] if labels else "")
+
+            try:
+                model = SentenceTransformer(self.er_config.embedding_model_name, local_files_only=True)
+                emb = model.encode(rep_texts, batch_size=128, normalize_embeddings=True)
+                vectors = np.array(emb, dtype="float32")
+
+                dim = int(vectors.shape[1])
+                index = faiss.IndexFlatIP(dim)
+                index.add(vectors)
+
+                top_k = max(2, int(self.er_config.embedding_top_k))
+                scores, neighbors = index.search(vectors, min(top_k, len(reps)))
+
+                threshold = float(self.er_config.embedding_threshold)
+                for i, rep_i in enumerate(reps):
+                    label_i = rep_labels[i]
+                    for pos in range(1, neighbors.shape[1]):
+                        j = int(neighbors[i][pos])
+                        if j < 0 or j == i:
+                            continue
+                        sim = float(scores[i][pos])
+                        if sim < threshold:
+                            continue
+                        rep_j = reps[j]
+                        label_j = rep_labels[j]
+                        if _labels_compatible(label_i, label_j):
+                            union(rep_i, rep_j)
+            except Exception:
+                # Embedding pass is best-effort; fall back to MinHash-only.
+                pass
+
+        # Materialize clusters from UF
+        clusters_by_rep: Dict[str, List[Entity]] = {}
+        for eid, ent in entities_by_id.items():
+            clusters_by_rep.setdefault(find(eid), []).append(ent)
+
+        canonical_entities: List[CanonicalEntity] = []
+        for cluster in clusters_by_rep.values():
+            if not cluster:
+                continue
+
+            canonical_name = _canonical_name_choice([e.text for e in cluster])
             canonical_id = f"can_{uuid4().hex}"
-            
-            merged_rel_ids = list(set([rel_id for e in cluster for rel_id in e.relationships]))
+
+            merged_rel_ids = list({rel_id for e in cluster for rel_id in (e.relationships or [])})
             entity_ids = [e.entity_id for e in cluster]
-            
+            labels = [e.label for e in cluster if e.label]
+            canonical_label = Counter(labels).most_common(1)[0][0] if labels else cluster[0].label
+
             ce = CanonicalEntity(
                 canonical_id=canonical_id,
                 text=canonical_name,
-                label=cluster[0].label,
+                label=canonical_label,
                 entities=entity_ids,
-                relationships=merged_rel_ids
+                relationships=merged_rel_ids,
             )
             canonical_entities.append(ce)
-            
+
             for ent in cluster:
                 ent.resolved_id = canonical_id
-        
+
         self.save_entities(new_entities)
         self.save_canonical_entities(canonical_entities)
 
@@ -498,11 +633,9 @@ class KGRedisStore:
             if existing_support is None or (
                 chunk_score,
                 source_score,
-                confidence,
             ) > (
                 existing_support["chunk_score"],
                 existing_support["source_score"],
-                existing_support["confidence"],
             ):
                 group["support_by_url"][canonical_url] = support_payload
 
@@ -564,7 +697,6 @@ class KGRedisStore:
                 key=lambda item: (
                     item["source_score"],
                     item["chunk_score"],
-                    item["confidence"],
                     item["url"],
                 ),
                 reverse=True,
@@ -594,7 +726,6 @@ class KGRedisStore:
                 card["query_relevance"],
                 card["support_count"],
                 card["best_source_score"],
-                card["avg_confidence"],
                 card["fact"],
             ),
             reverse=True,

@@ -49,7 +49,7 @@ class REModule:
                 "predicate": "关系动词或类型",
                 "object": "相关的实体、概念或属性",
                 "object_type": "entity" | "concept" | "attribute",
-                "confidence": 0.0-1.0
+                "confidence": "high" | "medium" | "low"
             }}
         ]
 
@@ -57,6 +57,10 @@ class REModule:
         - 仅为提供的目标实体提取关系，不要提取文中其他实体的关系。
         - 每个目标实体可以有零个或多个关系。
         - 如果目标实体没有任何有意义的关系，返回 []。
+        - 置信度用离散档位，不要输出 0-1 小数：
+          - high：文本中有明确、直接的陈述或强证据支持
+          - medium：有合理暗示但不够直接，或表述较弱/有条件
+          - low：可能为推断、模糊、或证据不足（尽量少输出这类关系）
 
         不要使用 markdown 代码块，不要有前言，不要有解释。
 
@@ -74,7 +78,7 @@ class REModule:
                 "predicate": "relationship verb or type",
                 "object": "related entity, concept, or attribute",
                 "object_type": "entity" | "concept" | "attribute",
-                "confidence": 0.0-1.0
+                "confidence": "high" | "medium" | "low"
             }}
         ]
 
@@ -82,6 +86,10 @@ class REModule:
         - Extract relationships ONLY for the provided target entities, not other entities in the passage.
         - Each target entity may have zero or more relationships.
         - If no meaningful relationships exist for any target entity, return [].
+        - Confidence MUST be a discrete bucket, not a 0-1 float:
+          - high: explicitly stated / directly supported in the passage
+          - medium: plausible but weaker / indirect / hedged
+          - low: speculative or weakly supported (avoid emitting these when possible)
 
         No markdown fences, no preamble, no explanation.
 
@@ -184,18 +192,35 @@ class REModule:
         if not isinstance(raw, list):
             return []
 
+        bucket_to_confidence = {
+            "high": 0.9,
+            "medium": 0.6,
+            "low": 0.3,
+        }
+
         relationships: List[Relationship] = []
         for item in raw:
             if not isinstance(item, dict):
                 continue
             try:
+                raw_conf = item.get("confidence", 0.0)
+                confidence: float
+                if isinstance(raw_conf, str):
+                    confidence = bucket_to_confidence.get(raw_conf.strip().lower(), 0.0)
+                else:
+                    confidence = float(raw_conf or 0.0)
+                    # Backwards-compat: if older prompts emit 0-1 floats, clamp safely.
+                    if confidence != confidence:  # NaN guard
+                        confidence = 0.0
+                    confidence = max(0.0, min(1.0, confidence))
+
                 rel = Relationship(
                     relationship_id=uuid.uuid4().hex,
                     subject=str(item.get("subject", "")),
                     predicate=str(item.get("predicate", "")),
                     object=str(item.get("object", "")),
                     object_type=str(item.get("object_type", "attribute")),
-                    confidence=float(item.get("confidence", 0.0)),
+                    confidence=confidence,
                 )
                 relationships.append(rel)
             except (TypeError, ValueError):
