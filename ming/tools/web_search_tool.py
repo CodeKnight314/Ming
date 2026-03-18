@@ -13,7 +13,10 @@ class WebSearchToolConfig:
     max_results: int = 30
     search_depth: str = "basic"
     topic: str = "general"
-    include_raw_content: bool = False
+    # Tavily Python client supports include_raw_content="text" to return extracted text.
+    # We keep this flexible (bool or str) to match varying SDK versions/configs.
+    include_raw_content: Any = "text"
+    score_cutoff: float = 0.5
 
 
 class WebSearchTool(BaseTool):
@@ -93,11 +96,8 @@ class WebSearchTool(BaseTool):
         self._ensure_client()
         search_kwargs: Dict[str, Any] = {
             "query": query,
-            "include_answer": False,
             "search_depth": self.config.search_depth,
             "max_results": max_results,
-            "include_images": False,
-            "topic": self.config.topic,
             "include_raw_content": self.config.include_raw_content,
         }
 
@@ -153,6 +153,9 @@ class WebSearchTool(BaseTool):
             if not isinstance(item, dict):
                 continue
 
+            if float(item.get("score", 0.0)) < self.config.score_cutoff:
+                continue
+
             url = str(item.get("url", "")).strip()
             if not url or url in seen_urls:
                 continue
@@ -160,6 +163,9 @@ class WebSearchTool(BaseTool):
 
             title = str(item.get("title", "")).strip() or "Untitled"
             source_info = self._classify_source(url, title)
+            raw = item.get("raw_content") or ""
+            snippet = item.get("content") or ""
+            content = f"{raw}\n{snippet}".strip()
 
             normalized.append(
                 {
@@ -167,7 +173,7 @@ class WebSearchTool(BaseTool):
                     "url": url,
                     "score": item.get("score"),
                     "published_date": item.get("published_date"),
-                    "content": str(item.get("raw_content") or item.get("content") or "").strip(),
+                    "content": str(content).strip(),
                     **source_info,
                 }
             )
@@ -189,7 +195,7 @@ class WebSearchTool(BaseTool):
         except Exception as exc:
             return []
 
-    def check_api_usage(self) -> int:
+    def check_api_usage(self) -> Dict[str, Any]:
         response = requests.get(
             "https://api.tavily.com/usage",
             headers={
@@ -199,15 +205,21 @@ class WebSearchTool(BaseTool):
 
         if response.status_code != 200:
             return {}
-        else: 
-            data = response.json()
-            limits = {
-                "total_requests": data["key"]["usage"],
-                "limit": data["key"]["limit"],
-                "current_plan": data["account"]["current_plan"], 
-                "plan_usage": data["account"]["plan_usage"],
-                "plan_limit": data["account"]["plan_limit"],
-                "paygo_usage": data["account"]["paygo_usage"],
-                "paygo_limit": data["account"]["paygo_limit"],
-            }
-            return limits
+
+        data = response.json()
+        account = data.get("account") or {}
+        raw_plan_usage = account.get("plan_usage", None)
+        if raw_plan_usage is None:
+            raw_plan_usage = account.get("search_usage", 0)
+
+        plan_limit = account.get("plan_limit", None)
+        plan_usage = int(raw_plan_usage or 0)
+        remaining = None if plan_limit is None else int(plan_limit) - plan_usage
+
+        return {
+            "current_plan": account.get("current_plan"),
+            "plan_usage": plan_usage,
+            "plan_limit": plan_limit,
+            "remaining": remaining,
+            "search_usage": account.get("search_usage"),
+        }

@@ -45,7 +45,8 @@ def create_tool_from_spec(spec: ToolConfig) -> BaseTool:
             max_results=int(spec.get("max_results", 30)),
             search_depth=str(spec.get("search_depth", "basic")),
             topic=str(spec.get("topic", "general")),
-            include_raw_content=bool(spec.get("include_raw_content", False)),
+            include_raw_content=spec.get("include_raw_content", "text"),
+            score_cutoff=float(spec.get("score_cutoff", 0.5)),
         )
         return WebSearchTool(config=config)
 
