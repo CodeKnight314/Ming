@@ -1,7 +1,10 @@
 import base64
+import json
 import logging
 import mimetypes
 import os
+import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +17,86 @@ from langchain_openrouter import ChatOpenRouter
 from ming.models.base_model import BaseModel
 
 logger = logging.getLogger(__name__)
+
+_MAX_INVOKE_ATTEMPTS = 5
+_INITIAL_RETRY_DELAY_SECONDS = 1.0
+
+
+def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _is_retryable_openrouter_error(exc: BaseException) -> bool:
+    retryable_type_names = {
+        "responsevalidationerror",
+        "timeout",
+        "readtimeout",
+        "connecttimeout",
+        "remoteprotocolerror",
+        "apiconnectionerror",
+    }
+    retryable_message_fragments = (
+        "eof while parsing",
+        "expecting value",
+        "connection reset",
+        "connection aborted",
+        "remote end closed connection",
+        "server disconnected without sending a response",
+        "temporarily unavailable",
+        "timed out",
+        "code': 5",  # OpenRouter occasionally returns {'error': {'code': 5xx, ...}}
+    )
+
+    for error in _iter_exception_chain(exc):
+        if isinstance(error, (TimeoutError, ConnectionError, json.JSONDecodeError)):
+            return True
+        error_type_name = type(error).__name__.lower()
+        error_message = str(error).lower()
+        if error_type_name in retryable_type_names:
+            return True
+        if any(fragment in error_message for fragment in retryable_message_fragments):
+            return True
+    return False
+
+
+def _summarize_openrouter_error_payload_from_text(text: str) -> str | None:
+    """Best-effort extraction of OpenRouter {'error': ...} payload from exception strings.
+
+    langchain_openrouter sometimes raises ResponseValidationError when the HTTP response body
+    is an OpenRouter error payload (e.g. code=502) rather than a normal chat completion.
+    We can't reliably access the raw body, so we parse the exception text conservatively.
+    """
+    lower = text.lower()
+    if "input_value" not in lower or "{'error':" not in text:
+        return None
+
+    # Example fragment (often truncated):
+    # input_value={'error': {'message': 'Up...content.', 'code': 502}}, input_type=dict
+    code_match = re.search(r"'code'\s*:\s*(\d{3})", text)
+    message_match = re.search(r"'message'\s*:\s*'([^']+)'", text)
+    if not code_match and not message_match:
+        return "OpenRouter error payload (unparsed)"
+
+    code = code_match.group(1) if code_match else "unknown"
+    message = message_match.group(1) if message_match else "unknown"
+    return f"OpenRouter upstream error code={code} message={message}"
+
+
+def _exception_chain_summary(exc: BaseException) -> str:
+    parts: list[str] = []
+    for error in _iter_exception_chain(exc):
+        text = str(error)
+        parsed = _summarize_openrouter_error_payload_from_text(text)
+        if parsed:
+            parts.append(parsed)
+            continue
+        parts.append(f"{type(error).__name__}: {error}")
+    return " <- ".join(parts)
 
 
 @dataclass
@@ -138,11 +221,40 @@ class OpenRouterModel(BaseModel):
             len(images or []),
         )
         start_time = time.time()
-        try:
-            response = self.client.invoke([HumanMessage(content=content)])
-        except Exception:
-            logger.exception("OpenRouter request failed for model=%s", self.config.model_name)
-            raise
+        last_exception: Exception | None = None
+        for attempt in range(1, _MAX_INVOKE_ATTEMPTS + 1):
+            try:
+                response = self.client.invoke([HumanMessage(content=content)])
+                break
+            except Exception as exc:
+                last_exception = exc
+                if attempt >= _MAX_INVOKE_ATTEMPTS or not _is_retryable_openrouter_error(exc):
+                    logger.exception(
+                        "OpenRouter request failed for model=%s after attempt %d/%d (%s)",
+                        self.config.model_name,
+                        attempt,
+                        _MAX_INVOKE_ATTEMPTS,
+                        _exception_chain_summary(exc),
+                    )
+                    raise
+
+                sleep_seconds = _INITIAL_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+                # Add a small jitter to avoid synchronized retries when running batches.
+                sleep_seconds = sleep_seconds * (0.85 + 0.3 * random.random())
+                logger.warning(
+                    "Retrying OpenRouter request for model=%s after attempt %d/%d in %.1fs (%s)",
+                    self.config.model_name,
+                    attempt,
+                    _MAX_INVOKE_ATTEMPTS,
+                    sleep_seconds,
+                    _exception_chain_summary(exc),
+                )
+                time.sleep(sleep_seconds)
+        else:
+            raise RuntimeError(
+                f"OpenRouter request failed unexpectedly for model={self.config.model_name}"
+            ) from last_exception
+
         elapsed = time.time() - start_time
         response_text = response.content if isinstance(response.content, str) else str(response.content)
         metadata = {
