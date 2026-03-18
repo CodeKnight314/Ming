@@ -19,7 +19,10 @@ Generate {query_count} short, broad web search queries that:
 - do NOT repeat any query already listed above, and do NOT generate queries that are semantically similar to them (e.g., paraphrases, near-synonyms, or rewordings that ask the same thing)
 
 Search rules: NEVER pass a URL as a query. Write self-contained queries—each must make sense on its own as a web search.
-When the topic is in a non-English language, include at least half of your queries in that language.
+When the topic appears to be in a non-English language, generate a MIX of queries:
+- Some queries should be phrased in high-quality English optimized for Google-style web search.
+- Some queries should be in the original topic language to capture local-language sources.
+- Avoid translating all queries into only one language; prefer bilingual coverage when non-English text is present.
 
 Wrap each query in <query>...</query> tags.
 """
@@ -67,14 +70,18 @@ Topic: {topic}
 {scout_section}
 {previous_queries_section}
 {history_section}
-
+{gaps_section}
 Generate {min_queries}-{max_queries} distinct search queries. {guidance}
 Use the scout brief to widen or clarify coverage before going deep.
 Vary query types: factual (numbers, data), causal (why, mechanisms), comparative (X vs Y), critical (limitations, failures), trend (recent changes, predictions).
 Each query must be self-contained—it will run as a web search with no additional context.
 Do NOT repeat or semantically duplicate any query already listed above—avoid paraphrases, near-synonyms, or rewordings that ask the same thing.
 
-Search rules: NEVER pass a URL as a query. Write self-contained queries. When the topic is non-English, include queries in that language.
+Search rules: NEVER pass a URL as a query. Write self-contained queries. When the topic appears to be in a non-English language, generate a MIX of queries:
+- Some queries should be phrased in high-quality English optimized for Google-style web search.
+- Some queries should be in the original topic language to capture local-language sources.
+- Avoid translating all queries into only one language; prefer bilingual coverage when non-English text is present.
+
 Wrap them in <query>...</query> tags for each distinct query.
 """
 
@@ -90,6 +97,15 @@ Synthesis guidelines:
 - Explain significance: why does a number matter, what does a trend imply, how does it compare to expectations?
 - Write in flowing analytical paragraphs. No self-referential language ("I found", "My research"). No meta-commentary.
 - Match the language of the topic in your output.
+
+If research success criteria are listed at the top of the retrieved content, end your synthesis with a structured assessment block:
+
+## Criteria Assessment
+For each criterion, write exactly:
+CRITERION: <criterion text>
+STATUS: SATISFIED | PARTIALLY | UNSATISFIED
+EVIDENCE: <one sentence citing the key supporting source>
+GAP: <what is still missing, or "None">
 
 Provide a clear, comprehensive synthesis based on the evidence above.
 """
@@ -153,7 +169,7 @@ Topic-writing rules:
 - Each TOPIC should describe one research angle, not the whole project.
 - Avoid overlap between TOPIC entries.
 
-Produce 4 distinct research angles. Ensure angles are mutually exclusive in scope but collectively exhaustive of the topic.
+Produce 3 to 6 distinct research angles depending on the complexity of the topic. Ensure angles are mutually exclusive in scope but collectively exhaustive of the topic.
 Match the language of the original user topic in your output.
 """
 
@@ -166,7 +182,7 @@ Produce a detailed Table of Contents (TOC) and writing constraints that will gui
 ## Structural Principles
 
 1. **Anchor to Requirements**: If the user's request explicitly mentions specific topics, comparison axes, or deliverables, these MUST be reflected as section or subsection headers verbatim. The user's framing defines the report's backbone.
-2. **Dimensional Organization**: For open-ended or complex topics involving multiple entities (companies, countries, methods), organize sections by analytical dimensions (e.g., "Technology Approach", "Market Position", "Regulatory Risk") rather than just a list of entities. This produces reports that compare and analyze rather than enumerate.
+2. **Dimensional Organization vs. Enumeration**: For open-ended topics involving multiple entities, organize sections by analytical dimensions (e.g., "Technology Approach", "Market Position") to produce analytical reports. HOWEVER, if the user explicitly requests a specific enumeration, taxonomy, or list of entities (e.g., "Top 10 companies", "9 social classes", "5 specific models"), you MUST structure the report or create a dedicated top-level section to explicitly list and detail those requested entities.
 3. **Hierarchy**: Use a 2-3 level hierarchy.
     - Up to 8 top-level sections for comprehensive coverage.
     - Each top-level section MUST have 2-5 subsections that break the topic into specific sub-analyses, entity-level deep dives, or distinct perspectives.
@@ -228,6 +244,9 @@ You must follow a strict two-phase process for this entire section:
 2. **Writing Phase**: Once research is complete, generate the final section content in one go.
     - **Format**: Markdown only.
     - **Headers**: Use `## [Section Title]` for the main section and `### [Subsection Title]` for each planned subsection.
+    - **Subsection Order**: Follow the planned subsection order exactly as provided. Write each `###` subsection in the same sequence. Do not reorder, merge, or omit planned subsections.
+    - **Subsection Discipline**: Keep each subsection tightly focused on its own planned scope. If evidence is more relevant to a later subsection, save it for that later subsection instead of discussing it early.
+    - **Narrative Flow**: Do not front-load later analysis into earlier subsections. Move from the first planned subsection to the last with a clean progression.
     - **Content**: Write dense, analytical prose. Use the gathered evidence to support every claim.
     - **Citations**: When using evidence from the KG tool, cite the source URL exactly as `[URL]`. Do NOT use numbers. Cite multiple sources for one claim when corroboration or disagreement matters, for example `[URL][URL]`.
     - **Style**: Professional, objective, and evidence-grounded. No self-reference (e.g., "I found", "The KG shows").
@@ -236,6 +255,8 @@ You must follow a strict two-phase process for this entire section:
 ## Critical Rules
 - **No Markdown Fences**: Do not wrap your final response in ```markdown or ``` blocks.
 - **No Meta-Commentary**: Do not include notes about your process, tool usage, or reasoning in the final output.
+- **No Cross-Subsection Leakage**: Do not discuss a later planned subsection in detail before its own header appears.
+- **Structured Data Presentation**: If the section requires listing entities, classes, or items, use clear bullet points, numbered lists, or bolded inline lists to make the enumeration visually distinct and easy to read.
 - **Direct Output**: Return ONLY the final section text including all subsections.
 """
 

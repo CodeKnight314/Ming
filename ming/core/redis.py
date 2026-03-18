@@ -70,6 +70,10 @@ class RedisDatabase:
         """Acquire an exclusive lock for fetching this URL. Returns True if acquired."""
         return bool(self.client.set(_URL_LOCK_PREFIX + url, "1", nx=True, ex=ttl))
 
+    def is_url_fetch_locked(self, url: str) -> bool:
+        """Return whether a fetch lock currently exists for the URL."""
+        return bool(self.client.exists(_URL_LOCK_PREFIX + url))
+
     def release_url_fetch_lock(self, url: str) -> None:
         """Release the fetch lock for a URL."""
         self.client.delete(_URL_LOCK_PREFIX + url)

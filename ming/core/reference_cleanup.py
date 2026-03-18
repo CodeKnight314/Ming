@@ -6,16 +6,33 @@ from urllib.parse import urlsplit, urlunsplit
 
 REFERENCE_LINE_RE = re.compile(r"^\[(\d+)\]:\s*(\S.*?)\s*$")
 INLINE_URL_CITATION_RE = re.compile(r"\[(https?://[^\]\s]+)\]")
+URL_CANDIDATE_RE = re.compile(r"https?://[^\s\]\"'<>(),（）》，。；：、】【]+")
 
 
 def _clean_url(raw_url: str) -> str:
-    url = raw_url.strip()
+    raw = raw_url.strip()
+    match = URL_CANDIDATE_RE.search(raw)
+    url = match.group(0) if match else raw
 
-    # The writer can leak trailing quotes, brackets, and commas.
     while url and url[-1] in ".,;:')\"]":
         url = url[:-1].rstrip()
 
     return url
+
+
+def _is_plausible_url(url: str) -> bool:
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = parts.netloc
+    if not host:
+        return False
+    if "." not in host:
+        return False
+    tld = host.rsplit(".", 1)[-1]
+    if len(tld) < 2:
+        return False
+    return True
 
 
 def canonicalize_url(url: str) -> str:
@@ -46,6 +63,10 @@ def _extract_unique_urls(lines: list[str]) -> list[str]:
             raise ValueError(f"Unsupported reference line: {line.rstrip()}")
 
         url = _clean_url(match.group(2))
+        if not _is_plausible_url(url):
+            # Drop clearly malformed URLs (e.g., truncated domains) instead of
+            # preserving irrecoverable artifacts in the reference section.
+            continue
         key = canonicalize_url(url)
         if key not in seen_keys:
             seen_keys.add(key)
