@@ -26,6 +26,7 @@ _URL_RE = re.compile(r"https?://[^\s\]\"'>,)]+")
 class WriterAgentConfig:
     model: OpenRouterModelConfig
     kg_query_tool: KGQueryTool
+    fallback_model: OpenRouterModelConfig | None = None
     draft_output_path: str | None = None
     max_iterations: int = 16
     num_parallel_sections: int = 4
@@ -76,8 +77,8 @@ class WriterAgent:
 
         return "\n\n".join(part for part in parts if part.strip()).strip() + "\n"
 
-    def _create_agent(self) -> Agent:
-        model_config = self.config.model
+    def _create_agent(self, model_config: OpenRouterModelConfig | None = None) -> Agent:
+        model_config = model_config or self.config.model
         model_config.max_tokens = max(8192, model_config.max_tokens)
 
         return Agent(
@@ -89,6 +90,23 @@ class WriterAgent:
                 max_tool_calls_per_turn=8,
             )
         )
+
+    def _run_writer_prompt_with_fallback(self, prompt: str) -> Tuple[str, List[Dict[str, str]]]:
+        """Run the writer model; on failure retry with fallback model."""
+        agent = self._create_agent(self.config.model)
+        try:
+            result = agent.run(prompt)
+            return result.output, result.messages
+        except Exception as exc:
+            if not self.config.fallback_model:
+                raise
+            logger.warning(
+                "Primary writer model failed; retrying with fallback model: %s",
+                exc,
+            )
+            fallback_agent = self._create_agent(self.config.fallback_model)
+            fallback_result = fallback_agent.run(prompt)
+            return fallback_result.output, fallback_result.messages
 
     def _build_initial_query(self, section: SectionPlan) -> str:
         subsection_titles = ", ".join(subsection.title for subsection in section.subsections)
@@ -102,8 +120,11 @@ class WriterAgent:
             if part.strip()
         )
 
-    def _canonical_entities_context(self, limit: int = 1000) -> str:
-        canonical_entities = self.config.kg_query_tool.kg_store.get_canonical_entities()
+    def _canonical_entities_context(self, limit: int = 2000) -> str:
+        canonical_entities = sorted(
+            self.config.kg_query_tool.kg_store.get_canonical_entities(),
+            key=lambda entity: (-len(getattr(entity, "relationships", []) or []), (entity.text or "").lower()),
+        )
         seen: set[str] = set()
         names: List[str] = []
         for entity in canonical_entities:
@@ -179,6 +200,9 @@ class WriterAgent:
         subsection_guidelines = "\n".join(
             [f"- {sub.title}: {sub.instruction}" for sub in section.subsections]
         )
+        subsection_order = "\n".join(
+            f"{idx}. {sub.title}" for idx, sub in enumerate(section.subsections, start=1)
+        )
         audit_section = ""
         if audit_feedback.strip():
             audit_section = f"### Audit Feedback\n{audit_feedback.strip()}\n\n"
@@ -191,6 +215,8 @@ class WriterAgent:
             f"{section.instruction}\n\n"
             f"### Subsection Guidelines\n"
             f"{subsection_guidelines}\n\n"
+            f"### Mandatory Subsection Order\n"
+            f"{subsection_order}\n\n"
             f"### Global Report Constraints\n"
             f"{constraints}\n\n"
             f"### Canonical KG Entities\n"
@@ -203,7 +229,9 @@ class WriterAgent:
             f"2. **Research**: Start with the surfaced evidence cards above. If you need more detail, call `kg_query_tool` with `search_evidence` first for broader evidence and use `get_neighbors` or `find_connection` only for drill-down.\n"
             f"3. **Target Length**: This entire section should be approximately 2000-2500 words.\n"
             f"4. **Citations**: Cite source URLs using [URL] format from KG results. Cite multiple sources for one claim when corroboration or disagreement matters, using adjacent citations like [URL][URL].\n"
-            f"5. **Write**: Output the full Markdown section starting with `## {section.title}` and including all `###` subsections."
+            f"5. **Order Discipline**: Follow the mandatory subsection order exactly. Do not discuss a later subsection in detail before its own `###` header.\n"
+            f"6. **Scope Discipline**: Keep each subsection focused on its assigned topic. If evidence is more relevant later, save it for the later subsection.\n"
+            f"7. **Write**: Output the full Markdown section starting with `## {section.title}` and including all `###` subsections."
         )
 
     def _clean_section_markdown(
@@ -306,7 +334,6 @@ class WriterAgent:
             }
         )
 
-        agent = self._create_agent()
         prompt = self._build_section_prompt(
             report_title=report_title,
             constraints_paragraph=constraints_paragraph,
@@ -314,13 +341,13 @@ class WriterAgent:
             initial_evidence_text=initial_evidence_text,
             canonical_entities_context=canonical_entities_context,
         )
-        result = agent.run(prompt)
-        urls = sorted(set(surfaced_urls + self._extract_urls_from_tool_results(result.messages)))
+        output, messages = self._run_writer_prompt_with_fallback(prompt)
+        urls = sorted(set(surfaced_urls + self._extract_urls_from_tool_results(messages)))
 
         markdown = self._clean_section_markdown(
             report_title=report_title,
             section_title=section.title,
-            raw_text=result.output,
+            raw_text=output,
         )
 
         needs_rerun, audit_feedback = self._needs_audit_rerun(
@@ -329,7 +356,6 @@ class WriterAgent:
             thin_pool=bool(initial_evidence.get("thin_pool", False)),
         )
         if needs_rerun and audit_feedback.strip():
-            rerun_agent = self._create_agent()
             rerun_prompt = self._build_section_prompt(
                 report_title=report_title,
                 constraints_paragraph=constraints_paragraph,
@@ -338,12 +364,12 @@ class WriterAgent:
                 canonical_entities_context=canonical_entities_context,
                 audit_feedback=audit_feedback,
             )
-            rerun_result = rerun_agent.run(rerun_prompt)
-            urls = sorted(set(urls + self._extract_urls_from_tool_results(rerun_result.messages)))
+            rerun_output, rerun_messages = self._run_writer_prompt_with_fallback(rerun_prompt)
+            urls = sorted(set(urls + self._extract_urls_from_tool_results(rerun_messages)))
             markdown = self._clean_section_markdown(
                 report_title=report_title,
                 section_title=section.title,
-                raw_text=rerun_result.output,
+                raw_text=rerun_output,
             )
 
         return section.section_id, markdown, urls

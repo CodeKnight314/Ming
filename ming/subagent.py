@@ -25,11 +25,59 @@ from ming.core.text_metrics import count_language_aware_tokens
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_criteria_from_topic(topic: str) -> str:
+    """Extract the success criteria block from a formatted topic string."""
+    match = re.search(r"Success Criteria:\s*(.*?)(?=\nConstraints:|\Z)", topic, re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
+def _extract_gaps_from_history(history: List[str]) -> List[str]:
+    """Extract unresolved GAP lines from the most recent criteria assessment in history.
+
+    Scans history in reverse to find the last THINK synthesis that contains a
+    ``## Criteria Assessment`` block, then returns all GAP values that are not
+    ``None`` or ``N/A``.  These are injected into GENERATE_QUERIES_PROMPT so the
+    next query round targets identified evidence gaps rather than re-exploring
+    already-covered ground.
+    """
+    for entry in reversed(history):
+        if "## Criteria Assessment" not in entry:
+            continue
+        gaps = []
+        for match in re.finditer(r"GAP:\s*(.+?)(?:\n|$)", entry):
+            gap_text = match.group(1).strip()
+            if gap_text.lower() not in ("none", "n/a", ""):
+                gaps.append(gap_text)
+        return gaps
+    return []
+
+
+def _count_criteria(criteria_text: str) -> int:
+    """Count the number of distinct success criteria in a criteria block."""
+    if not criteria_text:
+        return 1
+    items = re.findall(r"(?m)^\s*(?:[-*•]|\d+[.):])\s+", criteria_text)
+    return max(1, len(items)) if items else 1
+
+
+def _compute_think_tokens(num_sources: int, num_criteria: int) -> int:
+    """Compute a dynamic token budget for the think synthesis.
+
+    Formula: 300 base + 40 per source + 120 per criterion, clamped to [768, 2048].
+    """
+    computed = 300 + (num_sources * 40) + (num_criteria * 120)
+    return min(2048, max(768, computed))
+
+
 class ResearchSubagentConfig(TypedDict, total=False):
     max_context_len: int
     min_query_count: int
     max_query_count: int
+    max_open_urls_per_iteration: int
+    max_url_wait_seconds: float
     model: dict[str, Any]
+    fallback_model: dict[str, Any]
     tool_configs: List[dict[str, Any]]
     max_iterations: Optional[int]
     source_min_tokens: int
@@ -53,6 +101,10 @@ class ResearchSubagent:
         query_store: QueryStore | None = None,
     ):
         self.model = create_model_from_spec(config.get("model"))
+        fallback_spec = config.get("fallback_model")
+        self.fallback_model: BaseModel | None = (
+            create_model_from_spec(fallback_spec) if fallback_spec else None
+        )
         self.config = config
         self.database = database
         self.query_store = query_store
@@ -74,6 +126,26 @@ class ResearchSubagent:
         self.graph = self._build_graph()
         self.statistics = self._empty_statistics()
 
+    def _generate_with_fallback(self, prompt: str, **generation_kwargs: Any) -> str:
+        """Call the primary model, falling back to a secondary model on failure.
+
+        This protects individual research angles from being dropped entirely when
+        the primary engine (e.g. qwen3.5 flash) has transient OpenRouter/runtime issues.
+        """
+        try:
+            return self.model.generate(prompt, **self._generation_kwargs(**generation_kwargs))
+        except Exception as exc:
+            if not self.fallback_model:
+                raise
+            logger.warning(
+                "Primary subagent model failed; falling back to secondary model: %s",
+                exc,
+            )
+            return self.fallback_model.generate(
+                prompt,
+                **self._generation_kwargs(**generation_kwargs),
+            )
+
     def _empty_statistics(self) -> Dict[str, int]:
         return {
             "total_searches": 0,
@@ -81,8 +153,10 @@ class ResearchSubagent:
             "total_queries": 0,
             "discarded_search_results": 0,
             "discarded_open_results": 0,
+            "ranked_out_urls": 0,
             "successful_open_results": 0,
             "skipped_cached_urls": 0,
+            "tavily_depth_fallbacks": 0,
         }
 
     def _generation_kwargs(self, **overrides: Any):
@@ -150,16 +224,27 @@ class ResearchSubagent:
             history_section = ""
             guidance = "Cast a broad net to find relevant sources."
 
+        gaps = _extract_gaps_from_history(history) if history else []
+        if gaps:
+            gaps_section = (
+                "Unresolved gaps from prior synthesis that MUST be addressed in this round:\n"
+                + "\n".join(f"- {g}" for g in gaps)
+                + "\n"
+            )
+        else:
+            gaps_section = ""
+
         prompt = GENERATE_QUERIES_PROMPT.format(
             topic=topic,
             scout_section=scout_section,
             previous_queries_section=previous_queries_section,
             history_section=history_section,
+            gaps_section=gaps_section,
             min_queries=min_q,
             max_queries=max_q,
             guidance=guidance,
         )
-        response = self.model.generate(prompt, **self._generation_kwargs())
+        response = self._generate_with_fallback(prompt)
         queries = self._parse_queries_from_response(response)
 
         return {
@@ -195,6 +280,60 @@ class ResearchSubagent:
         )
         return not any(marker in lowered for marker in failure_markers)
 
+    @staticmethod
+    def _score_web_result(result: Dict[str, Any], index: int) -> tuple[int, float, int, int]:
+        raw_score = result.get("score")
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            score = float("-inf")
+        snippet_len = len((result.get("content") or "").strip())
+        return (
+            int(raw_score is not None),
+            score,
+            snippet_len,
+            -index,
+        )
+
+    def _select_open_candidates(
+        self, web_results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        if not web_results:
+            return []
+
+        best_by_url: Dict[str, tuple[tuple[int, float, int, int], Dict[str, Any]]] = {}
+        for index, result in enumerate(web_results):
+            url = (result.get("url") or "").strip()
+            if not url:
+                continue
+            if (
+                result.get("discard")
+                or result.get("discard_candidate")
+                or url.endswith(".pdf")
+                or url.endswith(".docx")
+            ):
+                self.statistics["discarded_search_results"] += 1
+                continue
+
+            score_key = self._score_web_result(result, index)
+            current = best_by_url.get(url)
+            if current is None or score_key > current[0]:
+                best_by_url[url] = (score_key, result)
+
+        ranked_results = [
+            item[1]
+            for item in sorted(
+                best_by_url.values(),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+        ]
+
+        max_open_urls = max(1, int(self.config.get("max_open_urls_per_iteration", 12)))
+        if len(ranked_results) > max_open_urls:
+            self.statistics["ranked_out_urls"] += len(ranked_results) - max_open_urls
+        return ranked_results[:max_open_urls]
+
     def _get_or_fetch_url_context_id(
         self, url: str, web_result: Dict[str, Any]
     ) -> Optional[str]:
@@ -204,7 +343,7 @@ class ResearchSubagent:
         - First to acquire lock fetches and inserts.
         - Others wait (poll) until the URL is indexed, then use cached result.
         """
-        if not url:
+        if not url or url.endswith(".pdf") or url.endswith(".docx"):
             return None
 
         if web_result.get("discard") or web_result.get("discard_candidate"):
@@ -217,24 +356,51 @@ class ResearchSubagent:
             self.statistics["skipped_cached_urls"] += 1
             return cached_id
 
-        # 2. Try to be the fetcher
+        # 2. Try to be the writer
         acquired = self.database.try_acquire_url_fetch_lock(url)
         if acquired:
             try:
-                wb_raw = self._fetch_website_content(url)
+                raw_text = (web_result.get("content") or "").strip()
+                tavily_tokens = count_language_aware_tokens(raw_text)
+
+                fallback_min_tokens = int(
+                    self.config.get("tavily_depth_fallback_min_tokens", 600)
+                )
+                fallback_score_floor = float(
+                    self.config.get("tavily_depth_fallback_score_threshold", 0.7)
+                )
+                tavily_score = float(web_result.get("score") or 0.0)
+
                 if (
-                    wb_raw.get("discard", True)
-                    or wb_raw.get("status") != "success"
-                    or not self._is_valid_context_content(wb_raw.get("content"))
+                    tavily_tokens < fallback_min_tokens
+                    and tavily_score >= fallback_score_floor
+                    and "open_url_tool" in self._tool_map
                 ):
+                    self.statistics["tavily_depth_fallbacks"] += 1
+                    try:
+                        fetched = self._fetch_website_content(url)
+                        if not fetched.get("discard") and self._is_valid_context_content(
+                            fetched.get("content")
+                        ):
+                            fetched_tokens = count_language_aware_tokens(
+                                fetched.get("content", "")
+                            )
+                            if fetched_tokens > tavily_tokens:
+                                raw_text = fetched["content"].strip()
+                    except Exception as fetch_exc:
+                        logger.debug(
+                            "Trafilatura depth fallback failed for %s: %s", url, fetch_exc
+                        )
+
+                if not self._is_valid_context_content(raw_text):
                     self.statistics["discarded_open_results"] += 1
                     return None
                 entry = {
                     "url": url,
                     "title": web_result.get("title", "Untitled"),
-                    "content": web_result.get("content", ""),
-                    "raw_content": wb_raw.get("content", ""),
-                    "token_count": count_language_aware_tokens(wb_raw.get("content", "")),
+                    "content": raw_text,
+                    "raw_content": raw_text,
+                    "token_count": count_language_aware_tokens(raw_text),
                 }
                 context_id = self.database.create_entry(entry)
                 self.database.set_url_index(url, context_id)
@@ -248,7 +414,7 @@ class ResearchSubagent:
                 self.database.release_url_fetch_lock(url)
 
         poll_interval = 0.2
-        max_wait = 90
+        max_wait = max(0.0, float(self.config.get("max_url_wait_seconds", 8.0)))
         waited = 0.0
         while waited < max_wait:
             time.sleep(poll_interval)
@@ -256,7 +422,17 @@ class ResearchSubagent:
             cached_id = self.database.get_context_id_by_url(url)
             if cached_id is not None:
                 return cached_id
-        logger.warning("Timeout waiting for URL %s to be cached by another subagent", url)
+            if not self.database.is_url_fetch_locked(url):
+                logger.info(
+                    "Skipping URL %s after peer fetch completed without caching it",
+                    url,
+                )
+                return None
+        logger.warning(
+            "Timeout waiting %.1fs for URL %s to be cached by another subagent",
+            max_wait,
+            url,
+        )
         return None
 
     def _retrieve(self, state: ResearchSubagentState) -> Dict[str, Any]:
@@ -264,7 +440,7 @@ class ResearchSubagent:
         if not queries:
             return {"history": state["history"] + ["No queries generated."]}
 
-        web_results = []
+        web_results: List[Dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=max(1, len(queries))) as executor:
             futures = [executor.submit(self._search_web, q) for q in queries]
             for future in as_completed(futures):
@@ -278,16 +454,18 @@ class ResearchSubagent:
             if topic:
                 self.query_store.add_queries(topic, queries)
 
+        candidate_results = self._select_open_candidates(web_results)
+
         new_context_ids = []
-        if web_results:
-            with ThreadPoolExecutor(max_workers=min(8, len(web_results))) as executor:
+        if candidate_results:
+            with ThreadPoolExecutor(max_workers=min(8, len(candidate_results))) as executor:
                 futures = [
                     executor.submit(
                         self._get_or_fetch_url_context_id,
                         r.get("url", ""),
                         r,
                     )
-                    for r in web_results
+                    for r in candidate_results
                 ]
                 for future in as_completed(futures):
                     context_id = future.result()
@@ -297,7 +475,11 @@ class ResearchSubagent:
         existing_ids = state.get("context_ids") or []
         context_ids = existing_ids + new_context_ids
         self.statistics["unique_urls"] = len(set(context_ids))
-        history_entry = "retrieved web content for queries: " + ", ".join(queries)
+        history_entry = (
+            "cached web content from Tavily for queries: "
+            + ", ".join(queries)
+            + f" (cached {len(new_context_ids)} of {len(web_results)} search results)"
+        )
         return {
             "context_ids": context_ids,
             "history": state["history"] + [history_entry],
@@ -312,10 +494,17 @@ class ResearchSubagent:
         if not context_ids:
             return {"history": state["history"] + ["No context retrieved to synthesize."]}
 
+        criteria_text = _parse_criteria_from_topic(topic)
+        num_criteria = _count_criteria(criteria_text)
+        think_tokens = _compute_think_tokens(len(context_ids), num_criteria)
+
         def _truncate_context(content: str, max_len: int) -> str:
             return content[:max_len] if content else ""
 
         context_parts = []
+
+        if criteria_text:
+            context_parts.append(f"Research success criteria:\n{criteria_text}")
 
         queries_for_context = list(all_queries)
         if self.query_store and topic:
@@ -348,12 +537,12 @@ class ResearchSubagent:
 
         think_tool = self._tool_map.get("think_tool")
         if think_tool is not None:
-            response = think_tool.run(context_str)
+            response = think_tool.run(context_str, max_new_tokens=think_tokens)
         else:
             prompt = THINK_PROMPT.format(context=context_str)
             response = self.model.generate(
                 prompt,
-                **self._generation_kwargs(),
+                **self._generation_kwargs(max_new_tokens=think_tokens),
             )
 
         return {"history": state["history"] + [response]}
@@ -372,9 +561,9 @@ class ResearchSubagent:
         history = state.get("history") or []
         history_str = "\n\n".join(history) if history else "No prior research yet."
         prompt = DECISION_PROMPT.format(history=history_str)
-        response = self.model.generate(
+        response = self._generate_with_fallback(
             prompt,
-            **self._generation_kwargs(max_new_tokens=32),
+            max_new_tokens=32,
         )
 
         decision = "continue" if "continue" in response.lower() else "stop"
@@ -425,7 +614,13 @@ class ResearchSubagent:
             "all_queries": [],
         }
 
-        return self.graph.invoke(initial_state)
+        recursion_limit = int(self.config.get("recursion_limit", 40))
+        results = self.graph.invoke(initial_state, config={"recursion_limit": recursion_limit})
+
+        for tool in self._tool_map.values():
+            if hasattr(tool, "close"):
+                tool.close()
+        return results
 
     def get_statistics(self) -> Dict[str, Any]:
         return self.statistics

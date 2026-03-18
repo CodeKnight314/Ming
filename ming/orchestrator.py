@@ -1,6 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+import html
 import logging
+from queue import Queue
+import re
 from typing import Any, Dict, List
 
 from ming.core.config import create_queries_store_from_config, create_redis_from_config
@@ -27,6 +30,7 @@ class MingDeepResearchConfig:
     queries_redis_config: QueryStoreConfig | dict[str, Any] | None = None
     kg_redis_config: RedisDatabaseConfig | dict[str, Any] | None = None
     writer_model: OpenRouterModelConfig | None = None
+    writer_fallback_model: OpenRouterModelConfig | None = None
     draft_output_path: str | None = None
     num_research_subagents: int = 3
     outline_max_context_ids: int = 180
@@ -35,6 +39,7 @@ class MingDeepResearchConfig:
     source_min_tokens: int = 400
     research_source_budget: int = 250
     max_chunks_per_source: int = 8
+    source_score_cutoff: float = 4.5
 
 
 class MingDeepResearch:
@@ -70,9 +75,10 @@ class MingDeepResearch:
         self.kg_store = KGRedisStore(self.kg_redis, ERConfig(threshold=0.5, num_perm=128))
         self.kg_query_tool = KGQueryTool(self.kg_store)
         self.nerre_pipeline = NERREPipeline(
-            re_config=OpenRouterModelConfig(model_name="google/gemini-2.5-flash-lite"),
+            re_config=OpenRouterModelConfig(model_name="google/gemma-3-4b-it", max_tokens=1024),
             kg_store=self.kg_store,
             max_workers=32,
+            source_score_cutoff=config.source_score_cutoff,
         )
 
         self.scout = ScoutSubagent(
@@ -123,6 +129,7 @@ class MingDeepResearch:
                     temperature=0.2,
                     max_tokens=4096,
                 ),
+                fallback_model=config.writer_fallback_model,
                 kg_query_tool=self.kg_query_tool,
                 draft_output_path=config.draft_output_path,
             )
@@ -147,41 +154,79 @@ class MingDeepResearch:
         return model.generate(prompt).strip()
 
     @staticmethod
+    def _strip_markdown_fences(raw_output: str) -> str:
+        cleaned = raw_output.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+        return cleaned
+
+    @staticmethod
+    def _escape_xml_text_nodes(xml_text: str) -> str:
+        def _escape_text_segment(segment: str) -> str:
+            return html.escape(html.unescape(segment), quote=False)
+
+        parts: list[str] = []
+        last_end = 0
+        for match in re.finditer(r"<[^>]+>", xml_text):
+            text_segment = xml_text[last_end:match.start()]
+            if text_segment:
+                parts.append(_escape_text_segment(text_segment))
+            parts.append(match.group(0))
+            last_end = match.end()
+
+        trailing = xml_text[last_end:]
+        if trailing:
+            parts.append(_escape_text_segment(trailing))
+
+        return "".join(parts)
+
+    @staticmethod
     def _parse_planning_result(planning_result: str) -> Dict[str, Any]:
         # Parse the planning result using xml.etree.ElementTree
         raw_output = planning_result
-        try:
-            # Handle potential markdown wrapping or extra whitespace
-            cleaned = raw_output.strip()
-            if cleaned.startswith("```"):
-                # Remove markdown fences if present
-                lines = cleaned.split("\n")
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                cleaned = "\n".join(lines).strip()
-            
-            root = xml.etree.ElementTree.fromstring(cleaned)
-        except xml.etree.ElementTree.ParseError as e:
-            logger.error(f"Failed to parse planning result XML: {e}\nResult: {raw_output}")
-            # Return a minimal valid structure to prevent total failure
-            return {"research_angles": [], "constraints": ""}
+        cleaned = MingDeepResearch._strip_markdown_fences(raw_output)
 
-        research_angles = root.findall("research_angles/research_angle")
-        constraints_el = root.find("constraints")
-        constraints = constraints_el.text if constraints_el is not None and constraints_el.text else ""
-        
-        return {
-            "research_angles": [
-                {
-                    "topic": angle.find("topic").text if angle.find("topic") is not None else "Unknown Topic",
-                    "success_criteria": angle.find("success_criteria").text if angle.find("success_criteria") is not None else "",
-                }
-                for angle in research_angles
-            ], 
-            "constraints": constraints
-        }
+        try:
+            root = xml.etree.ElementTree.fromstring(cleaned)
+        except xml.etree.ElementTree.ParseError as first_error:
+            sanitized = MingDeepResearch._escape_xml_text_nodes(cleaned)
+            try:
+                root = xml.etree.ElementTree.fromstring(sanitized)
+                logger.warning(
+                    "Planning XML required sanitization before parsing: %s",
+                    first_error,
+                )
+            except xml.etree.ElementTree.ParseError as second_error:
+                logger.error(
+                    "Failed to parse planning result XML after sanitization: %s\nResult: %s",
+                    second_error,
+                    raw_output,
+                )
+                return {"research_angles": [], "constraints": ""}
+
+        try:
+            research_angles = root.findall("research_angles/research_angle")
+            constraints_el = root.find("constraints")
+            constraints = constraints_el.text if constraints_el is not None and constraints_el.text else ""
+
+            return {
+                "research_angles": [
+                    {
+                        "topic": angle.find("topic").text if angle.find("topic") is not None else "Unknown Topic",
+                        "success_criteria": angle.find("success_criteria").text if angle.find("success_criteria") is not None else "",
+                    }
+                    for angle in research_angles
+                ],
+                "constraints": constraints,
+            }
+        except Exception as e:
+            logger.error(f"Failed to extract planning fields: {e}\nResult: {raw_output}")
+            return {"research_angles": [], "constraints": ""}
 
     @staticmethod
     def _truncate_text(text: str, max_chars: int = 1200) -> str:
@@ -279,6 +324,16 @@ class MingDeepResearch:
         logger.info(f"Executing {len(research_plan['research_angles'])} research angles in parallel...")
         start_time = time.time()
         results = []
+        subagent_pool: Queue[ResearchSubagent] = Queue()
+        for subagent in self.research_subagents:
+            subagent_pool.put(subagent)
+
+        def _run_research_angle(topic_prompt: str, scout_brief: str) -> Dict[str, Any]:
+            subagent = subagent_pool.get()
+            try:
+                return subagent.run(topic_prompt, scout_brief)
+            finally:
+                subagent_pool.put(subagent)
         
         with ThreadPoolExecutor(max_workers=self.config.num_research_subagents) as executor:
             future_to_angle = {}
@@ -288,14 +343,12 @@ class MingDeepResearch:
                     f"Success Criteria: {angle['success_criteria']}\n"
                     f"Constraints: {research_plan['constraints']}"
                 )
-                
-                subagent = ResearchSubagent(
-                    config=self.subagent_config,
-                    database=self.context_redis,
-                    query_store=self.queries_redis,
+
+                future = executor.submit(
+                    _run_research_angle,
+                    topic_prompt,
+                    scout_result["landscape_brief"],
                 )
-                
-                future = executor.submit(subagent.run, topic_prompt, scout_result["landscape_brief"])
                 future_to_angle[future] = angle
             
             for future in as_completed(future_to_angle):
@@ -438,6 +491,6 @@ if __name__ == "__main__":
     orchestrator = MingDeepResearch(config)
     import time
     start_time = time.time()
-    result = orchestrator.run("为我调研AI算法能否提升现有电子学读出时幅修正方法")
+    result = orchestrator.run("I need to dynamically adjust Kubernetes (K8S) cluster node counts based on fluctuating business request volumes, ensuring resources are scaled up proactively before peak loads and scaled down promptly during troughs. The standard Cluster Autoscaler (CA) isn't suitable as it relies on pending pods and might not fit non-elastic node group scenarios. What are effective implementation strategies, best practices, or existing projects that address predictive or scheduled autoscaling for K8S nodes?")
     end_time = time.time()
     print(f"\n\nTime taken: {round(end_time - start_time, 2)/60} minutes")
