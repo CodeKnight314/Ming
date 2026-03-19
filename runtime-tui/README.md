@@ -40,12 +40,12 @@ cargo run --manifest-path runtime-tui/Cargo.toml -- --mock runtime-tui/mock_stat
 - `tab` / `shift-tab`: change focus
 - `j` / `k` or arrow keys: move selection
 - `m`: switch between direct query and sequential batch mock forms
-- `Ctrl-S`: submit the current direct query or batch JSON to Redis
+- `enter`: submit the current direct query or batch JSON to Redis
 - `?`: toggle help
 
 ## Mock Goals
 
 - left pane: queue visibility
-- center pane: active run timeline plus angle detail
+- center pane: active run timeline, KG pipeline progress, and passive research angle statuses
 - right pane: direct query and sequential batch command composition
 - bottom pane: recent runtime events

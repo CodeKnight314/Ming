@@ -5,7 +5,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from threading import local
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Callable, Dict, Iterable, List, Optional, Union
 
 from ming.extraction.ner_module import Chunk, Entity, NERModule
 from ming.extraction.re_module import REModule, Relationship
@@ -112,7 +112,10 @@ class NERREPipeline:
         )
 
     def collect_sources(
-        self, sources: Iterable[tuple[str, str] | tuple[str, str, str]]
+        self,
+        sources: Iterable[tuple[str, str] | tuple[str, str, str]],
+        *,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> List[SourceChunkCollection]:
         normalized_sources = list(sources)
         if not normalized_sources:
@@ -140,6 +143,8 @@ class NERREPipeline:
             for future in as_completed(future_map):
                 idx = future_map[future]
                 collected_by_index[idx] = future.result()
+                if progress_callback is not None:
+                    progress_callback(len(collected_by_index), len(normalized_sources))
 
         collected: List[SourceChunkCollection] = []
         for idx in range(len(normalized_sources)):
@@ -299,7 +304,12 @@ class NERREPipeline:
 
         return kg_chunks, kg_entities, entity_map
 
-    def run_re_on_chunks(self, chunks: List[Chunk]) -> List[KGEntity]:
+    def run_re_on_chunks(
+        self,
+        chunks: List[Chunk],
+        *,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> List[KGEntity]:
         if not chunks:
             return []
 
@@ -313,24 +323,31 @@ class NERREPipeline:
 
         max_workers = min(self.max_workers, len(chunks_with_entities_indices))
         results_by_chunk_idx = {}
+        processed_count = 0
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(self._extract_chunk_relationships, chunks[idx]): idx
-                for idx in chunks_with_entities_indices
-            }
-            for future in as_completed(future_map):
-                idx = future_map[future]
-                try:
-                    results_by_chunk_idx[idx] = future.result()
-                except Exception as exc:
-                    chunk = chunks[idx]
-                    logger.warning(
-                        "Skipping RE extraction for chunk idx=%d url=%s due to error: %s",
-                        idx,
-                        getattr(chunk, "url", ""),
-                        exc,
-                    )
+        for batch_start in range(0, len(chunks_with_entities_indices), max_workers):
+            batch_indices = chunks_with_entities_indices[batch_start : batch_start + max_workers]
+            with ThreadPoolExecutor(max_workers=len(batch_indices)) as executor:
+                future_map = {
+                    executor.submit(self._extract_chunk_relationships, chunks[idx]): idx
+                    for idx in batch_indices
+                }
+                for future in as_completed(future_map):
+                    idx = future_map[future]
+                    try:
+                        results_by_chunk_idx[idx] = future.result()
+                    except Exception as exc:
+                        chunk = chunks[idx]
+                        logger.warning(
+                            "Skipping RE extraction for chunk idx=%d url=%s due to error: %s",
+                            idx,
+                            getattr(chunk, "url", ""),
+                            exc,
+                        )
+                    finally:
+                        processed_count += 1
+                        if progress_callback is not None:
+                            progress_callback(processed_count, len(chunks_with_entities_indices))
 
         all_relationships = []
         rel_to_entities = []

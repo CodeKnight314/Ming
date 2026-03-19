@@ -76,7 +76,7 @@ class MingDeepResearch:
         self.kg_store = KGRedisStore(self.kg_redis, ERConfig(threshold=0.5, num_perm=128))
         self.kg_query_tool = KGQueryTool(self.kg_store)
         self.nerre_pipeline = NERREPipeline(
-            re_config=OpenRouterModelConfig(model_name="google/gemma-3-4b-it", max_tokens=1024),
+            re_config=OpenRouterModelConfig(model_name="google/gemma-3n-e4b-it", max_tokens=1024),
             kg_store=self.kg_store,
             max_workers=32,
             source_score_cutoff=config.source_score_cutoff,
@@ -176,6 +176,35 @@ class MingDeepResearch:
             metrics=metrics,
             active_angle_count=active_angle_count,
             completed_angle_count=completed_angle_count,
+        )
+
+    def _stage_progress(
+        self,
+        stage: str,
+        message: str,
+        *,
+        processed: int,
+        total: int,
+        elapsed_seconds: float,
+        extra_metrics: dict[str, Any] | None = None,
+    ) -> None:
+        if self.runtime_observer is None:
+            return
+        metrics = {
+            f"{stage}_processed": processed,
+            f"{stage}_total": total,
+            f"{stage}_elapsed_seconds": round(elapsed_seconds, 3),
+        }
+        if extra_metrics:
+            metrics.update(extra_metrics)
+        self.runtime_observer.update_run(metrics=metrics)
+        self.runtime_observer.emit_event(
+            kind="metric_update",
+            component="orchestrator",
+            status="running",
+            message=message,
+            stage=stage,
+            metrics=metrics,
         )
 
     def _register_angle(self, angle_id: str, topic: str, success_criteria: str) -> None:
@@ -510,12 +539,37 @@ class MingDeepResearch:
                 all_context_ids.append(cid)
 
         source_inputs = []
-        for cid in tqdm(all_context_ids):
+        total_context_ids = len(all_context_ids)
+        for index, cid in enumerate(tqdm(all_context_ids), start=1):
             entry = self.context_redis.get_entry(cid)
             if entry and entry.get("raw_content"):
                 source_inputs.append((entry["raw_content"], entry.get("url", ""), cid))
+            self._stage_progress(
+                "kg_collect",
+                "Preparing source inputs for KG collection.",
+                processed=index,
+                total=total_context_ids,
+                elapsed_seconds=time.time() - start_time,
+                extra_metrics={
+                    "kg_collect_source_inputs_total": total_context_ids,
+                    "kg_collect_source_inputs_ready": len(source_inputs),
+                },
+            )
 
-        collected_sources = self.nerre_pipeline.collect_sources(source_inputs)
+        collected_sources = self.nerre_pipeline.collect_sources(
+            source_inputs,
+            progress_callback=lambda processed, total: self._stage_progress(
+                "kg_collect",
+                "Collecting NER chunks from sources.",
+                processed=processed,
+                total=total,
+                elapsed_seconds=time.time() - start_time,
+                extra_metrics={
+                    "kg_collect_source_inputs_total": len(source_inputs),
+                    "kg_collect_source_inputs_ready": len(source_inputs),
+                },
+            ),
+        )
         self._stage_completed(
             "kg_collect",
             "KG source collection completed.",
@@ -523,6 +577,8 @@ class MingDeepResearch:
                 "elapsed_seconds": round(time.time() - start_time, 3),
                 "source_input_count": len(source_inputs),
                 "collected_source_count": len(collected_sources),
+                "kg_collect_processed": len(collected_sources),
+                "kg_collect_total": len(source_inputs),
             },
         )
         self._stage_started("kg_filter", "KG source filtering started.")
@@ -537,12 +593,25 @@ class MingDeepResearch:
             len(retained_sources),
             len(collected_sources),
         )
+        self._stage_progress(
+            "kg_filter",
+            "Filtering collected sources for KG processing.",
+            processed=len(collected_sources),
+            total=len(collected_sources),
+            elapsed_seconds=time.time() - start_time,
+            extra_metrics={
+                "kg_filter_retained": len(retained_sources),
+            },
+        )
         self._stage_completed(
             "kg_filter",
             "KG source filtering completed.",
             metrics={
                 "retained_source_count": len(retained_sources),
                 "collected_source_count": len(collected_sources),
+                "kg_filter_processed": len(collected_sources),
+                "kg_filter_total": len(collected_sources),
+                "kg_filter_retained": len(retained_sources),
             },
         )
         self._stage_started("kg_re", "KG relationship extraction started.")
@@ -557,7 +626,21 @@ class MingDeepResearch:
         )
 
         try:
-            all_kg_entities.extend(self.nerre_pipeline.run_re_on_chunks(optimized_chunks))
+            all_kg_entities.extend(
+                self.nerre_pipeline.run_re_on_chunks(
+                    optimized_chunks,
+                    progress_callback=lambda processed, total: self._stage_progress(
+                        "kg_re",
+                        "Running RE extraction on optimized chunks.",
+                        processed=processed,
+                        total=total,
+                        elapsed_seconds=time.time() - start_time,
+                        extra_metrics={
+                            "kg_re_chunk_total": len(optimized_chunks),
+                        },
+                    ),
+                )
+            )
         except Exception as e:
             logger.warning(f"Batch NER/RE failed: {e}")
         end_time = time.time()
@@ -569,6 +652,8 @@ class MingDeepResearch:
                 "elapsed_seconds": round(end_time - start_time, 3),
                 "selected_chunk_count": len(optimized_chunks),
                 "kg_entity_count": len(all_kg_entities),
+                "kg_re_processed": len(optimized_chunks),
+                "kg_re_total": len(optimized_chunks),
             },
         )
 
@@ -576,6 +661,13 @@ class MingDeepResearch:
         start_time = time.time()
         self._stage_started("entity_resolution", "Entity resolution started.")
         self.kg_store.perform_entity_resolution(all_kg_entities)
+        self._stage_progress(
+            "entity_resolution",
+            "Resolving entities into canonical KG nodes.",
+            processed=len(all_kg_entities),
+            total=len(all_kg_entities),
+            elapsed_seconds=time.time() - start_time,
+        )
         end_time = time.time()
         logger.info(f"Entity resolution took {round(end_time - start_time, 2)} seconds")
         logger.info(f"Number of relationships active in the knowledge graph: {len(self.kg_store.get_relationships())}")

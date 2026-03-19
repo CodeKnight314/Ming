@@ -6,18 +6,17 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
 };
+use crossterm::execute;
 use ratatui::{
     DefaultTerminal,
     layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, Paragraph, Row, Table, Wrap},
 };
 use redis::{Commands, FromRedisValue, cmd, streams::StreamRangeReply};
 use serde::Deserialize;
@@ -37,34 +36,24 @@ const STAGE_ORDER: [&str; 9] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
-    Queue,
-    Angles,
     Input,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
     DirectQuery,
-    BatchJson,
-}
-
-impl InputMode {
-    fn title(self) -> &'static str {
-        match self {
-            Self::DirectQuery => "Direct Query",
-            Self::BatchJson => "Sequential Batch",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct DashboardData {
+    #[allow(dead_code)]
     queue: QueueView,
     active_run: RunView,
     recent_events: Vec<EventEntry>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[allow(dead_code)]
 struct QueueView {
     queued: Vec<JobEntry>,
     active: Option<JobEntry>,
@@ -72,6 +61,7 @@ struct QueueView {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[allow(dead_code)]
 struct JobEntry {
     job_id: String,
     kind: String,
@@ -83,10 +73,13 @@ struct JobEntry {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct RunView {
     run_id: String,
+    #[allow(dead_code)]
     prompt: String,
+    #[allow(dead_code)]
     status: String,
     stage: String,
     elapsed_seconds: u64,
+    #[allow(dead_code)]
     progress_ratio: f64,
     stage_progress: Vec<StageProgress>,
     angles: Vec<AngleView>,
@@ -197,7 +190,10 @@ enum DataSource {
 }
 
 impl DataSource {
-    fn load(&self) -> Result<(DashboardData, Option<String>, Option<String>)> {
+    fn load(
+        &self,
+        preferred_run_id: Option<&str>,
+    ) -> Result<(DashboardData, Option<String>, Option<String>)> {
         match self {
             Self::Mock { path } => {
                 let raw = fs::read_to_string(path).with_context(|| {
@@ -220,7 +216,11 @@ impl DataSource {
                 let mut con = client
                     .get_connection()
                     .context("failed to connect to Redis for live TUI state")?;
-                Ok((load_live_dashboard(&mut con, namespace)?, None, None))
+                Ok((
+                    load_live_dashboard(&mut con, namespace, preferred_run_id)?,
+                    None,
+                    None,
+                ))
             }
         }
     }
@@ -251,27 +251,6 @@ impl DataSource {
                             "payload": {
                                 "prompt": prompt,
                                 "metadata": {}
-                            }
-                        })
-                    }
-                    InputMode::BatchJson => {
-                        let items: JsonValue = serde_json::from_str(input.trim())
-                            .context("batch JSON must be a JSON array of {id, prompt}")?;
-                        if !items.is_array() {
-                            return Err(anyhow!("batch JSON must be an array"));
-                        }
-                        json!({
-                            "command_id": command_id,
-                            "type": "run_batch",
-                            "submitted_at": iso_like_now()?,
-                            "source": {
-                                "kind": "tui",
-                                "client_id": "runtime-tui",
-                                "user": "local"
-                            },
-                            "payload": {
-                                "mode": "sequential",
-                                "items": items
                             }
                         })
                     }
@@ -306,13 +285,14 @@ struct App {
     dashboard: DashboardData,
     focus: Focus,
     input_mode: InputMode,
-    queue_index: usize,
-    angle_index: usize,
     show_help: bool,
     direct_query_draft: String,
-    batch_json_draft: String,
     last_status: String,
     last_refresh: Option<Instant>,
+    // Remembered across refreshes so that once a run's job leaves the active
+    // slot we still fetch that specific run snapshot rather than letting
+    // latest_run_snapshot drift to a different (possibly empty) run.
+    last_run_id: Option<String>,
 }
 
 impl App {
@@ -320,39 +300,42 @@ impl App {
         data_source: DataSource,
         dashboard: DashboardData,
         direct_query_draft: String,
-        batch_json_draft: String,
+        _batch_json_draft: String,
     ) -> Self {
+        let last_run_id = {
+            let id = &dashboard.active_run.run_id;
+            if id != "none" && !id.is_empty() {
+                Some(id.clone())
+            } else {
+                None
+            }
+        };
         Self {
             data_source,
             dashboard,
-            focus: Focus::Queue,
+            focus: Focus::Input,
             input_mode: InputMode::DirectQuery,
-            queue_index: 0,
-            angle_index: 0,
             show_help: false,
             direct_query_draft,
-            batch_json_draft,
             last_status: "Ready.".to_string(),
             last_refresh: Some(Instant::now()),
+            last_run_id,
         }
     }
 
     fn refresh(&mut self) {
-        match self.data_source.load() {
+        match self.data_source.load(self.last_run_id.as_deref()) {
             Ok((dashboard, direct_draft, batch_draft)) => {
+                // Keep the run_id sticky as long as we've seen a real one.
+                let new_id = &dashboard.active_run.run_id;
+                if new_id != "none" && !new_id.is_empty() {
+                    self.last_run_id = Some(new_id.clone());
+                }
                 self.dashboard = dashboard;
                 if let Some(value) = direct_draft {
                     self.direct_query_draft = value;
                 }
-                if let Some(value) = batch_draft {
-                    self.batch_json_draft = value;
-                }
-                self.queue_index = self
-                    .queue_index
-                    .min(self.queue_items().len().saturating_sub(1));
-                self.angle_index = self
-                    .angle_index
-                    .min(self.dashboard.active_run.angles.len().saturating_sub(1));
+                let _ = batch_draft;
                 self.last_refresh = Some(Instant::now());
                 self.last_status = format!("Refreshed from {}.", self.data_source.source_label());
             }
@@ -367,10 +350,30 @@ impl App {
         match self.data_source.submit(self.input_mode, &input) {
             Ok(message) => {
                 self.last_status = message;
-                match self.input_mode {
-                    InputMode::DirectQuery => self.direct_query_draft.clear(),
-                    InputMode::BatchJson => self.batch_json_draft.clear(),
-                }
+                self.direct_query_draft.clear();
+                // Drop the sticky run ID so the next refresh picks up the new
+                // run rather than continuing to show the just-completed one.
+                self.last_run_id = None;
+                // Reset the displayed run immediately — don't wait for the next
+                // poll cycle to clear old stage/metric data.
+                self.dashboard.active_run = RunView {
+                    run_id: "none".to_string(),
+                    prompt: String::new(),
+                    status: "queued".to_string(),
+                    stage: "queued".to_string(),
+                    elapsed_seconds: 0,
+                    progress_ratio: 0.0,
+                    stage_progress: STAGE_ORDER
+                        .iter()
+                        .map(|label| StageProgress {
+                            label: (*label).to_string(),
+                            status: "pending".to_string(),
+                            duration_seconds: 0,
+                        })
+                        .collect(),
+                    angles: Vec::new(),
+                    metrics: Vec::new(),
+                };
             }
             Err(err) => {
                 self.last_status = format!("Submit failed: {err}");
@@ -379,154 +382,51 @@ impl App {
     }
 
     fn next_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Queue => Focus::Angles,
-            Focus::Angles => Focus::Input,
-            Focus::Input => Focus::Queue,
-        };
+        self.focus = Focus::Input;
     }
 
     fn prev_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Queue => Focus::Input,
-            Focus::Angles => Focus::Queue,
-            Focus::Input => Focus::Angles,
-        };
-    }
-
-    fn selected_angle(&self) -> Option<&AngleView> {
-        self.dashboard.active_run.angles.get(self.angle_index)
-    }
-
-    fn queue_items(&self) -> Vec<&JobEntry> {
-        let mut items = Vec::new();
-        if let Some(active) = self.dashboard.queue.active.as_ref() {
-            items.push(active);
-        }
-        items.extend(self.dashboard.queue.queued.iter());
-        items.extend(self.dashboard.queue.completed.iter().take(4));
-        items
-    }
-
-    fn move_down(&mut self) {
-        match self.focus {
-            Focus::Queue => {
-                let len = self.queue_items().len();
-                if len > 0 {
-                    self.queue_index = (self.queue_index + 1).min(len - 1);
-                }
-            }
-            Focus::Angles => {
-                let len = self.dashboard.active_run.angles.len();
-                if len > 0 {
-                    self.angle_index = (self.angle_index + 1).min(len - 1);
-                }
-            }
-            Focus::Input => {}
-        }
-    }
-
-    fn move_up(&mut self) {
-        match self.focus {
-            Focus::Queue => self.queue_index = self.queue_index.saturating_sub(1),
-            Focus::Angles => self.angle_index = self.angle_index.saturating_sub(1),
-            Focus::Input => {}
-        }
-    }
-
-    fn toggle_input_mode(&mut self) {
-        self.input_mode = match self.input_mode {
-            InputMode::DirectQuery => InputMode::BatchJson,
-            InputMode::BatchJson => InputMode::DirectQuery,
-        };
+        self.focus = Focus::Input;
     }
 
     fn active_input_text(&self) -> &str {
-        match self.input_mode {
-            InputMode::DirectQuery => &self.direct_query_draft,
-            InputMode::BatchJson => &self.batch_json_draft,
-        }
+        &self.direct_query_draft
     }
 
     fn handle_char(&mut self, ch: char) {
         if self.focus != Focus::Input {
             return;
         }
-        match self.input_mode {
-            InputMode::DirectQuery => self.direct_query_draft.push(ch),
-            InputMode::BatchJson => self.batch_json_draft.push(ch),
-        }
+        self.direct_query_draft.push(ch);
     }
 
     fn backspace(&mut self) {
         if self.focus != Focus::Input {
             return;
         }
-        match self.input_mode {
-            InputMode::DirectQuery => {
-                self.direct_query_draft.pop();
-            }
-            InputMode::BatchJson => {
-                self.batch_json_draft.pop();
-            }
-        }
+        self.direct_query_draft.pop();
     }
 
-    fn preview_submission(&self) -> String {
-        match self.input_mode {
-            InputMode::DirectQuery => {
-                let prompt = self.direct_query_draft.trim();
-                if prompt.is_empty() {
-                    "Direct query command preview will appear here.".to_string()
-                } else {
-                    serde_json::to_string_pretty(&json!({
-                        "type": "run_query",
-                        "payload": { "prompt": prompt }
-                    }))
-                    .unwrap_or_else(|_| "Failed to render preview.".to_string())
-                }
-            }
-            InputMode::BatchJson => {
-                let trimmed = self.batch_json_draft.trim();
-                if trimmed.is_empty() {
-                    "Sequential batch command preview will appear here.".to_string()
-                } else {
-                    match serde_json::from_str::<JsonValue>(trimmed) {
-                        Ok(value) => serde_json::to_string_pretty(&json!({
-                            "type": "run_batch",
-                            "payload": {
-                                "mode": "sequential",
-                                "items": value
-                            }
-                        }))
-                        .unwrap_or_else(|_| "Failed to format preview.".to_string()),
-                        Err(err) => format!("Invalid JSON draft: {err}"),
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn main() -> Result<()> {
     let data_source = parse_data_source_from_args()?;
-    let (dashboard, direct_query_draft, batch_json_draft) = data_source.load()?;
+    let (dashboard, direct_query_draft, batch_json_draft) = data_source.load(None)?;
     let direct_query_draft = direct_query_draft.unwrap_or_default();
-    let batch_json_draft = batch_json_draft.unwrap_or_else(default_batch_template);
+    let _ = batch_json_draft;
 
-    enable_raw_mode().context("failed to enable raw mode")?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
     let terminal = ratatui::init();
+    // Capture mouse events so scroll wheel is absorbed by the app and does not
+    // leak through to the host terminal's scrollback buffer.
+    execute!(std::io::stdout(), EnableMouseCapture).ok();
 
     let result = run_app(
         terminal,
-        App::new(data_source, dashboard, direct_query_draft, batch_json_draft),
+        App::new(data_source, dashboard, direct_query_draft, String::new()),
     );
 
+    execute!(std::io::stdout(), DisableMouseCapture).ok();
     ratatui::restore();
-    disable_raw_mode().ok();
-    execute!(std::io::stdout(), LeaveAlternateScreen).ok();
 
     result
 }
@@ -592,11 +492,6 @@ fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
                 continue;
             }
 
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-                app.submit_current();
-                continue;
-            }
-
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Char('r') => {
@@ -605,14 +500,11 @@ fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
                 }
                 KeyCode::Tab => app.next_focus(),
                 KeyCode::BackTab => app.prev_focus(),
-                KeyCode::Down | KeyCode::Char('j') => app.move_down(),
-                KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                KeyCode::Char('m') => app.toggle_input_mode(),
                 KeyCode::Char('?') => app.show_help = !app.show_help,
                 KeyCode::Backspace => app.backspace(),
                 KeyCode::Enter => {
                     if app.focus == Focus::Input {
-                        app.handle_char('\n');
+                        app.submit_current();
                     }
                 }
                 KeyCode::Char(ch) => app.handle_char(ch),
@@ -622,7 +514,11 @@ fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
     }
 }
 
-fn load_live_dashboard(con: &mut redis::Connection, namespace: &str) -> Result<DashboardData> {
+fn load_live_dashboard(
+    con: &mut redis::Connection,
+    namespace: &str,
+    preferred_run_id: Option<&str>,
+) -> Result<DashboardData> {
     let queue_key = format!("{namespace}:queue");
     let queue_wire = get_json::<QueueSnapshotWire>(con, &queue_key)?.unwrap_or_default();
 
@@ -645,7 +541,7 @@ fn load_live_dashboard(con: &mut redis::Connection, namespace: &str) -> Result<D
         .filter_map(|job_id| get_job_entry(con, namespace, job_id).transpose())
         .collect::<Result<Vec<_>>>()?;
 
-    let active_run = load_active_run_view(con, namespace, active_job.as_ref())?;
+    let active_run = load_active_run_view(con, namespace, active_job.as_ref(), preferred_run_id)?;
     let recent_events = load_recent_events(con, namespace, 12)?;
 
     Ok(DashboardData {
@@ -696,6 +592,7 @@ fn load_active_run_view(
     con: &mut redis::Connection,
     namespace: &str,
     active_job: Option<&JobEntry>,
+    preferred_run_id: Option<&str>,
 ) -> Result<RunView> {
     let run_wire = if let Some(active_job) = active_job {
         let job_key = format!("{namespace}:jobs:{}", active_job.job_id);
@@ -705,6 +602,11 @@ fn load_active_run_view(
         } else {
             latest_run_snapshot(con, namespace)?
         }
+    } else if let Some(run_id) = preferred_run_id {
+        // No active job, but we remember the last run — fetch it directly
+        // to avoid latest_run_snapshot picking a different run from the scan.
+        get_json::<RunSnapshotWire>(con, &format!("{namespace}:runs:{run_id}"))?
+            .or(latest_run_snapshot(con, namespace)?)
     } else {
         latest_run_snapshot(con, namespace)?
     };
@@ -822,9 +724,10 @@ fn derive_stage_progress(
 ) -> Result<Vec<StageProgress>> {
     let events = load_recent_runtime_event_payloads(con, namespace, 40)?;
     let mut stage_status = BTreeMap::new();
+    // XREVRANGE returns newest-first; use or_insert so the newest event wins.
     for event in events {
         if let Some(stage) = event.stage {
-            stage_status.insert(stage, event.status);
+            stage_status.entry(stage).or_insert(event.status);
         }
     }
 
@@ -839,20 +742,43 @@ fn derive_stage_progress(
         .position(|stage| *stage == current_stage)
         .unwrap_or(usize::MAX);
 
+    // When the overall run is done the orchestrator sets run.stage to something
+    // outside STAGE_ORDER (e.g. "completed", null). current_index becomes
+    // usize::MAX which would otherwise prevent the index-based "completed"
+    // fallback from firing, resetting every stage to pending.
+    let run_is_terminal = matches!(
+        run.status.as_str(),
+        "completed" | "done" | "success" | "finished"
+    );
+
     Ok(STAGE_ORDER
         .iter()
         .enumerate()
         .map(|(index, stage)| {
-            let status = if let Some(value) = stage_status.get(*stage) {
-                value.clone()
-            } else if *stage == current_stage {
-                current_stage_status.clone()
-            } else if index < current_index {
+            let status = if run_is_terminal {
+                // Run finished: mark everything completed, only trust explicit
+                // "failed" events to flag individual stage failures.
+                match stage_status.get(*stage).map(String::as_str) {
+                    Some("failed") => "failed".to_string(),
+                    _ => "completed".to_string(),
+                }
+            } else if current_index != usize::MAX && index < current_index {
+                // Past stages are definitively completed once the orchestrator
+                // has moved on, regardless of any stale "running" events.
                 "completed".to_string()
-            } else if index > current_index {
-                "pending".to_string()
+            } else if *stage == current_stage {
+                // Normalize: anything that isn't an explicit terminal state is
+                // "running" so ▶ lights up regardless of the exact string written.
+                match current_stage_status.as_str() {
+                    "completed" | "failed" => current_stage_status.clone(),
+                    _ => "running".to_string(),
+                }
             } else {
-                "running".to_string()
+                // Future stages are always pending during an active run.
+                // The event map is NOT consulted here: the stream is shared
+                // across runs, so it contains "completed" events from the
+                // previous run which would falsely mark these stages as done.
+                "pending".to_string()
             };
             StageProgress {
                 label: (*stage).to_string(),
@@ -969,10 +895,6 @@ fn truncate(text: &str, max_chars: usize) -> String {
     trimmed.chars().take(max_chars).collect::<String>() + "..."
 }
 
-fn default_batch_template() -> String {
-    "[\n  {\n    \"id\": \"b1\",\n    \"prompt\": \"First prompt\"\n  },\n  {\n    \"id\": \"b2\",\n    \"prompt\": \"Second prompt\"\n  }\n]\n".to_string()
-}
-
 fn unix_millis() -> Result<u128> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -988,27 +910,23 @@ fn render(frame: &mut Frame, app: &App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
-            Constraint::Min(20),
-            Constraint::Length(10),
+            Constraint::Length(1), // header bar
+            Constraint::Min(14),   // main: pipeline + KG/Angles | Events
+            Constraint::Length(5), // query input
+            Constraint::Length(1), // footer
         ])
         .split(frame.area());
 
-    render_header(frame, root[0], app);
-
-    let middle = Layout::default()
+    let main = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(28),
-            Constraint::Percentage(42),
-            Constraint::Percentage(30),
-        ])
+        .constraints([Constraint::Percentage(69), Constraint::Percentage(31)])
         .split(root[1]);
 
-    render_queue(frame, middle[0], app);
-    render_run_center(frame, middle[1], app);
-    render_input(frame, middle[2], app);
-    render_events(frame, root[2], app);
+    render_header(frame, root[0], app);
+    render_run_center(frame, main[0], app);
+    render_events(frame, main[1], app);
+    render_input(frame, root[2], app);
+    render_footer(frame, root[3], app);
 
     if app.show_help {
         render_help(frame);
@@ -1016,122 +934,318 @@ fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Length(2)])
-        .split(area);
+    let run = &app.dashboard.active_run;
+    let stage_color = match run.stage.as_str() {
+        "idle" | "none" => Color::DarkGray,
+        _ => Color::Cyan,
+    };
+    let refresh_label = app
+        .last_refresh
+        .map(|t| {
+            let s = t.elapsed().as_secs();
+            if s < 2 {
+                "just now".to_string()
+            } else {
+                format!("{s}s ago")
+            }
+        })
+        .unwrap_or_else(|| "never".to_string());
 
-    let top = vec![
+    let spans = vec![
         Span::styled(
-            "Ming Runtime TUI",
+            " MING ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Black)
+                .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
+        Span::styled("run:", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!(
-                "source={} run={} stage={} elapsed={}s",
-                app.data_source.source_label(),
-                app.dashboard.active_run.run_id,
-                app.dashboard.active_run.stage,
-                app.dashboard.active_run.elapsed_seconds
-            ),
-            Style::default().fg(Color::Gray),
+            format!(" {} ", run.run_id),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("  stage:", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {} ", run.stage),
+            Style::default().fg(stage_color),
+        ),
+        Span::styled("  elapsed:", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {}s", run.elapsed_seconds),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("  refreshed:", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {} ", refresh_label),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format!("  [{}]", app.data_source.source_label()),
+            Style::default().fg(Color::DarkGray),
         ),
     ];
-    frame.render_widget(
-        Paragraph::new(Line::from(top)).block(
-            Block::default()
-                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                .title("Status"),
-        ),
-        chunks[0],
-    );
-    frame.render_widget(
-        Paragraph::new(app.last_status.clone())
-            .block(Block::default().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM))
-            .wrap(Wrap { trim: true }),
-        chunks[1],
-    );
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_queue(frame: &mut Frame, area: Rect, app: &App) {
-    let items = app
-        .queue_items()
-        .into_iter()
-        .enumerate()
-        .map(|(index, job)| {
-            let prefix = if index == app.queue_index && app.focus == Focus::Queue {
-                "▸ "
-            } else {
-                "  "
-            };
-            let style = match job.status.as_str() {
-                "running" => Style::default().fg(Color::Yellow),
-                "completed" => Style::default().fg(Color::Green),
-                "failed" => Style::default().fg(Color::Red),
-                _ => Style::default().fg(Color::White),
-            };
-            ListItem::new(Line::from(vec![
-                Span::raw(prefix),
-                Span::styled(format!("[{}] ", job.kind), Style::default().fg(Color::Cyan)),
-                Span::styled(job.prompt_label.clone(), style),
-                Span::styled(
-                    format!("  {} / {}", job.job_id, job.command_id),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]))
-        })
-        .collect::<Vec<_>>();
-
-    let list = List::new(items).block(titled_block("Queue", app.focus == Focus::Queue));
-    frame.render_widget(list, area);
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let spans = vec![
+        Span::styled(&app.last_status, Style::default().fg(Color::White)),
+        Span::styled(
+            "    q: quit   r: refresh   ?: help",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_run_center(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
-            Constraint::Length(11),
-            Constraint::Length(7),
-            Constraint::Min(8),
+            Constraint::Length(4), // stage pipeline (2 text lines + 2 borders)
+            Constraint::Length(3), // progress gauge
+            Constraint::Min(8),    // KG pipeline + angles
         ])
         .split(area);
 
-    let gauge = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title("Run Progress"))
-        .gauge_style(Style::default().fg(Color::Cyan))
-        .ratio(app.dashboard.active_run.progress_ratio)
-        .label(format!(
-            "{} | {}",
-            app.dashboard.active_run.status, app.dashboard.active_run.prompt
-        ));
-    frame.render_widget(gauge, chunks[0]);
+    render_stage_pipeline(frame, chunks[0], app);
+    render_progress_gauge(frame, chunks[1], app);
 
-    let stage_rows = app
-        .dashboard
-        .active_run
-        .stage_progress
-        .iter()
-        .map(|stage| {
-            let status_style = match stage.status.as_str() {
-                "completed" => Style::default().fg(Color::Green),
-                "running" => Style::default().fg(Color::Yellow),
-                "failed" => Style::default().fg(Color::Red),
-                _ => Style::default().fg(Color::Gray),
+    let lower = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .split(chunks[2]);
+
+    render_kg_pipeline(frame, lower[0], app);
+    render_angle_statuses(frame, lower[1], app);
+}
+
+fn render_stage_pipeline(frame: &mut Frame, area: Rect, app: &App) {
+    let stage_defs: &[(&str, &str)] = &[
+        ("scout", "scout"),
+        ("planning", "plan"),
+        ("research_parallel", "rsrch"),
+        ("kg_collect", "coll"),
+        ("kg_filter", "filt"),
+        ("kg_re", "re"),
+        ("entity_resolution", "resol"),
+        ("outline", "outln"),
+        ("write", "write"),
+    ];
+
+    let stages = &app.dashboard.active_run.stage_progress;
+    let mut label_spans: Vec<Span> = vec![];
+    let mut icon_spans: Vec<Span> = vec![];
+
+    for (i, (key, short)) in stage_defs.iter().enumerate() {
+        let status = stages
+            .iter()
+            .find(|s| &s.label == key)
+            .map(|s| s.status.as_str())
+            .unwrap_or("pending");
+
+        let (icon, color, bold) = match status {
+            "completed" => ("✓", Color::Green, false),
+            "running" => ("▶", Color::Yellow, true),
+            "failed" => ("✗", Color::Red, false),
+            _ => ("·", Color::DarkGray, false),
+        };
+
+        let w = 7usize;
+        let label_style = Style::default().fg(color);
+        let icon_style = if bold {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
+
+        label_spans.push(Span::styled(
+            format!("{:^width$}", short, width = w),
+            label_style,
+        ));
+        icon_spans.push(Span::styled(
+            format!("{:^width$}", icon, width = w),
+            icon_style,
+        ));
+
+        if i + 1 < stage_defs.len() {
+            let arrow_color = if status == "completed" {
+                Color::Green
+            } else {
+                Color::DarkGray
             };
-            Row::new(vec![
-                stage.label.clone(),
-                stage.status.clone(),
-                format!("{}s", stage.duration_seconds),
-            ])
-            .style(status_style)
+            label_spans.push(Span::styled("─", Style::default().fg(Color::DarkGray)));
+            icon_spans.push(Span::styled("─", Style::default().fg(arrow_color)));
+        }
+    }
+
+    let text = vec![Line::from(label_spans), Line::from(icon_spans)];
+    frame.render_widget(
+        Paragraph::new(text).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    " Pipeline ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        ),
+        area,
+    );
+}
+
+fn render_progress_gauge(frame: &mut Frame, area: Rect, app: &App) {
+    let run = &app.dashboard.active_run;
+    let ratio = run.progress_ratio.clamp(0.0, 1.0);
+    let pct = (ratio * 100.0).round() as u16;
+    let label = format!("{pct}%  ·  elapsed {}s", run.elapsed_seconds);
+
+    let color = if ratio >= 1.0 {
+        Color::Green
+    } else if ratio > 0.0 {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+
+    frame.render_widget(
+        Gauge::default()
+            .block(Block::default().borders(Borders::ALL))
+            .gauge_style(Style::default().fg(color).bg(Color::DarkGray))
+            .ratio(ratio)
+            .label(label),
+        area,
+    );
+}
+
+fn render_input(frame: &mut Frame, area: Rect, app: &App) {
+    let text_with_cursor = format!("{}▌", app.active_input_text());
+    frame.render_widget(
+        Paragraph::new(text_with_cursor)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(
+                        " Query ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .title_bottom(Line::from(vec![
+                        Span::styled(
+                            " Enter ",
+                            Style::default().fg(Color::Black).bg(Color::Yellow),
+                        ),
+                        Span::styled(" to submit  ", Style::default().fg(Color::DarkGray)),
+                    ])),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_kg_pipeline(frame: &mut Frame, area: Rect, app: &App) {
+    let stages = [
+        ("kg_collect", "Collect"),
+        ("kg_filter", "Filter"),
+        ("kg_re", "NER / RE"),
+        ("entity_resolution", "Resolve"),
+    ];
+
+    let lines = stages
+        .iter()
+        .flat_map(|(key, label)| {
+            let processed =
+                metric_value(app, &format!("{key}_processed")).unwrap_or_else(|| "-".to_string());
+            let total =
+                metric_value(app, &format!("{key}_total")).unwrap_or_else(|| "-".to_string());
+            let elapsed = metric_value(app, &format!("{key}_elapsed_seconds"))
+                .unwrap_or_else(|| "-".to_string());
+            let status = app
+                .dashboard
+                .active_run
+                .stage_progress
+                .iter()
+                .find(|s| &s.label == key)
+                .map(|s| s.status.as_str())
+                .unwrap_or("pending");
+
+            let (icon, color) = match status {
+                "completed" => ("✓", Color::Green),
+                "running" => ("▶", Color::Yellow),
+                "failed" => ("✗", Color::Red),
+                _ => ("·", Color::DarkGray),
+            };
+
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        icon,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{:<12}", label),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{}/{}", processed, total),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        format!("  {}s", elapsed),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                Line::from(""),
+            ]
         })
         .collect::<Vec<_>>();
-    let stage_table = Table::new(
-        stage_rows,
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(
+                        " KG Pipeline ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_angle_statuses(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = app
+        .dashboard
+        .active_run
+        .angles
+        .iter()
+        .map(|angle| {
+            let (icon, color) = match angle.status.as_str() {
+                "completed" => ("✓", Color::Green),
+                "running" => ("▶", Color::Yellow),
+                "failed" => ("✗", Color::Red),
+                _ => ("·", Color::DarkGray),
+            };
+            Row::new(vec![
+                format!("{} {}", icon, angle.topic),
+                angle.stage.clone(),
+                format!("{}q {}s", angle.queries_total, angle.context_ids_total),
+            ])
+            .style(Style::default().fg(color))
+        })
+        .collect::<Vec<_>>();
+
+    let table = Table::new(
+        rows,
         [
             Constraint::Percentage(50),
             Constraint::Percentage(25),
@@ -1139,142 +1253,25 @@ fn render_run_center(frame: &mut Frame, area: Rect, app: &App) {
         ],
     )
     .header(
-        Row::new(vec!["Stage", "Status", "Duration"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Stage Timeline"),
-    );
-    frame.render_widget(stage_table, chunks[1]);
-
-    let metric_lines = app
-        .dashboard
-        .active_run
-        .metrics
-        .iter()
-        .map(|metric| {
-            Line::from(vec![
-                Span::styled(
-                    format!("{:<18}", metric.label),
-                    Style::default().fg(Color::Gray),
-                ),
-                Span::styled(metric.value.clone(), Style::default().fg(Color::Cyan)),
-            ])
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(metric_lines)
-            .block(Block::default().borders(Borders::ALL).title("Run Metrics"))
-            .wrap(Wrap { trim: true }),
-        chunks[2],
-    );
-
-    let lower = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(chunks[3]);
-
-    let angle_items = app
-        .dashboard
-        .active_run
-        .angles
-        .iter()
-        .enumerate()
-        .map(|(index, angle)| {
-            let prefix = if index == app.angle_index && app.focus == Focus::Angles {
-                "▸ "
-            } else {
-                "  "
-            };
-            ListItem::new(Line::from(vec![
-                Span::raw(prefix),
-                Span::styled(angle.angle_id.clone(), Style::default().fg(Color::Cyan)),
-                Span::raw(" "),
-                Span::raw(angle.topic.clone()),
-            ]))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        List::new(angle_items).block(titled_block("Angles", app.focus == Focus::Angles)),
-        lower[0],
-    );
-
-    let angle_detail = if let Some(angle) = app.selected_angle() {
-        vec![
-            Line::from(vec![Span::styled(
-                angle.topic.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(format!("status: {}", angle.status)),
-            Line::from(format!("stage: {}", angle.stage)),
-            Line::from(format!("iteration: {}", angle.iteration)),
-            Line::from(format!("queries: {}", angle.queries_total)),
-            Line::from(format!("contexts: {}", angle.context_ids_total)),
-        ]
-    } else {
-        vec![Line::from("No angle selected.")]
-    };
-    frame.render_widget(
-        Paragraph::new(angle_detail)
-            .block(Block::default().borders(Borders::ALL).title("Angle Detail"))
-            .wrap(Wrap { trim: true }),
-        lower[1],
-    );
-}
-
-fn render_input(frame: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(10),
-        ])
-        .split(area);
-
-    let titles = ["Direct Query", "Sequential Batch"]
-        .iter()
-        .map(|title| Line::from(*title))
-        .collect::<Vec<_>>();
-    let selected = match app.input_mode {
-        InputMode::DirectQuery => 0,
-        InputMode::BatchJson => 1,
-    };
-    frame.render_widget(
-        Tabs::new(titles)
-            .select(selected)
-            .block(titled_block("Command", app.focus == Focus::Input))
-            .highlight_style(
+        Row::new(vec!["Angle", "Stage", "Q/Src"])
+            .style(
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-        chunks[0],
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                " Angles ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
     );
 
-    frame.render_widget(
-        Paragraph::new(app.active_input_text())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(app.input_mode.title()),
-            )
-            .wrap(Wrap { trim: false }),
-        chunks[1],
-    );
-
-    frame.render_widget(
-        Paragraph::new(app.preview_submission())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Submission Preview (Ctrl-S to send)"),
-            )
-            .wrap(Wrap { trim: false }),
-        chunks[2],
-    );
+    frame.render_widget(table, area);
 }
 
 fn render_events(frame: &mut Frame, area: Rect, app: &App) {
@@ -1283,37 +1280,56 @@ fn render_events(frame: &mut Frame, area: Rect, app: &App) {
         .recent_events
         .iter()
         .map(|entry| {
-            let color = match entry.level.as_str() {
-                "warning" => Color::Yellow,
-                "error" => Color::Red,
-                _ => Color::Gray,
+            let (level_icon, color) = match entry.level.as_str() {
+                "error" => ("✗", Color::Red),
+                "warning" => ("!", Color::Yellow),
+                _ => ("·", Color::DarkGray),
+            };
+            // Show only time portion (last 8 chars) if the timestamp is long
+            let ts_short = if entry.ts.len() > 8 {
+                &entry.ts[entry.ts.len() - 8..]
+            } else {
+                &entry.ts
             };
             Line::from(vec![
                 Span::styled(
-                    format!("{} ", entry.ts),
+                    level_icon,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{} ", ts_short),
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(
-                    format!("[{}] ", entry.component),
+                    format!("[{}]", entry.component),
                     Style::default().fg(Color::Cyan),
                 ),
+                Span::raw(" "),
                 Span::styled(entry.message.clone(), Style::default().fg(color)),
-                Span::raw(
+                Span::styled(
                     entry
                         .stage
                         .as_ref()
-                        .map(|stage| format!(" ({stage})"))
+                        .map(|s| format!(" ({s})"))
                         .unwrap_or_default(),
+                    Style::default().fg(Color::DarkGray),
                 ),
             ])
         })
         .collect::<Vec<_>>();
+
     frame.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Recent Events"),
+                    .title(Span::styled(
+                        " Events ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
             )
             .wrap(Wrap { trim: true }),
         area,
@@ -1321,33 +1337,93 @@ fn render_events(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame) {
-    let area = centered_rect(60, 48, frame.area());
+    let area = centered_rect(46, 52, frame.area());
     frame.render_widget(Clear, area);
-    let help = Paragraph::new(vec![
-        Line::from("q: quit"),
-        Line::from("r: refresh now"),
-        Line::from("tab / shift-tab: move focus"),
-        Line::from("j / k or arrows: move selection"),
-        Line::from("m: switch command mode"),
-        Line::from("Ctrl-S: submit current draft to Redis"),
-        Line::from("?: toggle help"),
-        Line::from("type when Input is focused"),
-    ])
-    .block(Block::default().borders(Borders::ALL).title("Help"))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(help, area);
+
+    let help_text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  q          ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("quit", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  r          ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("refresh now", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  ?          ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("toggle this help", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Enter      ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("submit query", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Backspace  ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("delete last character", Style::default().fg(Color::White)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Type directly to compose a query.",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(vec![Span::styled(
+            "  Auto-refreshes every 1.2s.",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(help_text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(Span::styled(
+                        " Help ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
-fn titled_block<'a>(title: &'a str, focused: bool) -> Block<'a> {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(border_style)
+fn metric_value(app: &App, key: &str) -> Option<String> {
+    app.dashboard
+        .active_run
+        .metrics
+        .iter()
+        .find(|metric| metric.label == key)
+        .map(|metric| metric.value.clone())
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
