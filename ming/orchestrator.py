@@ -45,8 +45,9 @@ class MingDeepResearchConfig:
 class MingDeepResearch:
     _CHARS_PER_TOKEN_ESTIMATE = 4
 
-    def __init__(self, config: MingDeepResearchConfig):
+    def __init__(self, config: MingDeepResearchConfig, runtime_observer: Any | None = None):
         self.config = config
+        self.runtime_observer = runtime_observer
         redis_cfg = {
             "redis": {
                 "hostname": config.redis_config.hostname,
@@ -133,6 +134,57 @@ class MingDeepResearch:
                 kg_query_tool=self.kg_query_tool,
                 draft_output_path=config.draft_output_path,
             )
+        )
+
+    def _stage_started(
+        self,
+        stage: str,
+        message: str,
+        *,
+        metrics: dict[str, Any] | None = None,
+        active_angle_count: int | None = None,
+        completed_angle_count: int | None = None,
+    ) -> None:
+        if self.runtime_observer is None:
+            return
+        self.runtime_observer.stage_transition(
+            component="orchestrator",
+            stage=stage,
+            status="started",
+            message=message,
+            metrics=metrics,
+            active_angle_count=active_angle_count,
+            completed_angle_count=completed_angle_count,
+        )
+
+    def _stage_completed(
+        self,
+        stage: str,
+        message: str,
+        *,
+        metrics: dict[str, Any] | None = None,
+        active_angle_count: int | None = None,
+        completed_angle_count: int | None = None,
+    ) -> None:
+        if self.runtime_observer is None:
+            return
+        self.runtime_observer.stage_transition(
+            component="orchestrator",
+            stage=stage,
+            status="completed",
+            message=message,
+            metrics=metrics,
+            active_angle_count=active_angle_count,
+            completed_angle_count=completed_angle_count,
+        )
+
+    def _register_angle(self, angle_id: str, topic: str, success_criteria: str) -> None:
+        if self.runtime_observer is None:
+            return
+        self.runtime_observer.register_angle(
+            angle_id=angle_id,
+            topic=topic,
+            success_criteria=success_criteria,
         )
 
     @staticmethod
@@ -302,13 +354,24 @@ class MingDeepResearch:
     def run(self, query: str) -> str:
         # 1. Scout the web for information
         import time
+        self._stage_started("scout", "Scout stage started.")
         logger.info(f"Scouting landscape for: {query}")
         start_time = time.time()
-        scout_result = self.scout.run(query)
+        scout_result = self.scout.run(query, observer=self.runtime_observer)
         end_time = time.time()
         logger.info(f"Scouting landscape for: {query} took {round(end_time - start_time, 2)} seconds")
+        self._stage_completed(
+            "scout",
+            "Scout stage completed.",
+            metrics={
+                "elapsed_seconds": round(end_time - start_time, 3),
+                "query_count": len(scout_result.get("queries", [])),
+                "search_result_count": len(scout_result.get("search_results", [])),
+            },
+        )
         
         # 2. Plan the research
+        self._stage_started("planning", "Planning stage started.")
         logger.info("Planning research angles...")
         start_time = time.time()
         planning_result = self._generate_with_system_prompt(
@@ -319,8 +382,26 @@ class MingDeepResearch:
         research_plan = self._parse_planning_result(planning_result)
         end_time = time.time()
         logger.info(f"Planning research angles took {round(end_time - start_time, 2)} seconds")
+        self._stage_completed(
+            "planning",
+            "Planning stage completed.",
+            metrics={
+                "elapsed_seconds": round(end_time - start_time, 3),
+                "research_angle_count": len(research_plan.get("research_angles", [])),
+            },
+        )
         
         # 3. Parallel Execution of Research Subagents
+        for index, angle in enumerate(research_plan["research_angles"], start=1):
+            angle["_angle_id"] = f"angle_{index}"
+            self._register_angle(angle["_angle_id"], angle["topic"], angle["success_criteria"])
+        self._stage_started(
+            "research_parallel",
+            "Parallel research stage started.",
+            active_angle_count=len(research_plan["research_angles"]),
+            completed_angle_count=0,
+            metrics={"research_angle_count": len(research_plan["research_angles"])},
+        )
         logger.info(f"Executing {len(research_plan['research_angles'])} research angles in parallel...")
         start_time = time.time()
         results = []
@@ -328,10 +409,23 @@ class MingDeepResearch:
         for subagent in self.research_subagents:
             subagent_pool.put(subagent)
 
-        def _run_research_angle(topic_prompt: str, scout_brief: str) -> Dict[str, Any]:
+        def _run_research_angle(
+            topic_prompt: str,
+            scout_brief: str,
+            angle_id: str,
+            angle_topic: str,
+            success_criteria: str,
+        ) -> Dict[str, Any]:
             subagent = subagent_pool.get()
             try:
-                return subagent.run(topic_prompt, scout_brief)
+                return subagent.run(
+                    topic_prompt,
+                    scout_brief,
+                    observer=self.runtime_observer,
+                    angle_id=angle_id,
+                    angle_topic=angle_topic,
+                    success_criteria=success_criteria,
+                )
             finally:
                 subagent_pool.put(subagent)
         
@@ -348,6 +442,9 @@ class MingDeepResearch:
                     _run_research_angle,
                     topic_prompt,
                     scout_result["landscape_brief"],
+                    angle["_angle_id"],
+                    angle["topic"],
+                    angle["success_criteria"],
                 )
                 future_to_angle[future] = angle
             
@@ -359,10 +456,41 @@ class MingDeepResearch:
                     res["_success_criteria"] = angle["success_criteria"]
                     results.append(res)
                     logger.info(f"Completed research for angle: {angle['topic']}")
+                    if self.runtime_observer is not None:
+                        self.runtime_observer.update_angle(
+                            angle["_angle_id"],
+                            status="completed",
+                            stage="decide",
+                            iteration=int(res.get("iteration", 0)),
+                            queries_total=len(res.get("all_queries", []) or []),
+                            context_ids_total=len(res.get("context_ids", []) or []),
+                            statistics=res.get("statistics", {}) or {},
+                            emit_event=True,
+                            message=f"Completed research for angle: {angle['topic']}",
+                        )
                 except Exception as e:
                     logger.error(f"Subagent failed for angle '{angle['topic']}': {e}")
+                    if self.runtime_observer is not None:
+                        self.runtime_observer.update_angle(
+                            angle["_angle_id"],
+                            status="failed",
+                            stage="research_parallel",
+                            error=f"{type(e).__name__}: {e}",
+                            emit_event=True,
+                            message=f"Research angle failed: {angle['topic']}",
+                        )
         end_time = time.time()
         logger.info(f"Executing research angles took {round(end_time - start_time, 2)} seconds")
+        self._stage_completed(
+            "research_parallel",
+            "Parallel research stage completed.",
+            active_angle_count=0,
+            completed_angle_count=len(results),
+            metrics={
+                "elapsed_seconds": round(end_time - start_time, 3),
+                "completed_angle_count": len(results),
+            },
+        )
         
         total_sources = 0
         for res in results:
@@ -370,6 +498,7 @@ class MingDeepResearch:
         logger.info(f"Total number of sources to process: {total_sources}")
         logger.info("Starting batch NER/RE extraction into Knowledge Graph...")
         start_time = time.time()
+        self._stage_started("kg_collect", "KG source collection started.")
         all_context_ids: List[str] = []
         seen_context_ids = set()
         all_kg_entities = []
@@ -387,6 +516,16 @@ class MingDeepResearch:
                 source_inputs.append((entry["raw_content"], entry.get("url", ""), cid))
 
         collected_sources = self.nerre_pipeline.collect_sources(source_inputs)
+        self._stage_completed(
+            "kg_collect",
+            "KG source collection completed.",
+            metrics={
+                "elapsed_seconds": round(time.time() - start_time, 3),
+                "source_input_count": len(source_inputs),
+                "collected_source_count": len(collected_sources),
+            },
+        )
+        self._stage_started("kg_filter", "KG source filtering started.")
         retained_sources = self.nerre_pipeline.filter_sources(
             collected_sources,
             min_tokens=self.config.source_min_tokens,
@@ -398,6 +537,15 @@ class MingDeepResearch:
             len(retained_sources),
             len(collected_sources),
         )
+        self._stage_completed(
+            "kg_filter",
+            "KG source filtering completed.",
+            metrics={
+                "retained_source_count": len(retained_sources),
+                "collected_source_count": len(collected_sources),
+            },
+        )
+        self._stage_started("kg_re", "KG relationship extraction started.")
         optimized_chunks = self.nerre_pipeline.select_chunks_for_re(
             retained_sources,
             max_chunks_per_source=self.config.max_chunks_per_source,
@@ -414,15 +562,35 @@ class MingDeepResearch:
             logger.warning(f"Batch NER/RE failed: {e}")
         end_time = time.time()
         logger.info(f"NER/RE extraction took {round(end_time - start_time, 2)} seconds")
+        self._stage_completed(
+            "kg_re",
+            "KG relationship extraction completed.",
+            metrics={
+                "elapsed_seconds": round(end_time - start_time, 3),
+                "selected_chunk_count": len(optimized_chunks),
+                "kg_entity_count": len(all_kg_entities),
+            },
+        )
 
         logger.info("Starting batch entity resolution...")
         start_time = time.time()
+        self._stage_started("entity_resolution", "Entity resolution started.")
         self.kg_store.perform_entity_resolution(all_kg_entities)
         end_time = time.time()
         logger.info(f"Entity resolution took {round(end_time - start_time, 2)} seconds")
         logger.info(f"Number of relationships active in the knowledge graph: {len(self.kg_store.get_relationships())}")
         logger.info(f"Number of chunks active in the knowledge graph: {len(self.kg_store.get_chunks())}")
         logger.info(f"Number of canonical entities active in the knowledge graph: {len(self.kg_store.get_canonical_entities())}")
+        self._stage_completed(
+            "entity_resolution",
+            "Entity resolution completed.",
+            metrics={
+                "elapsed_seconds": round(end_time - start_time, 3),
+                "relationship_count": len(self.kg_store.get_relationships()),
+                "chunk_count": len(self.kg_store.get_chunks()),
+                "canonical_entity_count": len(self.kg_store.get_canonical_entities()),
+            },
+        )
 
         # final report
         logger.info("Generating final report...")
@@ -432,6 +600,7 @@ class MingDeepResearch:
         )
 
         # 4. Generate Outline
+        self._stage_started("outline", "Outline generation started.")
         logger.info("Generating report outline...")
         start_time = time.time()
 
@@ -458,6 +627,7 @@ class MingDeepResearch:
                     max_iterations,
                     e,
                 )
+                print(outline_result)
 
         if len(sections) == 0:
             logger.error(
@@ -470,7 +640,16 @@ class MingDeepResearch:
             report_title = query
         end_time = time.time()
         logger.info(f"Generating report outline took {round(end_time - start_time, 2)} seconds")
+        self._stage_completed(
+            "outline",
+            "Outline generation completed.",
+            metrics={
+                "elapsed_seconds": round(end_time - start_time, 3),
+                "section_count": len(sections),
+            },
+        )
 
+        self._stage_started("write", "Report writing started.")
         logger.info("Writing iterative markdown report...")
         start_time = time.time()
         report_markdown = self.writer_agent.run(
@@ -481,6 +660,14 @@ class MingDeepResearch:
         )
         end_time = time.time()
         logger.info(f"Writing report took {round(end_time - start_time, 2)} seconds")
+        self._stage_completed(
+            "write",
+            "Report writing completed.",
+            metrics={
+                "elapsed_seconds": round(end_time - start_time, 3),
+                "report_length": len(report_markdown or ""),
+            },
+        )
 
         return report_markdown
 

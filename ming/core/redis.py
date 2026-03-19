@@ -46,6 +46,9 @@ class RedisDatabase:
         """Serialize non-scalar values to Redis-compatible strings."""
         if value is None:
             return ""
+        # redis-py rejects bool values for hash mappings; coerce explicitly.
+        if isinstance(value, bool):
+            return int(value)
         if isinstance(value, (str, bytes, int, float)):
             return value
         if isinstance(value, set):

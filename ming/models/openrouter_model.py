@@ -145,7 +145,8 @@ def _build_chat_openrouter(
 
 class OpenRouterModel(BaseModel):
     def __init__(self, config: Optional[OpenRouterModelConfig] = None):
-        load_dotenv()
+        # Prefer repo-local .env over any pre-exported shell variables.
+        load_dotenv(override=True)
         self.config = config or OpenRouterModelConfig()
         self.prompt = ""
 

@@ -84,6 +84,7 @@ class WriterAgent:
         return Agent(
             AgentConfig(
                 model=model_config,
+                fallback_model=self.config.fallback_model,
                 system_prompt=REPORT_SECTION_WRITER_PROMPT,
                 tools=[self.config.kg_query_tool],
                 max_iterations=self.config.max_iterations,

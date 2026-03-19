@@ -199,6 +199,22 @@ Define specific quality standards (constraints) for the report:
 ## Output Format
 Return your response in the following XML format:
 
+XML output rules:
+- Return exactly one valid XML block wrapped in <report_outline>...</report_outline>.
+- Do not include any text before or after the XML.
+- All text content must be XML-safe.
+- Escape special characters in text nodes:
+  - `&` -> `&amp;`
+  - `<` -> `&lt;`
+  - `>` -> `&gt;` when needed
+  - `"` -> `&quot;` if used inside attributes
+  - `'` -> `&apos;` if used inside attributes
+- Never write raw company names or phrases containing `&` inside text nodes; always escape them.
+  Example: `S&amp;P`, `AT&amp;T`, `R&amp;D`.
+- Keep all free text inside element bodies, not attributes, except the required `id` attributes.
+- Do not invent extra tags, comments, CDATA blocks, or markdown fences.
+- Ensure every opened tag is closed and all nesting is valid XML.
+
 <report_outline>
   <report_title>...</report_title>
   <task_analysis>

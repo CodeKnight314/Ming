@@ -66,14 +66,14 @@ def _compute_think_tokens(num_sources: int, num_criteria: int) -> int:
 
     Formula: 300 base + 40 per source + 120 per criterion, clamped to [768, 2048].
     """
-    computed = 300 + (num_sources * 40) + (num_criteria * 120)
-    return min(2048, max(768, computed))
+    return 8192
 
 
 class ResearchSubagentConfig(TypedDict, total=False):
     max_context_len: int
     min_query_count: int
     max_query_count: int
+    max_total_queries: int
     max_open_urls_per_iteration: int
     max_url_wait_seconds: float
     model: dict[str, Any]
@@ -116,8 +116,6 @@ class ResearchSubagent:
                 if tool.preflight_check():
                     name = tool.get_name()
                     self._tool_map[name] = tool
-                    if name == "think_tool":
-                        tool.model = self.model
             except Exception as e:
                 logger.warning("Skipping tool %s: %s", tool_config, e)
 
@@ -125,6 +123,10 @@ class ResearchSubagent:
         self.source_min_tokens = max(1, int(config.get("source_min_tokens", 400)))
         self.graph = self._build_graph()
         self.statistics = self._empty_statistics()
+        self._runtime_observer: Any | None = None
+        self._angle_id: str | None = None
+        self._angle_topic: str = ""
+        self._angle_success_criteria: str = ""
 
     def _generate_with_fallback(self, prompt: str, **generation_kwargs: Any) -> str:
         """Call the primary model, falling back to a secondary model on failure.
@@ -186,13 +188,83 @@ class ResearchSubagent:
             queries.append(query)
         return queries
 
+    def _current_iteration(self, state: ResearchSubagentState) -> int:
+        return int(state.get("iteration", 0)) + 1
+
+    def _max_total_queries(self) -> int:
+        raw_limit = self.config.get("max_new_queries", 10)
+        return max(1, int(raw_limit))
+
+    def _ensure_angle_registered(self) -> None:
+        if self._runtime_observer is None or not self._angle_id:
+            return
+        try:
+            self._runtime_observer.register_angle(
+                angle_id=self._angle_id,
+                topic=self._angle_topic or self._angle_id,
+                success_criteria=self._angle_success_criteria,
+            )
+        except Exception:
+            return
+
+    def _update_observer(
+        self,
+        state: ResearchSubagentState,
+        *,
+        stage: str,
+        status: str,
+        message: str,
+        metrics: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        if self._runtime_observer is None or not self._angle_id:
+            return
+        self._runtime_observer.update_angle(
+            self._angle_id,
+            status=status,
+            stage=stage,
+            iteration=self._current_iteration(state),
+            queries_total=len(state.get("all_queries") or []),
+            context_ids_total=len(state.get("context_ids") or []),
+            statistics=dict(self.statistics),
+            error=error,
+            emit_event=True,
+            message=message,
+            metrics=metrics,
+        )
+
     def _generate_queries_node(self, state: ResearchSubagentState) -> Dict[str, Any]:
+        self._update_observer(
+            state,
+            stage="generate_queries",
+            status="running",
+            message="Generating research queries.",
+        )
         topic = state["topic"]
         history = state.get("history") or []
         all_queries = state.get("all_queries") or []
         scout_report = (state.get("scout_report") or "").strip()
-        min_q = self.config.get("min_query_count", 3)
-        max_q = self.config.get("max_query_count", 5)
+        remaining_budget = max(0, self._max_total_queries() - len(all_queries))
+        max_q = min(int(self.config.get("max_query_count", 5)), remaining_budget)
+        min_q = min(int(self.config.get("min_query_count", 3)), max_q)
+
+        if remaining_budget <= 0 or max_q <= 0:
+            next_state = {
+                "queries": [],
+                "all_queries": all_queries,
+                "history": history + ["Query budget exhausted; no additional queries generated."],
+            }
+            self._update_observer(
+                {
+                    **state,
+                    **next_state,
+                },
+                stage="generate_queries",
+                status="running",
+                message="Query budget exhausted; no additional queries generated.",
+                metrics={"generated_query_count": 0, "remaining_query_budget": 0},
+            )
+            return next_state
 
         if scout_report:
             scout_section = "Scout brief:\n" + scout_report + "\n\n"
@@ -245,13 +317,29 @@ class ResearchSubagent:
             guidance=guidance,
         )
         response = self._generate_with_fallback(prompt)
-        queries = self._parse_queries_from_response(response)
-
-        return {
+        queries = self._parse_queries_from_response(response)[:remaining_budget]
+        next_state = {
             "queries": queries,
             "all_queries": all_queries + queries,
             "history": history + ["Generated queries: " + ", ".join(queries)],
         }
+        self._update_observer(
+            {
+                **state,
+                **next_state,
+            },
+            stage="generate_queries",
+            status="running",
+            message="Generated research queries.",
+            metrics={
+                "generated_query_count": len(queries),
+                "remaining_query_budget": max(
+                    0, self._max_total_queries() - len(next_state["all_queries"])
+                ),
+            },
+        )
+
+        return next_state
 
     def _search_web(self, query: str) -> Dict[str, Any]:
         tool = self._tool_map.get("web_search_tool")
@@ -265,11 +353,11 @@ class ResearchSubagent:
             raise ValueError("Open URL tool not found.")
         return tool.run(url)
 
-    def _is_valid_context_content(self, content: Optional[str]) -> bool:
+    def _is_cacheable_context_content(self, content: Optional[str]) -> bool:
         if content is None:
             return False
         cleaned = content.strip()
-        if count_language_aware_tokens(cleaned) < self.source_min_tokens:
+        if not cleaned:
             return False
 
         lowered = cleaned.lower()
@@ -279,6 +367,14 @@ class ResearchSubagent:
             "exception occurred while processing url",
         )
         return not any(marker in lowered for marker in failure_markers)
+
+    def _meets_source_length_threshold(self, content: Optional[str]) -> bool:
+        if content is None:
+            return False
+        cleaned = content.strip()
+        if not cleaned:
+            return False
+        return count_language_aware_tokens(cleaned) >= self.source_min_tokens
 
     @staticmethod
     def _score_web_result(result: Dict[str, Any], index: int) -> tuple[int, float, int, int]:
@@ -379,9 +475,8 @@ class ResearchSubagent:
                     self.statistics["tavily_depth_fallbacks"] += 1
                     try:
                         fetched = self._fetch_website_content(url)
-                        if not fetched.get("discard") and self._is_valid_context_content(
-                            fetched.get("content")
-                        ):
+                        fetched_content = fetched.get("content")
+                        if self._is_cacheable_context_content(fetched_content):
                             fetched_tokens = count_language_aware_tokens(
                                 fetched.get("content", "")
                             )
@@ -392,16 +487,20 @@ class ResearchSubagent:
                             "Trafilatura depth fallback failed for %s: %s", url, fetch_exc
                         )
 
-                if not self._is_valid_context_content(raw_text):
-                    self.statistics["discarded_open_results"] += 1
-                    return None
                 entry = {
                     "url": url,
                     "title": web_result.get("title", "Untitled"),
                     "content": raw_text,
                     "raw_content": raw_text,
                     "token_count": count_language_aware_tokens(raw_text),
+                    "below_source_min_tokens": not self._meets_source_length_threshold(raw_text),
+                    "content_missing": not bool(raw_text),
+                    "preserved_from_search": True,
+                    "retrieval_status": web_result.get("status", "success"),
+                    "retrieval_notes": web_result.get("retrieval_notes", ""),
                 }
+                if not self._is_cacheable_context_content(raw_text):
+                    self.statistics["discarded_open_results"] += 1
                 context_id = self.database.create_entry(entry)
                 self.database.set_url_index(url, context_id)
                 self.statistics["successful_open_results"] += 1
@@ -436,6 +535,12 @@ class ResearchSubagent:
         return None
 
     def _retrieve(self, state: ResearchSubagentState) -> Dict[str, Any]:
+        self._update_observer(
+            state,
+            stage="retrieve",
+            status="running",
+            message="Retrieving sources for research angle.",
+        )
         queries = state.get("queries") or []
         if not queries:
             return {"history": state["history"] + ["No queries generated."]}
@@ -480,12 +585,34 @@ class ResearchSubagent:
             + ", ".join(queries)
             + f" (cached {len(new_context_ids)} of {len(web_results)} search results)"
         )
-        return {
+        next_state = {
             "context_ids": context_ids,
             "history": state["history"] + [history_entry],
         }
+        self._update_observer(
+            {
+                **state,
+                **next_state,
+            },
+            stage="retrieve",
+            status="running",
+            message="Retrieved sources for research angle.",
+            metrics={
+                "query_count": len(queries),
+                "search_result_count": len(web_results),
+                "candidate_result_count": len(candidate_results),
+                "new_context_id_count": len(new_context_ids),
+            },
+        )
+        return next_state
     
     def _think(self, state: ResearchSubagentState) -> Dict[str, Any]:
+        self._update_observer(
+            state,
+            stage="think",
+            status="running",
+            message="Synthesizing retrieved context.",
+        )
         context_ids = state.get("context_ids") or []
         all_queries = state.get("all_queries") or []
         topic = state.get("topic", "")
@@ -535,28 +662,58 @@ class ResearchSubagent:
 
         context_str = "\n\n---\n\n".join(context_parts)
 
-        think_tool = self._tool_map.get("think_tool")
-        if think_tool is not None:
-            response = think_tool.run(context_str, max_new_tokens=think_tokens)
-        else:
-            prompt = THINK_PROMPT.format(context=context_str)
-            response = self.model.generate(
-                prompt,
-                **self._generation_kwargs(max_new_tokens=think_tokens),
-            )
+        prompt = THINK_PROMPT.format(context=context_str)
+        response = self._generate_with_fallback(
+            prompt,
+            max_new_tokens=think_tokens,
+        )
 
-        return {"history": state["history"] + [response]}
+        next_state = {"history": state["history"] + [response]}
+        self._update_observer(
+            {
+                **state,
+                **next_state,
+            },
+            stage="think",
+            status="running",
+            message="Completed synthesis for current iteration.",
+            metrics={"think_token_budget": think_tokens},
+        )
+        return next_state
 
     def _decide_node(self, state: ResearchSubagentState) -> Dict[str, Any]:
+        self._update_observer(
+            state,
+            stage="decide",
+            status="running",
+            message="Evaluating whether to continue research.",
+        )
         iteration = state.get("iteration", 0)
         max_iterations = self.config.get("max_iterations", 8)
-
-        if iteration >= max_iterations:
-            return {
+        max_queries = self._max_total_queries()
+        
+        if iteration >= max_iterations or len(state.get("all_queries", [])) >= max_queries:
+            stop_reason = (
+                "Max iterations reached; stopping research."
+                if iteration >= max_iterations
+                else "Max query budget reached; stopping research."
+            )
+            next_state = {
                 "decision": "stop",
                 "iteration": iteration + 1,
-                "history": state["history"] + ["Max iterations reached; stopping research."],
+                "history": state["history"] + [stop_reason],
             }
+            self._update_observer(
+                {
+                    **state,
+                    **next_state,
+                },
+                stage="decide",
+                status="completed",
+                message=stop_reason,
+                metrics={"decision": "stop", "max_total_queries": max_queries},
+            )
+            return next_state
 
         history = state.get("history") or []
         history_str = "\n\n".join(history) if history else "No prior research yet."
@@ -570,11 +727,22 @@ class ResearchSubagent:
         history_entry = (
             "Continuing research." if decision == "continue" else "Stopping research."
         )
-        return {
+        next_state = {
             "decision": decision,
             "iteration": iteration + 1,
             "history": state["history"] + [history_entry],
         }
+        self._update_observer(
+            {
+                **state,
+                **next_state,
+            },
+            stage="decide",
+            status="completed",
+            message=history_entry,
+            metrics={"decision": decision},
+        )
+        return next_state
 
     def _route_after_decide(self, state: ResearchSubagentState) -> str:
         return state.get("decision", "stop")
@@ -603,8 +771,21 @@ class ResearchSubagent:
             "history": state["history"],
         }
 
-    def run(self, topic: str, scout_report: str = "") -> Dict[str, Any]:
+    def run(
+        self,
+        topic: str,
+        scout_report: str = "",
+        observer: Any | None = None,
+        angle_id: str | None = None,
+        angle_topic: str | None = None,
+        success_criteria: str = "",
+    ) -> Dict[str, Any]:
         self.statistics = self._empty_statistics()
+        self._runtime_observer = observer
+        self._angle_id = angle_id
+        self._angle_topic = angle_topic or topic
+        self._angle_success_criteria = success_criteria
+        self._ensure_angle_registered()
         initial_state: ResearchSubagentState = {
             "topic": topic,
             "context_ids": [],
@@ -615,12 +796,34 @@ class ResearchSubagent:
         }
 
         recursion_limit = int(self.config.get("recursion_limit", 40))
-        results = self.graph.invoke(initial_state, config={"recursion_limit": recursion_limit})
-
-        for tool in self._tool_map.values():
-            if hasattr(tool, "close"):
-                tool.close()
-        return results
+        try:
+            results = self.graph.invoke(initial_state, config={"recursion_limit": recursion_limit})
+            results["statistics"] = dict(self.statistics)
+            self._update_observer(
+                results,
+                stage="decide",
+                status="completed",
+                message="Research angle completed.",
+                metrics={"final_decision": results.get("decision")},
+            )
+            return results
+        except Exception as exc:
+            self._update_observer(
+                initial_state,
+                stage="research_parallel",
+                status="failed",
+                message=f"Research angle failed: {type(exc).__name__}: {exc}",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            for tool in self._tool_map.values():
+                if hasattr(tool, "close"):
+                    tool.close()
+            self._runtime_observer = None
+            self._angle_id = None
+            self._angle_topic = ""
+            self._angle_success_criteria = ""
 
     def get_statistics(self) -> Dict[str, Any]:
         return self.statistics
@@ -630,6 +833,7 @@ class ResearchSubagent:
 class AgentConfig:
     model: dict[str, Any]
     system_prompt: str
+    fallback_model: dict[str, Any] | OpenRouterModelConfig | None = None
     tools: List[ToolConfig] | None = None
     max_iterations: int = 15
     max_tool_calls_per_turn: int = 8
@@ -664,6 +868,13 @@ class Agent:
             model_spec = asdict(model_spec)
             model_spec["provider"] = "openrouter"
         self.model = create_model_from_spec(model_spec)
+        fallback_spec = config.fallback_model
+        if isinstance(fallback_spec, OpenRouterModelConfig):
+            fallback_spec = asdict(fallback_spec)
+            fallback_spec["provider"] = "openrouter"
+        self.fallback_model: BaseModel | None = (
+            create_model_from_spec(fallback_spec) if fallback_spec else None
+        )
         self._tool_map: Dict[str, BaseTool] = {}
         for tool_config in (config.tools or []):
             try:
@@ -679,6 +890,18 @@ class Agent:
         self.max_iterations = config.max_iterations
         self.max_tool_calls_per_turn = max(1, config.max_tool_calls_per_turn)
         self.graph = self._build_graph()
+
+    def _generate_with_fallback(self, prompt: str, **generation_kwargs: Any) -> str:
+        try:
+            return self.model.generate(prompt, **generation_kwargs)
+        except Exception as exc:
+            if not self.fallback_model:
+                raise
+            logger.warning(
+                "Primary agent model failed; falling back to secondary model: %s",
+                exc,
+            )
+            return self.fallback_model.generate(prompt, **generation_kwargs)
 
     def _format_tools_for_prompt(self) -> str:
         if not self._tool_map:
@@ -732,7 +955,7 @@ class Agent:
 
     def _call_model(self, state: AgentState) -> Dict[str, Any]:
         prompt = self._messages_to_prompt(state["messages"])
-        response = self.model.generate(prompt)
+        response = self._generate_with_fallback(prompt)
         messages = state["messages"] + [{"role": "assistant", "content": response}]
         return {"messages": messages, "output": response}
 
@@ -799,7 +1022,7 @@ class Agent:
 
         if not self._tool_map:
             prompt = self._messages_to_prompt(initial["messages"])
-            output = self.model.generate(prompt)
+            output = self._generate_with_fallback(prompt)
             return AgentResult(
                 output=output,
                 messages=initial["messages"] + [{"role": "assistant", "content": output}],

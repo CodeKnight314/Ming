@@ -38,6 +38,10 @@ class ScoutSubagent:
     ):
         self.config = config
         self.model = create_model_from_spec(config.get("model"))
+        fallback_spec = config.get("fallback_model")
+        self.fallback_model = (
+            create_model_from_spec(fallback_spec) if fallback_spec else None
+        )
 
         self._tool_map = {}
         for tool_config in (config.get("tool_configs") or []):
@@ -47,6 +51,21 @@ class ScoutSubagent:
                     self._tool_map[tool.get_name()] = tool
             except Exception as exc:
                 logger.warning("Skipping scout tool %s: %s", tool_config, exc)
+
+    def _generate_with_fallback(self, prompt: str, **generation_kwargs: Any) -> str:
+        try:
+            return self.model.generate(prompt, **self._generation_kwargs(**generation_kwargs))
+        except Exception as exc:
+            if not self.fallback_model:
+                raise
+            logger.warning(
+                "Primary scout model failed; falling back to secondary model: %s",
+                exc,
+            )
+            return self.fallback_model.generate(
+                prompt,
+                **self._generation_kwargs(**generation_kwargs),
+            )
 
     def _generation_kwargs(self, **overrides: Any) -> Dict[str, Any]:
         base = {
@@ -93,9 +112,9 @@ class ScoutSubagent:
             previous_queries_section=previous_queries_section,
             query_count=max_q,
         )
-        response = self.model.generate(
+        response = self._generate_with_fallback(
             prompt,
-            **self._generation_kwargs(max_new_tokens=256),
+            max_new_tokens=256,
         )
         queries = self._parse_queries_from_response(response)
         queries = queries[:max_q]
@@ -147,8 +166,17 @@ class ScoutSubagent:
             lines.append("")
         return "\n".join(lines).strip()
 
-    def run(self, topic: str) -> ScoutResult:
+    def run(self, topic: str, observer: Any | None = None) -> ScoutResult:
         queries = self._generate_queries(topic)
+        if observer is not None:
+            observer.emit_event(
+                kind="metric_update",
+                component="scout",
+                status="running",
+                message="Scout generated queries.",
+                stage="scout",
+                metrics={"query_count": len(queries)},
+            )
         max_results_per_query = max(1, int(self.config.get("max_results_per_query", 3)))
 
         search_results: List[Dict[str, Any]] = []
@@ -159,14 +187,32 @@ class ScoutSubagent:
                 search_results.extend(results[:max_results_per_query])
 
         search_results = self._dedupe_results(search_results)
+        if observer is not None:
+            observer.emit_event(
+                kind="metric_update",
+                component="scout",
+                status="running",
+                message="Scout search burst completed.",
+                stage="scout",
+                metrics={"search_result_count": len(search_results)},
+            )
         evidence_block = self._format_search_results(search_results)
-        landscape_brief = self.model.generate(
+        landscape_brief = self._generate_with_fallback(
             SCOUT_SUMMARY_PROMPT.format(
                 topic=topic,
                 scout_results=evidence_block,
             ),
-            **self._generation_kwargs(max_new_tokens=512),
+            max_new_tokens=512,
         ).strip()
+        if observer is not None:
+            observer.emit_event(
+                kind="metric_update",
+                component="scout",
+                status="completed",
+                message="Scout landscape brief generated.",
+                stage="scout",
+                metrics={"landscape_brief_chars": len(landscape_brief)},
+            )
 
         return {
             "topic": topic,

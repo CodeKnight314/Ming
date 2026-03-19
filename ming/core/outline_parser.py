@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import html
 import re
 import xml.etree.ElementTree as ET
 
@@ -48,6 +49,30 @@ def extract_outline_block(text: str) -> str:
     if not match:
         raise ValueError("Could not find a <report_outline>...</report_outline> block.")
     return match.group(0)
+
+
+def escape_xml_text_nodes(xml_text: str) -> str:
+    def _escape_text_segment(segment: str) -> str:
+        return html.escape(html.unescape(segment), quote=False)
+
+    parts: list[str] = []
+    last_end = 0
+    for match in re.finditer(r"<[^>]+>", xml_text):
+        text_segment = xml_text[last_end:match.start()]
+        if text_segment:
+            parts.append(_escape_text_segment(text_segment))
+        parts.append(match.group(0))
+        last_end = match.end()
+
+    trailing = xml_text[last_end:]
+    if trailing:
+        parts.append(_escape_text_segment(trailing))
+
+    return "".join(parts)
+
+
+def sanitize_outline_xml(outline_xml: str) -> str:
+    return escape_xml_text_nodes(extract_outline_block(outline_xml))
 
 
 def normalize_space(text: str | None) -> str:
@@ -114,7 +139,7 @@ def constraints_to_paragraph(root: ET.Element) -> str:
 
 
 def outline_to_sections(outline_xml: str) -> tuple[str, str, list[SectionPlan]]:
-    root = ET.fromstring(outline_xml)
+    root = ET.fromstring(sanitize_outline_xml(outline_xml))
     report_title = normalize_space(root.findtext("report_title"))
     constraints_paragraph = constraints_to_paragraph(root)
     sections: list[SectionPlan] = []
