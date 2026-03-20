@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import html
+import json
 import logging
 from queue import Queue
 import re
@@ -738,10 +739,27 @@ class MingDeepResearch:
             metrics={
                 "elapsed_seconds": round(end_time - start_time, 3),
                 "section_count": len(sections),
+                "outline_section_titles_json": json.dumps(
+                    [s.title for s in sections], ensure_ascii=False
+                ),
             },
         )
 
         self._stage_started("write", "Report writing started.")
+        # Seed writer metrics on the run snapshot immediately so the TUI sees
+        # section count and rows before the first parallel section completes (and
+        # even if an older writer_agent omitted runtime_observer).
+        if self.runtime_observer is not None and sections:
+            self.runtime_observer.update_run(
+                metrics={
+                    "write_sections_completed": 0,
+                    "write_sections_total": len(sections),
+                    "write_sections_progress_json": json.dumps(
+                        [{"title": s.title, "status": "running"} for s in sections],
+                        ensure_ascii=False,
+                    ),
+                }
+            )
         logger.info("Writing iterative markdown report...")
         start_time = time.time()
         report_markdown = self.writer_agent.run(
@@ -749,6 +767,7 @@ class MingDeepResearch:
             constraints_paragraph=constraints_paragraph,
             sections=sections,
             draft_output_path=self.config.draft_output_path,
+            runtime_observer=self.runtime_observer,
         )
         end_time = time.time()
         logger.info(f"Writing report took {round(end_time - start_time, 2)} seconds")
@@ -764,12 +783,104 @@ class MingDeepResearch:
         return report_markdown
 
 if __name__ == "__main__":
-    from ming.core.config import create_ming_deep_research_config
-    logging.basicConfig(level=logging.INFO)
-    config = create_ming_deep_research_config()
-    orchestrator = MingDeepResearch(config)
+    import argparse
     import time
-    start_time = time.time()
-    result = orchestrator.run("I need to dynamically adjust Kubernetes (K8S) cluster node counts based on fluctuating business request volumes, ensuring resources are scaled up proactively before peak loads and scaled down promptly during troughs. The standard Cluster Autoscaler (CA) isn't suitable as it relies on pending pods and might not fit non-elastic node group scenarios. What are effective implementation strategies, best practices, or existing projects that address predictive or scheduled autoscaling for K8S nodes?")
-    end_time = time.time()
-    print(f"\n\nTime taken: {round(end_time - start_time, 2)/60} minutes")
+    from pathlib import Path
+
+    from ming.core.config import create_ming_deep_research_config, load_config
+    from ming.core.redis_flush import flush_research_redis_for_new_run
+
+    parser = argparse.ArgumentParser(description="Ming deep research CLI.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--jsonl",
+        type=str,
+        help="Path to query JSONL (fields: id, prompt, ...). Writes id_<id>.md per row.",
+    )
+    group.add_argument("--query", type=str, help="Run a single query (stdout timing only).")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.json",
+        help="Config JSON path (used for Redis flush targets).",
+    )
+    parser.add_argument(
+        "--submission-dir",
+        type=str,
+        default=None,
+        help="Output directory for id_<id>.md with --jsonl (default: <jsonl>/../submission).",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
+    raw_config = load_config(args.config)
+    config = create_ming_deep_research_config(raw_config)
+    orchestrator = MingDeepResearch(config)
+
+    if args.query:
+        flush_research_redis_for_new_run(raw_config)
+        start_time = time.time()
+        orchestrator.run(args.query)
+        print(f"\n\nTime taken: {round(time.time() - start_time, 2) / 60} minutes")
+    else:
+        jsonl_path = Path(args.jsonl).expanduser().resolve()
+        submission_dir = (
+            Path(args.submission_dir).expanduser().resolve()
+            if args.submission_dir
+            else jsonl_path.parent.parent / "submission"
+        )
+        submission_dir.mkdir(parents=True, exist_ok=True)
+
+        entries: list[dict[str, Any]] = []
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as e:
+                    tqdm.write(f"Skipping line {line_no}: invalid JSON ({e})")
+                    continue
+                if "id" not in row or "prompt" not in row:
+                    tqdm.write(f"Skipping line {line_no}: missing id or prompt")
+                    continue
+                entries.append(row)
+
+        n_skipped = n_written = n_failed = 0
+        pbar = tqdm(entries, desc="JSONL queries", unit="query", dynamic_ncols=True)
+        for row in pbar:
+            qid = row["id"]
+            prompt = str(row["prompt"])
+            out_path = submission_dir / f"id_{qid}.md"
+            pbar.set_postfix(
+                skipped=n_skipped, written=n_written, failed=n_failed, id=qid, refresh=False
+            )
+            if out_path.exists():
+                n_skipped += 1
+                pbar.set_postfix(
+                    skipped=n_skipped, written=n_written, failed=n_failed, id=qid
+                )
+                tqdm.write(f"Skip id={qid} (exists: {out_path})")
+                continue
+
+            flush_research_redis_for_new_run(raw_config)
+            start_time = time.time()
+            result = orchestrator.run(prompt)
+            elapsed_min = round(time.time() - start_time, 2) / 60
+
+            if result:
+                out_path.write_text(result, encoding="utf-8")
+                n_written += 1
+                pbar.set_postfix(
+                    skipped=n_skipped, written=n_written, failed=n_failed, id=qid
+                )
+                tqdm.write(f"Wrote id={qid} -> {out_path} ({elapsed_min:.2f} min)")
+            else:
+                n_failed += 1
+                pbar.set_postfix(
+                    skipped=n_skipped, written=n_written, failed=n_failed, id=qid
+                )
+                tqdm.write(
+                    f"Empty report for id={qid}; not writing {out_path} ({elapsed_min:.2f} min)"
+                )

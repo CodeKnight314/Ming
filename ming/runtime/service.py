@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from ming.core.redis import RedisDatabaseConfig
 from ming.runtime.contracts import (
+    DEFAULT_RUNTIME_NAMESPACE,
     CommandResult,
     CommandSnapshot,
     JobSnapshot,
@@ -95,9 +96,14 @@ def close_orchestrator(orchestrator: Any) -> None:
             close_fn()
 
 
-def default_job_executor_factory(config_path: str | Path) -> JobExecutor:
+def default_job_executor_factory(
+    config_path: str | Path,
+    *,
+    runtime_namespace: str = DEFAULT_RUNTIME_NAMESPACE,
+) -> JobExecutor:
     def _executor(job: RuntimeJob) -> dict[str, Any]:
         from ming.core.config import create_ming_deep_research_config, load_config
+        from ming.core.redis_flush import flush_research_redis_for_new_run
         from ming.orchestrator import MingDeepResearch
 
         prompt = str(job.payload.get("prompt", "")).strip()
@@ -105,6 +111,9 @@ def default_job_executor_factory(config_path: str | Path) -> JobExecutor:
             raise RuntimeValidationError("Job payload.prompt must be non-empty")
 
         config_dict = load_config(config_path)
+        flush_research_redis_for_new_run(
+            config_dict, runtime_namespace=runtime_namespace
+        )
         config = create_ming_deep_research_config(config_dict)
 
         prompt_id = job.payload.get("prompt_id")
@@ -154,7 +163,10 @@ class RuntimeService:
             stream_maxlen=config.stream_maxlen,
             snapshot_ttl_seconds=config.snapshot_ttl_seconds,
         )
-        self.executor = executor or default_job_executor_factory(config.config_path)
+        self.executor = executor or default_job_executor_factory(
+            config.config_path,
+            runtime_namespace=config.namespace,
+        )
         self.id_factory = id_factory or (lambda prefix: f"{prefix}_{uuid4().hex}")
         self.now_fn = now_fn
 
@@ -287,18 +299,11 @@ class RuntimeService:
                 metrics={"report_length": len(report_markdown)},
             )
             self.emitter.write_run_snapshot(
-                RunSnapshot(
-                    run_id=run_id,
-                    job_id=job.job_id,
-                    command_id=job.command_id,
+                observer.snapshot_terminated(
                     status=RuntimeStatus.COMPLETED.value,
-                    started_at=job.started_at or self.now_fn(),
-                    finished_at=job.finished_at,
-                    prompt=str(job.payload.get("prompt", "")),
-                    prompt_id=str(job.payload.get("prompt_id")) if job.payload.get("prompt_id") is not None else None,
-                    stage="runtime_execute",
-                    stage_status=RuntimeStatus.COMPLETED.value,
-                    metrics={"report_length": len(report_markdown)},
+                    finished_at=job.finished_at or self.now_fn(),
+                    error=None,
+                    extra_metrics={"report_length": len(report_markdown)},
                 )
             )
             self.emitter.emit_event(
@@ -330,18 +335,11 @@ class RuntimeService:
                 message=f"Job failed: {job.error}",
             )
             self.emitter.write_run_snapshot(
-                RunSnapshot(
-                    run_id=run_id,
-                    job_id=job.job_id,
-                    command_id=job.command_id,
+                observer.snapshot_terminated(
                     status=RuntimeStatus.FAILED.value,
-                    started_at=job.started_at or self.now_fn(),
-                    finished_at=job.finished_at,
-                    prompt=str(job.payload.get("prompt", "")),
-                    prompt_id=str(job.payload.get("prompt_id")) if job.payload.get("prompt_id") is not None else None,
-                    stage="runtime_execute",
-                    stage_status=RuntimeStatus.FAILED.value,
+                    finished_at=job.finished_at or self.now_fn(),
                     error=job.error,
+                    extra_metrics=None,
                 )
             )
             self.emitter.emit_event(

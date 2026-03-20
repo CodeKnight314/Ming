@@ -1,7 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,13 +14,28 @@ use ratatui::{
     DefaultTerminal,
     layout::{Constraint, Direction, Layout, Rect},
     prelude::*,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, Paragraph, Row, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 use redis::{Commands, FromRedisValue, cmd, streams::StreamRangeReply};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
+
+/// Gemini-CLI–inspired dark theme (RGB works in most modern terminals).
+mod theme {
+    use ratatui::style::Color;
+
+    pub const ACCENT_BLUE: Color = Color::Rgb(138, 180, 248);
+    pub const ACCENT_PURPLE: Color = Color::Rgb(197, 151, 230);
+    pub const TEXT: Color = Color::Rgb(232, 234, 237);
+    pub const MUTED: Color = Color::Rgb(139, 148, 158);
+    pub const SUBTLE: Color = Color::Rgb(72, 79, 88);
+    pub const SUCCESS: Color = Color::Rgb(129, 201, 149);
+    pub const WARN: Color = Color::Rgb(242, 204, 96);
+    pub const ERROR: Color = Color::Rgb(255, 123, 114);
+    pub const INPUT_BG: Color = Color::Rgb(30, 34, 42);
+}
 
 const STAGE_ORDER: [&str; 9] = [
     "scout",
@@ -39,16 +54,12 @@ enum Focus {
     Input,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InputMode {
-    DirectQuery,
-}
-
 #[derive(Clone, Debug, Deserialize)]
 struct DashboardData {
     #[allow(dead_code)]
     queue: QueueView,
     active_run: RunView,
+    #[allow(dead_code)]
     recent_events: Vec<EventEntry>,
 }
 
@@ -90,6 +101,7 @@ struct RunView {
 struct StageProgress {
     label: String,
     status: String,
+    #[allow(dead_code)]
     duration_seconds: u64,
 }
 
@@ -98,6 +110,7 @@ struct AngleView {
     angle_id: String,
     topic: String,
     stage: String,
+    #[allow(dead_code)]
     iteration: u32,
     queries_total: u32,
     context_ids_total: u32,
@@ -111,12 +124,19 @@ struct MetricEntry {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[allow(dead_code)]
 struct EventEntry {
     ts: String,
     component: String,
     message: String,
     stage: Option<String>,
     level: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WriteSectionProgress {
+    title: String,
+    status: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -153,6 +173,10 @@ struct RunSnapshotWire {
     status: String,
     stage: Option<String>,
     stage_status: Option<String>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    finished_at: Option<String>,
     metrics: BTreeMap<String, JsonValue>,
 }
 
@@ -225,49 +249,73 @@ impl DataSource {
         }
     }
 
-    fn submit(&self, mode: InputMode, input: &str) -> Result<String> {
+    fn submit_run_query(&self, prompt: &str) -> Result<String> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(anyhow!("prompt is empty"));
+        }
         match self {
-            Self::Mock { .. } => Ok("Mock mode: submission preview only.".to_string()),
+            Self::Mock { .. } => Ok(format!(
+                "Mock: would submit run_query ({} chars).",
+                prompt.chars().count()
+            )),
             Self::Live { client, namespace } => {
                 let mut con = client
                     .get_connection()
                     .context("failed to connect to Redis for command submission")?;
                 let command_id = format!("cmd_rs_{}", unix_millis()?);
-                let payload = match mode {
-                    InputMode::DirectQuery => {
-                        let prompt = input.trim();
-                        if prompt.is_empty() {
-                            return Err(anyhow!("prompt is empty"));
-                        }
-                        json!({
-                            "command_id": command_id,
-                            "type": "run_query",
-                            "submitted_at": iso_like_now()?,
-                            "source": {
-                                "kind": "tui",
-                                "client_id": "runtime-tui",
-                                "user": "local"
-                            },
-                            "payload": {
-                                "prompt": prompt,
-                                "metadata": {}
-                            }
-                        })
+                let payload = json!({
+                    "command_id": command_id,
+                    "type": "run_query",
+                    "submitted_at": iso_like_now()?,
+                    "source": {
+                        "kind": "tui",
+                        "client_id": "runtime-tui",
+                        "user": "local"
+                    },
+                    "payload": {
+                        "prompt": prompt,
+                        "metadata": {}
                     }
-                };
+                });
+                xadd_command(&mut con, namespace, &payload, &command_id)
+            }
+        }
+    }
 
-                let stream_key = format!("{namespace}:commands");
-                let payload_string = serde_json::to_string(&payload)?;
-                let stream_id: String = cmd("XADD")
-                    .arg(&stream_key)
-                    .arg("*")
-                    .arg("payload")
-                    .arg(payload_string)
-                    .query(&mut con)
-                    .context("failed to append command to Redis stream")?;
-                Ok(format!(
-                    "Submitted {command_id} to {stream_key} ({stream_id})"
-                ))
+    fn submit_run_batch(&self, items: &[(String, String)]) -> Result<String> {
+        if items.is_empty() {
+            return Err(anyhow!("batch has no items"));
+        }
+        match self {
+            Self::Mock { .. } => Ok(format!(
+                "Mock: would submit run_batch ({} items).",
+                items.len()
+            )),
+            Self::Live { client, namespace } => {
+                let mut con = client
+                    .get_connection()
+                    .context("failed to connect to Redis for command submission")?;
+                let command_id = format!("cmd_rs_{}", unix_millis()?);
+                let json_items: Vec<JsonValue> = items
+                    .iter()
+                    .map(|(id, p)| json!({ "id": id, "prompt": p }))
+                    .collect();
+                let payload = json!({
+                    "command_id": command_id,
+                    "type": "run_batch",
+                    "submitted_at": iso_like_now()?,
+                    "source": {
+                        "kind": "tui",
+                        "client_id": "runtime-tui",
+                        "user": "local"
+                    },
+                    "payload": {
+                        "mode": "sequential",
+                        "items": json_items
+                    }
+                });
+                xadd_command(&mut con, namespace, &payload, &command_id)
             }
         }
     }
@@ -280,11 +328,107 @@ impl DataSource {
     }
 }
 
+fn xadd_command(
+    con: &mut redis::Connection,
+    namespace: &str,
+    payload: &JsonValue,
+    command_id: &str,
+) -> Result<String> {
+    let stream_key = format!("{namespace}:commands");
+    let payload_string = serde_json::to_string(payload)?;
+    let stream_id: String = cmd("XADD")
+        .arg(&stream_key)
+        .arg("*")
+        .arg("payload")
+        .arg(payload_string)
+        .query(con)
+        .context("failed to append command to Redis stream")?;
+    Ok(format!(
+        "Submitted {command_id} to {stream_key} ({stream_id})"
+    ))
+}
+
+fn json_batch_id(value: &JsonValue) -> Result<String> {
+    match value {
+        JsonValue::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Err(anyhow!("batch id must be non-empty"));
+            }
+            Ok(t.to_string())
+        }
+        JsonValue::Number(n) => Ok(n.to_string()),
+        _ => Err(anyhow!("batch id must be a string or number")),
+    }
+}
+
+fn push_batch_object(obj: &serde_json::Map<String, JsonValue>, index: &str) -> Result<(String, String)> {
+    let id = match obj.get("id") {
+        Some(v) => json_batch_id(v)?,
+        None => return Err(anyhow!("batch item {index}: missing id")),
+    };
+    let prompt = obj
+        .get("prompt")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("batch item {index}: prompt required"))?
+        .to_string();
+    Ok((id, prompt))
+}
+
+fn ensure_unique_batch_ids(items: &[(String, String)]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for (id, _) in items {
+        if !seen.insert(id.as_str()) {
+            return Err(anyhow!("duplicate batch id: {id}"));
+        }
+    }
+    Ok(())
+}
+
+/// JSON array of `{id, prompt}` or JSONL with one object per line (e.g. deepresearch-bench `query.jsonl`).
+fn load_batch_items_from_path(path: &Path) -> Result<Vec<(String, String)>> {
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let trimmed_start = raw.trim_start();
+    let items = if trimmed_start.starts_with('[') {
+        let arr: Vec<JsonValue> =
+            serde_json::from_str(&raw).context("parse batch file as JSON array")?;
+        let mut out = Vec::new();
+        for (i, v) in arr.iter().enumerate() {
+            let obj = v
+                .as_object()
+                .ok_or_else(|| anyhow!("batch[{i}] must be an object"))?;
+            out.push(push_batch_object(obj, &format!("[{i}]"))?);
+        }
+        out
+    } else {
+        let mut out = Vec::new();
+        for (i, line) in raw.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let v: JsonValue =
+                serde_json::from_str(line).with_context(|| format!("JSONL line {}", i + 1))?;
+            let obj = v
+                .as_object()
+                .ok_or_else(|| anyhow!("JSONL line {}: object expected", i + 1))?;
+            out.push(push_batch_object(obj, &format!("line {}", i + 1))?);
+        }
+        out
+    };
+    if items.is_empty() {
+        return Err(anyhow!("no batch items found in {}", path.display()));
+    }
+    ensure_unique_batch_ids(&items)?;
+    Ok(items)
+}
+
 struct App {
     data_source: DataSource,
     dashboard: DashboardData,
     focus: Focus,
-    input_mode: InputMode,
     show_help: bool,
     direct_query_draft: String,
     last_status: String,
@@ -293,6 +437,10 @@ struct App {
     // slot we still fetch that specific run snapshot rather than letting
     // latest_run_snapshot drift to a different (possibly empty) run.
     last_run_id: Option<String>,
+    /// Drives per-stage spinners (increments each frame).
+    ui_tick: u32,
+    /// Set when the user submits `/exit`; main loop stops on next frame.
+    exit_requested: bool,
 }
 
 impl App {
@@ -314,12 +462,13 @@ impl App {
             data_source,
             dashboard,
             focus: Focus::Input,
-            input_mode: InputMode::DirectQuery,
             show_help: false,
             direct_query_draft,
             last_status: "Ready.".to_string(),
             last_refresh: Some(Instant::now()),
             last_run_id,
+            ui_tick: 0,
+            exit_requested: false,
         }
     }
 
@@ -332,12 +481,12 @@ impl App {
                     self.last_run_id = Some(new_id.clone());
                 }
                 self.dashboard = dashboard;
-                if let Some(value) = direct_draft {
-                    self.direct_query_draft = value;
-                }
-                let _ = batch_draft;
+                // Do not overwrite `direct_query_draft` here: mock reload would reset the
+                // composer every poll (~1.2s) and make typing impossible.
+                let _ = (direct_draft, batch_draft);
                 self.last_refresh = Some(Instant::now());
-                self.last_status = format!("Refreshed from {}.", self.data_source.source_label());
+                // Do not overwrite `last_status` on success — periodic refresh would erase
+                // submission messages; timing already shows in the header.
             }
             Err(err) => {
                 self.last_status = format!("Refresh failed: {err}");
@@ -345,39 +494,90 @@ impl App {
         }
     }
 
+    fn reset_dashboard_for_new_command(&mut self) {
+        self.last_run_id = None;
+        self.dashboard.active_run = RunView {
+            run_id: "none".to_string(),
+            prompt: String::new(),
+            status: "queued".to_string(),
+            stage: "queued".to_string(),
+            elapsed_seconds: 0,
+            progress_ratio: 0.0,
+            stage_progress: STAGE_ORDER
+                .iter()
+                .map(|label| StageProgress {
+                    label: (*label).to_string(),
+                    status: "pending".to_string(),
+                    duration_seconds: 0,
+                })
+                .collect(),
+            angles: Vec::new(),
+            metrics: Vec::new(),
+        };
+    }
+
+    fn finish_run_query_submit(&mut self, prompt: &str) -> Result<String> {
+        let msg = self.data_source.submit_run_query(prompt)?;
+        self.reset_dashboard_for_new_command();
+        self.direct_query_draft.clear();
+        Ok(msg)
+    }
+
+    fn finish_batch_submit(&mut self, path: PathBuf) -> Result<String> {
+        let items = load_batch_items_from_path(&path)?;
+        let msg = self.data_source.submit_run_batch(&items)?;
+        self.reset_dashboard_for_new_command();
+        self.direct_query_draft.clear();
+        Ok(msg)
+    }
+
+    fn handle_slash_command(&mut self, line: &str) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            return;
+        }
+        let cmd = parts[0];
+        match cmd {
+            "/exit" => {
+                self.exit_requested = true;
+                self.last_status = "Exiting.".to_string();
+            }
+            "/batch" => {
+                let path = parts[1..].join(" ");
+                if path.is_empty() {
+                    self.last_status =
+                        "Usage: /batch <path>  (file: JSON array or JSONL; see F1 help)"
+                            .to_string();
+                    return;
+                }
+                match self.finish_batch_submit(PathBuf::from(path)) {
+                    Ok(m) => self.last_status = m,
+                    Err(e) => self.last_status = format!("{e:#}"),
+                }
+            }
+            _ => {
+                self.last_status =
+                    "Unknown command — use /batch <path> or /exit.".to_string();
+            }
+        }
+    }
+
     fn submit_current(&mut self) {
         let input = self.active_input_text().to_string();
-        match self.data_source.submit(self.input_mode, &input) {
-            Ok(message) => {
-                self.last_status = message;
-                self.direct_query_draft.clear();
-                // Drop the sticky run ID so the next refresh picks up the new
-                // run rather than continuing to show the just-completed one.
-                self.last_run_id = None;
-                // Reset the displayed run immediately — don't wait for the next
-                // poll cycle to clear old stage/metric data.
-                self.dashboard.active_run = RunView {
-                    run_id: "none".to_string(),
-                    prompt: String::new(),
-                    status: "queued".to_string(),
-                    stage: "queued".to_string(),
-                    elapsed_seconds: 0,
-                    progress_ratio: 0.0,
-                    stage_progress: STAGE_ORDER
-                        .iter()
-                        .map(|label| StageProgress {
-                            label: (*label).to_string(),
-                            status: "pending".to_string(),
-                            duration_seconds: 0,
-                        })
-                        .collect(),
-                    angles: Vec::new(),
-                    metrics: Vec::new(),
-                };
-            }
-            Err(err) => {
-                self.last_status = format!("Submit failed: {err}");
-            }
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            self.last_status = "Nothing to submit.".to_string();
+            return;
+        }
+        if trimmed.starts_with('/') {
+            self.handle_slash_command(&trimmed);
+            // Consume the command line so Enter does not re-run the same command.
+            self.direct_query_draft.clear();
+            return;
+        }
+        match self.finish_run_query_submit(&trimmed) {
+            Ok(message) => self.last_status = message,
+            Err(err) => self.last_status = format!("Submit failed: {err:#}"),
         }
     }
 
@@ -481,6 +681,7 @@ fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
             last_poll = Instant::now();
         }
 
+        app.ui_tick = app.ui_tick.wrapping_add(1);
         terminal.draw(|frame| render(frame, &app))?;
 
         if !event::poll(Duration::from_millis(150))? {
@@ -493,18 +694,21 @@ fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
             }
 
             match key.code {
-                KeyCode::Char('q') => return Ok(()),
-                KeyCode::Char('r') => {
-                    app.refresh();
-                    last_poll = Instant::now();
-                }
                 KeyCode::Tab => app.next_focus(),
                 KeyCode::BackTab => app.prev_focus(),
-                KeyCode::Char('?') => app.show_help = !app.show_help,
+                KeyCode::F(1) => app.show_help = !app.show_help,
+                KeyCode::Esc => {
+                    if app.show_help {
+                        app.show_help = false;
+                    }
+                }
                 KeyCode::Backspace => app.backspace(),
                 KeyCode::Enter => {
                     if app.focus == Focus::Input {
                         app.submit_current();
+                        if app.exit_requested {
+                            return Ok(());
+                        }
                     }
                 }
                 KeyCode::Char(ch) => app.handle_char(ch),
@@ -542,7 +746,7 @@ fn load_live_dashboard(
         .collect::<Result<Vec<_>>>()?;
 
     let active_run = load_active_run_view(con, namespace, active_job.as_ref(), preferred_run_id)?;
-    let recent_events = load_recent_events(con, namespace, 12)?;
+    let recent_events = load_recent_events(con, namespace, 24)?;
 
     Ok(DashboardData {
         queue: QueueView {
@@ -661,31 +865,47 @@ fn load_active_run_view(
     })
 }
 
+/// Prefer an in-flight run; otherwise pick the most recently finished (or started) snapshot.
+/// Avoids scan-order noise where an older run (e.g. metrics wiped pre-fix) overwrote a good one.
+fn run_snapshot_rank(run: &RunSnapshotWire) -> (u8, String) {
+    let running = if run.status == "running" { 1u8 } else { 0u8 };
+    let ts = run
+        .finished_at
+        .as_deref()
+        .or(run.started_at.as_deref())
+        .unwrap_or("")
+        .to_string();
+    (running, ts)
+}
+
 fn latest_run_snapshot(
     con: &mut redis::Connection,
     namespace: &str,
 ) -> Result<Option<RunSnapshotWire>> {
     let pattern = format!("{namespace}:runs:*");
-    let mut best: Option<(String, RunSnapshotWire)> = None;
     let keys = con
         .scan_match::<_, String>(pattern)
         .context("failed to scan run snapshots")?
         .collect::<Vec<_>>();
+    let mut candidates: Vec<RunSnapshotWire> = Vec::new();
     for key in keys {
         if key.contains(":angles:") {
             continue;
         }
         if let Some(run) = get_json::<RunSnapshotWire>(con, &key)? {
-            let better = best
-                .as_ref()
-                .map(|(_, current)| run.status == "running" || current.status != "running")
-                .unwrap_or(true);
-            if better {
-                best = Some((key, run));
-            }
+            candidates.push(run);
         }
     }
-    Ok(best.map(|(_, run)| run))
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    candidates.sort_by(|a, b| {
+        let ra = run_snapshot_rank(a);
+        let rb = run_snapshot_rank(b);
+        // Running before completed; then lexicographically greatest ISO timestamp (newest).
+        rb.cmp(&ra)
+    });
+    Ok(candidates.into_iter().next())
 }
 
 fn load_angle_views(
@@ -882,8 +1102,8 @@ fn json_value_label(value: &JsonValue) -> String {
         JsonValue::Bool(v) => v.to_string(),
         JsonValue::Number(v) => v.to_string(),
         JsonValue::String(v) => v.clone(),
-        JsonValue::Array(v) => format!("[{} items]", v.len()),
-        JsonValue::Object(v) => format!("{{{} keys}}", v.len()),
+        // Preserve structured metrics (e.g. write_sections_progress_json) so the TUI can parse them.
+        JsonValue::Array(_) | JsonValue::Object(_) => serde_json::to_string(value).unwrap_or_default(),
     }
 }
 
@@ -906,27 +1126,566 @@ fn iso_like_now() -> Result<String> {
     Ok(format!("{}Z", unix_millis()?))
 }
 
+fn run_is_terminal(run: &RunView) -> bool {
+    matches!(
+        run.status.as_str(),
+        "completed" | "done" | "success" | "finished"
+    )
+}
+
+fn run_is_real(run: &RunView) -> bool {
+    !run.run_id.is_empty() && run.run_id != "none"
+}
+
+const KG_STAGE_KEYS: [&str; 4] = [
+    "kg_collect",
+    "kg_filter",
+    "kg_re",
+    "entity_resolution",
+];
+
+fn kg_has_failed_stage(run: &RunView) -> bool {
+    KG_STAGE_KEYS.iter().any(|key| {
+        run.stage_progress
+            .iter()
+            .find(|s| s.label == *key)
+            .map(|s| s.status == "failed")
+            .unwrap_or(false)
+    })
+}
+
+const SPINNER_FRAMES: &[&str] =
+    &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Pipeline order: earliest stage first in the list (top), latest last (bottom of the stage list).
+/// `bottom_anchor_lines` pads above so the block sits low in the Activity panel when there is room.
+const ACTIVITY_STACK: &[&str] = &[
+    "scout",
+    "planning",
+    "research_parallel",
+    "__kg__",
+    "outline",
+    "write",
+];
+
+fn stage_row_status<'a>(run: &'a RunView, key: &str) -> &'a str {
+    run.stage_progress
+        .iter()
+        .find(|s| s.label == key)
+        .map(|s| s.status.as_str())
+        .unwrap_or("pending")
+}
+
+fn activity_block_visible(run: &RunView, block: &str) -> bool {
+    if !run_is_real(run) {
+        return false;
+    }
+    if run_is_terminal(run) {
+        return true;
+    }
+    match block {
+        "scout" => stage_row_status(run, "scout") != "pending" || run.stage == "scout",
+        "planning" => stage_row_status(run, "planning") != "pending" || run.stage == "planning",
+        "research_parallel" => {
+            stage_row_status(run, "research_parallel") != "pending"
+                || run.stage == "research_parallel"
+        }
+        "__kg__" => KG_STAGE_KEYS.iter().any(|k| {
+            stage_row_status(run, k) != "pending" || run.stage == *k
+        }),
+        "outline" => stage_row_status(run, "outline") != "pending" || run.stage == "outline",
+        "write" => stage_row_status(run, "write") != "pending" || run.stage == "write",
+        _ => false,
+    }
+}
+
+fn kg_row_aggregate_status(run: &RunView) -> &'static str {
+    if kg_has_failed_stage(run) {
+        return "failed";
+    }
+    if KG_STAGE_KEYS
+        .iter()
+        .all(|k| stage_row_status(run, k) == "completed")
+    {
+        return "completed";
+    }
+    if KG_STAGE_KEYS
+        .iter()
+        .any(|k| stage_row_status(run, k) == "running")
+    {
+        return "running";
+    }
+    if KG_STAGE_KEYS
+        .iter()
+        .any(|k| stage_row_status(run, k) != "pending")
+    {
+        return "running";
+    }
+    "pending"
+}
+
+fn stage_glyph(status: &str, tick: u32) -> (String, Style) {
+    match status {
+        // Writer agent (and some backends) use "done" for finished sections.
+        "completed" | "done" => (
+            "✓ ".to_string(),
+            Style::default()
+                .fg(theme::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "failed" | "error" => (
+            "✗ ".to_string(),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "running" => {
+            let f = SPINNER_FRAMES[tick as usize % SPINNER_FRAMES.len()];
+            (
+                format!("{f} "),
+                Style::default()
+                    .fg(theme::ACCENT_BLUE)
+                    .add_modifier(Modifier::BOLD),
+            )
+        }
+        _ => (
+            "· ".to_string(),
+            Style::default().fg(theme::SUBTLE),
+        ),
+    }
+}
+
+fn block_heading_status<'a>(run: &'a RunView, block: &str) -> &'a str {
+    match block {
+        "scout" => stage_row_status(run, "scout"),
+        "planning" => stage_row_status(run, "planning"),
+        "research_parallel" => stage_row_status(run, "research_parallel"),
+        "__kg__" => kg_row_aggregate_status(run),
+        "outline" => stage_row_status(run, "outline"),
+        "write" => stage_row_status(run, "write"),
+        _ => "pending",
+    }
+}
+
+fn block_display_title<'a>(block: &'a str) -> &'a str {
+    match block {
+        "scout" => "Scouting",
+        "planning" => "Planning",
+        "research_parallel" => "Parallel research",
+        "__kg__" => "Knowledge graph",
+        "outline" => "Outline",
+        "write" => "Writing report",
+        _ => block,
+    }
+}
+
+fn push_stage_header(out: &mut Vec<Line<'static>>, run: &RunView, block: &str, tick: u32) {
+    let status = block_heading_status(run, block);
+    let st = if run_is_terminal(run) && status == "pending" {
+        "completed"
+    } else {
+        status
+    };
+    let (glyph, gstyle) = stage_glyph(st, tick);
+    let title = block_display_title(block).to_string();
+    out.push(Line::from(vec![
+        Span::styled(glyph, gstyle),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+}
+
+fn push_kg_sublines(out: &mut Vec<Line<'static>>, app: &App) {
+    let stages = [
+        ("kg_collect", "Collect"),
+        ("kg_filter", "Filter"),
+        ("kg_re", "NER / RE"),
+        ("entity_resolution", "Resolve"),
+    ];
+    for (key, label) in stages {
+        let processed =
+            metric_value(app, &format!("{key}_processed")).unwrap_or_else(|| "—".to_string());
+        let total = metric_value(app, &format!("{key}_total")).unwrap_or_else(|| "—".to_string());
+        let elapsed = metric_value(app, &format!("{key}_elapsed_seconds"))
+            .unwrap_or_else(|| "—".to_string());
+        let status = stage_row_status(&app.dashboard.active_run, key);
+        let (icon, accent) = match status {
+            "completed" => ("✓", theme::SUCCESS),
+            "running" => ("▶", theme::WARN),
+            "failed" => ("✗", theme::ERROR),
+            _ => ("·", theme::SUBTLE),
+        };
+        let row_fg = if status == "running" {
+            theme::TEXT
+        } else {
+            theme::MUTED
+        };
+        out.push(Line::from(vec![
+            Span::styled("      ", theme::SUBTLE),
+            Span::styled(
+                icon,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("{label:<12}"),
+                Style::default().fg(row_fg),
+            ),
+            Span::styled(
+                format!("{processed}/{total}"),
+                Style::default().fg(theme::TEXT),
+            ),
+            Span::styled(
+                format!("  {elapsed}s"),
+                Style::default().fg(theme::SUBTLE),
+            ),
+        ]));
+    }
+}
+
+fn push_angle_sublines(out: &mut Vec<Line<'static>>, run: &RunView) {
+    for angle in &run.angles {
+        let (icon, accent) = match angle.status.as_str() {
+            "completed" => ("✓", theme::SUCCESS),
+            "running" => ("▶", theme::WARN),
+            "failed" | "error" => ("✗", theme::ERROR),
+            _ => ("·", theme::SUBTLE),
+        };
+        let row_fg = if angle.status == "running" {
+            theme::TEXT
+        } else {
+            theme::MUTED
+        };
+        let topic = truncate(&angle.topic, 52);
+        out.push(Line::from(vec![
+            Span::styled("      ", theme::SUBTLE),
+            Span::styled(
+                icon,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(topic, Style::default().fg(row_fg)),
+            Span::styled(
+                format!(
+                    "  · {}  · {}q {} src",
+                    angle.stage, angle.queries_total, angle.context_ids_total
+                ),
+                Style::default().fg(theme::SUBTLE),
+            ),
+        ]));
+    }
+}
+
+fn append_scout_details(out: &mut Vec<Line<'static>>, app: &App) {
+    let q = metric_value(app, "query_count").unwrap_or_else(|| "0".to_string());
+    let s = metric_value(app, "search_result_count").unwrap_or_else(|| "0".to_string());
+    out.push(Line::from(vec![Span::styled(
+        format!("      Searches run: {q}"),
+        Style::default().fg(theme::MUTED),
+    )]));
+    out.push(Line::from(vec![Span::styled(
+        format!("      Sources collected: {s}"),
+        Style::default().fg(theme::MUTED),
+    )]));
+}
+
+fn append_planning_details(out: &mut Vec<Line<'static>>, app: &App) {
+    let n = metric_value(app, "research_angle_count").unwrap_or_else(|| "—".to_string());
+    out.push(Line::from(vec![Span::styled(
+        format!("      Research angles: {n}"),
+        Style::default().fg(theme::MUTED),
+    )]));
+}
+
+fn append_outline_details(out: &mut Vec<Line<'static>>, app: &App, run: &RunView) {
+    let st = stage_row_status(run, "outline");
+    if let Some(raw) = metric_value(app, "outline_section_titles_json") {
+        if let Ok(titles) = serde_json::from_str::<Vec<String>>(&raw) {
+            let done = st == "completed";
+            for t in titles {
+                let icon = if done { "✓" } else { "○" };
+                let line = truncate(&t, 68);
+                out.push(Line::from(vec![
+                    Span::styled("      ", theme::SUBTLE),
+                    Span::styled(
+                        icon,
+                        Style::default()
+                            .fg(if done {
+                                theme::SUCCESS
+                            } else {
+                                theme::WARN
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(line, Style::default().fg(theme::MUTED)),
+                ]));
+            }
+            return;
+        }
+    }
+    if st == "running" || st == "pending" {
+        out.push(Line::from(vec![Span::styled(
+            "      Structuring sections…",
+            Style::default().fg(theme::MUTED),
+        )]));
+    }
+}
+
+fn append_write_details(out: &mut Vec<Line<'static>>, app: &App, run: &RunView, tick: u32) {
+    let st = stage_row_status(run, "write");
+    if let Some(raw) = metric_value(app, "write_sections_progress_json") {
+        if let Ok(rows) = serde_json::from_str::<Vec<WriteSectionProgress>>(&raw) {
+            for row in rows {
+                let row_st = row.status.as_str();
+                let (g, gs) = stage_glyph(row_st, tick);
+                let title = truncate(&row.title, 58);
+                out.push(Line::from(vec![
+                    Span::styled("      ", theme::SUBTLE),
+                    Span::styled(g, gs),
+                    Span::styled(title, Style::default().fg(theme::MUTED)),
+                ]));
+            }
+            return;
+        }
+    }
+    let done = metric_value(app, "write_sections_completed").unwrap_or_else(|| "0".to_string());
+    let tot = metric_value(app, "write_sections_total").unwrap_or_else(|| "—".to_string());
+    if st == "running"
+        || st == "completed"
+        || st == "failed"
+        || (st == "pending" && done != "0")
+    {
+        out.push(Line::from(vec![Span::styled(
+            format!("      Sections: {done}/{tot}"),
+            Style::default().fg(theme::MUTED),
+        )]));
+    }
+}
+
+fn append_activity_block(out: &mut Vec<Line<'static>>, app: &App, block: &str, tick: u32) {
+    let run = &app.dashboard.active_run;
+    if !activity_block_visible(run, block) {
+        return;
+    }
+    push_stage_header(out, run, block, tick);
+    match block {
+        "scout" => append_scout_details(out, app),
+        "planning" => append_planning_details(out, app),
+        "research_parallel" => {
+            if run.angles.is_empty() {
+                out.push(Line::from(vec![Span::styled(
+                    "      (Waiting for angle snapshots…)",
+                    Style::default().fg(theme::SUBTLE),
+                )]));
+            } else {
+                push_angle_sublines(out, run);
+            }
+        }
+        "__kg__" => push_kg_sublines(out, app),
+        "outline" => append_outline_details(out, app, run),
+        "write" => append_write_details(out, app, run, tick),
+        _ => {}
+    }
+    out.push(Line::from(""));
+}
+
+fn bottom_anchor_lines(mut lines: Vec<Line<'static>>, max_height: u16) -> Vec<Line<'static>> {
+    let max = max_height as usize;
+    if lines.len() > max {
+        lines = lines[lines.len() - max..].to_vec();
+    } else {
+        let pad = max - lines.len();
+        for _ in 0..pad {
+            lines.insert(0, Line::from(""));
+        }
+    }
+    lines
+}
+
+fn build_activity_content(app: &App, inner_height: u16) -> Vec<Line<'static>> {
+    let run = &app.dashboard.active_run;
+    let mut stack: Vec<Line<'static>> = Vec::new();
+    if run_is_real(run) {
+        for block in ACTIVITY_STACK {
+            append_activity_block(&mut stack, app, block, app.ui_tick);
+        }
+    } else {
+        stack.push(Line::from(vec![Span::styled(
+            "  Ready — submit a prompt below.",
+            Style::default().fg(theme::MUTED),
+        )]));
+        stack.push(Line::from(""));
+    }
+    bottom_anchor_lines(stack, inner_height)
+}
+
+fn render_activity_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(theme::SUBTLE))
+        .title(Span::styled(
+            " Activity ",
+            Style::default()
+                .fg(theme::ACCENT_BLUE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let body = build_activity_content(app, inner.height);
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+const HEADER_ROWS: u16 = 2;
+const FOOTER_ROWS: u16 = 1;
+/// Max visible rows for the draft text inside the Query panel (grows upward as you type).
+const MAX_COMPOSER_DISPLAY_LINES: usize = 4;
+
+fn query_input_block() -> Block<'static> {
+    Block::default()
+        .borders(Borders::TOP)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(theme::ACCENT_BLUE))
+        .title(Span::styled(
+            " Query ",
+            Style::default()
+                .fg(theme::ACCENT_BLUE)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::INPUT_BG))
+}
+
+/// Wrap draft into at most `max_lines` rows. First row reserves two cells for the `› ` prefix.
+fn wrap_draft_chunks(draft: &str, inner_width: u16, max_lines: usize) -> Vec<String> {
+    let max_lines = max_lines.clamp(1, 64);
+    let w = inner_width.max(1) as usize;
+    let first_max = w.saturating_sub(2).max(1);
+    let cont_max = w.max(1);
+
+    if draft.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut row_len = 0usize;
+    let mut limit = first_max;
+
+    for ch in draft.chars() {
+        if rows.len() >= max_lines {
+            break;
+        }
+        let ch_w = 1usize;
+        if row_len + ch_w > limit && !current.is_empty() {
+            rows.push(std::mem::take(&mut current));
+            row_len = 0;
+            limit = cont_max;
+            if rows.len() >= max_lines {
+                break;
+            }
+        }
+        current.push(ch);
+        row_len += ch_w;
+    }
+
+    if rows.len() < max_lines {
+        rows.push(current);
+    }
+    rows.truncate(max_lines);
+    if rows.is_empty() {
+        vec![String::new()]
+    } else {
+        rows
+    }
+}
+
+fn build_query_panel_lines(app: &App, full_width: u16) -> (u16, Vec<Line<'static>>) {
+    let block = query_input_block();
+    let inner_w = block
+        .inner(Rect::new(0, 0, full_width, 255))
+        .width
+        .max(1);
+
+    let chunks = wrap_draft_chunks(
+        app.active_input_text(),
+        inner_w,
+        MAX_COMPOSER_DISPLAY_LINES,
+    );
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_last = i + 1 == chunks.len();
+        let body: String = if is_last {
+            format!("{chunk}▌")
+        } else {
+            chunk.clone()
+        };
+        if i == 0 {
+            lines.push(Line::from(vec![
+                Span::styled("› ", Style::default().fg(theme::ACCENT_PURPLE)),
+                Span::styled(body, Style::default().fg(theme::TEXT)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(theme::SUBTLE)),
+                Span::styled(body, Style::default().fg(theme::TEXT)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("Research prompt or ", Style::default().fg(theme::SUBTLE)),
+        Span::styled("/batch …  /exit", Style::default().fg(theme::ACCENT_PURPLE)),
+        Span::styled("  ·  ", Style::default().fg(theme::SUBTLE)),
+        Span::styled("F1", Style::default().fg(theme::ACCENT_BLUE)),
+        Span::styled(" help  ·  ", Style::default().fg(theme::SUBTLE)),
+        Span::styled("Enter", Style::default().fg(theme::ACCENT_BLUE)),
+        Span::styled(" submit", Style::default().fg(theme::MUTED)),
+    ]));
+
+    let inner_h = lines.len() as u16;
+    let total_h = inner_h.saturating_add(1);
+    (total_h, lines)
+}
+
 fn render(frame: &mut Frame, app: &App) {
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // header bar
-            Constraint::Min(14),   // main: pipeline + KG/Angles | Events
-            Constraint::Length(5), // query input
-            Constraint::Length(1), // footer
-        ])
-        .split(frame.area());
+    let full = frame.area();
+    let (query_h, query_lines) = build_query_panel_lines(app, full.width);
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(69), Constraint::Percentage(31)])
-        .split(root[1]);
+    let activity_h = full
+        .height
+        .saturating_sub(HEADER_ROWS + query_h + FOOTER_ROWS);
 
-    render_header(frame, root[0], app);
-    render_run_center(frame, main[0], app);
-    render_events(frame, main[1], app);
-    render_input(frame, root[2], app);
-    render_footer(frame, root[3], app);
+    let x = full.x;
+    let y = full.y;
+    let w = full.width;
+
+    render_header(frame, Rect::new(x, y, w, HEADER_ROWS), app);
+    render_activity_panel(
+        frame,
+        Rect::new(x, y + HEADER_ROWS, w, activity_h),
+        app,
+    );
+    render_input(
+        frame,
+        Rect::new(x, y + HEADER_ROWS + activity_h, w, query_h),
+        query_lines,
+    );
+    render_footer(
+        frame,
+        Rect::new(x, y + HEADER_ROWS + activity_h + query_h, w, FOOTER_ROWS),
+        app,
+    );
 
     if app.show_help {
         render_help(frame);
@@ -936,8 +1695,8 @@ fn render(frame: &mut Frame, app: &App) {
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let run = &app.dashboard.active_run;
     let stage_color = match run.stage.as_str() {
-        "idle" | "none" => Color::DarkGray,
-        _ => Color::Cyan,
+        "idle" | "none" | "queued" => theme::MUTED,
+        _ => theme::ACCENT_BLUE,
     };
     let refresh_label = app
         .last_refresh
@@ -951,450 +1710,115 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         })
         .unwrap_or_else(|| "never".to_string());
 
-    let spans = vec![
+    let brand = Line::from(vec![
+        Span::styled("›› ", theme::ACCENT_BLUE),
         Span::styled(
-            " MING ",
+            "MING",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled("run:", Style::default().fg(Color::DarkGray)),
+        Span::styled("  runtime TUI", Style::default().fg(theme::MUTED)),
         Span::styled(
-            format!(" {} ", run.run_id),
-            Style::default().fg(Color::White),
+            format!("     {}", app.data_source.source_label()),
+            Style::default().fg(theme::SUBTLE),
         ),
-        Span::styled("  stage:", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!(" {} ", run.stage),
-            Style::default().fg(stage_color),
-        ),
-        Span::styled("  elapsed:", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!(" {}s", run.elapsed_seconds),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled("  refreshed:", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!(" {} ", refresh_label),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled(
-            format!("  [{}]", app.data_source.source_label()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
+    ]);
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let meta = Line::from(vec![
+        Span::styled("run ", Style::default().fg(theme::MUTED)),
+        Span::styled(
+            truncate(&run.run_id, 18),
+            Style::default().fg(theme::TEXT),
+        ),
+        Span::styled("   stage ", Style::default().fg(theme::MUTED)),
+        Span::styled(run.stage.clone(), Style::default().fg(stage_color)),
+        Span::styled(
+            format!("   {}s", run.elapsed_seconds),
+            Style::default().fg(theme::TEXT),
+        ),
+        Span::styled("   ↻ ", Style::default().fg(theme::MUTED)),
+        Span::styled(refresh_label, Style::default().fg(theme::MUTED)),
+    ]);
+
+    frame.render_widget(Paragraph::new(vec![brand, meta]), area);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let spans = vec![
-        Span::styled(&app.last_status, Style::default().fg(Color::White)),
+        Span::styled(&app.last_status, Style::default().fg(theme::TEXT)),
         Span::styled(
-            "    q: quit   r: refresh   ?: help",
-            Style::default().fg(Color::DarkGray),
+            "     /exit quit   F1 help   Esc close help",
+            Style::default().fg(theme::SUBTLE),
         ),
     ];
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_run_center(frame: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4), // stage pipeline (2 text lines + 2 borders)
-            Constraint::Length(3), // progress gauge
-            Constraint::Min(8),    // KG pipeline + angles
-        ])
-        .split(area);
-
-    render_stage_pipeline(frame, chunks[0], app);
-    render_progress_gauge(frame, chunks[1], app);
-
-    let lower = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
-        .split(chunks[2]);
-
-    render_kg_pipeline(frame, lower[0], app);
-    render_angle_statuses(frame, lower[1], app);
-}
-
-fn render_stage_pipeline(frame: &mut Frame, area: Rect, app: &App) {
-    let stage_defs: &[(&str, &str)] = &[
-        ("scout", "scout"),
-        ("planning", "plan"),
-        ("research_parallel", "rsrch"),
-        ("kg_collect", "coll"),
-        ("kg_filter", "filt"),
-        ("kg_re", "re"),
-        ("entity_resolution", "resol"),
-        ("outline", "outln"),
-        ("write", "write"),
-    ];
-
-    let stages = &app.dashboard.active_run.stage_progress;
-    let mut label_spans: Vec<Span> = vec![];
-    let mut icon_spans: Vec<Span> = vec![];
-
-    for (i, (key, short)) in stage_defs.iter().enumerate() {
-        let status = stages
-            .iter()
-            .find(|s| &s.label == key)
-            .map(|s| s.status.as_str())
-            .unwrap_or("pending");
-
-        let (icon, color, bold) = match status {
-            "completed" => ("✓", Color::Green, false),
-            "running" => ("▶", Color::Yellow, true),
-            "failed" => ("✗", Color::Red, false),
-            _ => ("·", Color::DarkGray, false),
-        };
-
-        let w = 7usize;
-        let label_style = Style::default().fg(color);
-        let icon_style = if bold {
-            Style::default().fg(color).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(color)
-        };
-
-        label_spans.push(Span::styled(
-            format!("{:^width$}", short, width = w),
-            label_style,
-        ));
-        icon_spans.push(Span::styled(
-            format!("{:^width$}", icon, width = w),
-            icon_style,
-        ));
-
-        if i + 1 < stage_defs.len() {
-            let arrow_color = if status == "completed" {
-                Color::Green
-            } else {
-                Color::DarkGray
-            };
-            label_spans.push(Span::styled("─", Style::default().fg(Color::DarkGray)));
-            icon_spans.push(Span::styled("─", Style::default().fg(arrow_color)));
-        }
-    }
-
-    let text = vec![Line::from(label_spans), Line::from(icon_spans)];
+fn render_input(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    let block = query_input_block();
     frame.render_widget(
-        Paragraph::new(text).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    " Pipeline ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-        ),
-        area,
-    );
-}
-
-fn render_progress_gauge(frame: &mut Frame, area: Rect, app: &App) {
-    let run = &app.dashboard.active_run;
-    let ratio = run.progress_ratio.clamp(0.0, 1.0);
-    let pct = (ratio * 100.0).round() as u16;
-    let label = format!("{pct}%  ·  elapsed {}s", run.elapsed_seconds);
-
-    let color = if ratio >= 1.0 {
-        Color::Green
-    } else if ratio > 0.0 {
-        Color::Yellow
-    } else {
-        Color::DarkGray
-    };
-
-    frame.render_widget(
-        Gauge::default()
-            .block(Block::default().borders(Borders::ALL))
-            .gauge_style(Style::default().fg(color).bg(Color::DarkGray))
-            .ratio(ratio)
-            .label(label),
-        area,
-    );
-}
-
-fn render_input(frame: &mut Frame, area: Rect, app: &App) {
-    let text_with_cursor = format!("{}▌", app.active_input_text());
-    frame.render_widget(
-        Paragraph::new(text_with_cursor)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(
-                        " Query ",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .title_bottom(Line::from(vec![
-                        Span::styled(
-                            " Enter ",
-                            Style::default().fg(Color::Black).bg(Color::Yellow),
-                        ),
-                        Span::styled(" to submit  ", Style::default().fg(Color::DarkGray)),
-                    ])),
-            )
+        Paragraph::new(lines)
+            .block(block)
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
-fn render_kg_pipeline(frame: &mut Frame, area: Rect, app: &App) {
-    let stages = [
-        ("kg_collect", "Collect"),
-        ("kg_filter", "Filter"),
-        ("kg_re", "NER / RE"),
-        ("entity_resolution", "Resolve"),
-    ];
-
-    let lines = stages
-        .iter()
-        .flat_map(|(key, label)| {
-            let processed =
-                metric_value(app, &format!("{key}_processed")).unwrap_or_else(|| "-".to_string());
-            let total =
-                metric_value(app, &format!("{key}_total")).unwrap_or_else(|| "-".to_string());
-            let elapsed = metric_value(app, &format!("{key}_elapsed_seconds"))
-                .unwrap_or_else(|| "-".to_string());
-            let status = app
-                .dashboard
-                .active_run
-                .stage_progress
-                .iter()
-                .find(|s| &s.label == key)
-                .map(|s| s.status.as_str())
-                .unwrap_or("pending");
-
-            let (icon, color) = match status {
-                "completed" => ("✓", Color::Green),
-                "running" => ("▶", Color::Yellow),
-                "failed" => ("✗", Color::Red),
-                _ => ("·", Color::DarkGray),
-            };
-
-            vec![
-                Line::from(vec![
-                    Span::styled(
-                        icon,
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:<12}", label),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("{}/{}", processed, total),
-                        Style::default().fg(Color::White),
-                    ),
-                    Span::styled(
-                        format!("  {}s", elapsed),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]),
-                Line::from(""),
-            ]
-        })
-        .collect::<Vec<_>>();
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(
-                        " KG Pipeline ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-            )
-            .wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-fn render_angle_statuses(frame: &mut Frame, area: Rect, app: &App) {
-    let rows = app
-        .dashboard
-        .active_run
-        .angles
-        .iter()
-        .map(|angle| {
-            let (icon, color) = match angle.status.as_str() {
-                "completed" => ("✓", Color::Green),
-                "running" => ("▶", Color::Yellow),
-                "failed" => ("✗", Color::Red),
-                _ => ("·", Color::DarkGray),
-            };
-            Row::new(vec![
-                format!("{} {}", icon, angle.topic),
-                angle.stage.clone(),
-                format!("{}q {}s", angle.queries_total, angle.context_ids_total),
-            ])
-            .style(Style::default().fg(color))
-        })
-        .collect::<Vec<_>>();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(50),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ],
-    )
-    .header(
-        Row::new(vec!["Angle", "Stage", "Q/Src"])
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " Angles ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-    );
-
-    frame.render_widget(table, area);
-}
-
-fn render_events(frame: &mut Frame, area: Rect, app: &App) {
-    let lines = app
-        .dashboard
-        .recent_events
-        .iter()
-        .map(|entry| {
-            let (level_icon, color) = match entry.level.as_str() {
-                "error" => ("✗", Color::Red),
-                "warning" => ("!", Color::Yellow),
-                _ => ("·", Color::DarkGray),
-            };
-            // Show only time portion (last 8 chars) if the timestamp is long
-            let ts_short = if entry.ts.len() > 8 {
-                &entry.ts[entry.ts.len() - 8..]
-            } else {
-                &entry.ts
-            };
-            Line::from(vec![
-                Span::styled(
-                    level_icon,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{} ", ts_short),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("[{}]", entry.component),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::raw(" "),
-                Span::styled(entry.message.clone(), Style::default().fg(color)),
-                Span::styled(
-                    entry
-                        .stage
-                        .as_ref()
-                        .map(|s| format!(" ({s})"))
-                        .unwrap_or_default(),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
-        })
-        .collect::<Vec<_>>();
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(
-                        " Events ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-            )
-            .wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
 fn render_help(frame: &mut Frame) {
-    let area = centered_rect(46, 52, frame.area());
+    let area = centered_rect(52, 58, frame.area());
     frame.render_widget(Clear, area);
 
+    let key = |k: &str| {
+        Span::styled(
+            format!("  {:<11}", k),
+            Style::default()
+                .fg(theme::ACCENT_BLUE)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
     let help_text = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                "  q          ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("quit", Style::default().fg(Color::White)),
+            key("/exit"),
+            Span::styled("quit (submit with Enter)", Style::default().fg(theme::TEXT)),
         ]),
         Line::from(vec![
-            Span::styled(
-                "  r          ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("refresh now", Style::default().fg(Color::White)),
+            key("F1"),
+            Span::styled("toggle this help", Style::default().fg(theme::TEXT)),
         ]),
         Line::from(vec![
-            Span::styled(
-                "  ?          ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("toggle this help", Style::default().fg(Color::White)),
+            key("Esc"),
+            Span::styled("close help", Style::default().fg(theme::TEXT)),
         ]),
         Line::from(vec![
-            Span::styled(
-                "  Enter      ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("submit query", Style::default().fg(Color::White)),
+            key("Enter"),
+            Span::styled("submit prompt, /batch <path>, or /exit", Style::default().fg(theme::TEXT)),
         ]),
         Line::from(vec![
-            Span::styled(
-                "  Backspace  ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("delete last character", Style::default().fg(Color::White)),
+            key("Backspace"),
+            Span::styled("delete character", Style::default().fg(theme::TEXT)),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Type directly to compose a query.",
-            Style::default().fg(Color::DarkGray),
+            "  Batch file (/batch <path>):",
+            Style::default().fg(theme::ACCENT_BLUE),
         )]),
         Line::from(vec![Span::styled(
-            "  Auto-refreshes every 1.2s.",
-            Style::default().fg(Color::DarkGray),
+            "  JSON array, or JSONL with one object per line. Each object:",
+            Style::default().fg(theme::MUTED),
+        )]),
+        Line::from(vec![Span::styled(
+            r#"  {"id": <integer>, "prompt": "<research query>"}"#,
+            Style::default().fg(theme::TEXT),
+        )]),
+        Line::from(vec![Span::styled(
+            "  Example array: [ {\"id\": 1, \"prompt\": \"…\"}, {\"id\": 2, \"prompt\": \"…\"} ]",
+            Style::default().fg(theme::MUTED),
+        )]),
+        Line::from(vec![Span::styled(
+            "  Activity panel: current stage + subtasks; status line keeps your last action.",
+            Style::default().fg(theme::MUTED),
         )]),
     ];
 
@@ -1403,12 +1827,12 @@ fn render_help(frame: &mut Frame) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow))
+                    .border_type(BorderType::Plain)
+                    .border_style(Style::default().fg(theme::ACCENT_PURPLE))
                     .title(Span::styled(
-                        " Help ",
+                        " Help  ·  F1 / Esc ",
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
+                            .fg(theme::TEXT)
                             .add_modifier(Modifier::BOLD),
                     )),
             )

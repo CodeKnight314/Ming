@@ -607,6 +607,24 @@ class ResearchSubagent:
         return next_state
     
     def _think(self, state: ResearchSubagentState) -> Dict[str, Any]:
+        all_queries = state.get("all_queries") or []
+        max_queries = self._max_total_queries()
+        if len(all_queries) >= max_queries:
+            msg = "Max query budget reached; skipping synthesis."
+            next_state: Dict[str, Any] = {"history": state["history"] + [msg]}
+            self._update_observer(
+                {**state, **next_state},
+                stage="think",
+                status="running",
+                message=msg,
+                metrics={
+                    "skipped_for_query_budget": True,
+                    "max_total_queries": max_queries,
+                    "think_token_budget": 0,
+                },
+            )
+            return next_state
+
         self._update_observer(
             state,
             stage="think",
@@ -614,7 +632,6 @@ class ResearchSubagent:
             message="Synthesizing retrieved context.",
         )
         context_ids = state.get("context_ids") or []
-        all_queries = state.get("all_queries") or []
         topic = state.get("topic", "")
         max_context_len = self.config.get("max_context_len", 4096)
 
@@ -858,8 +875,6 @@ class AgentResult:
 
 
 class Agent:
-    # Match only well-formed tool calls whose payload is a JSON object.
-    # This avoids treating nested stray <tool_call> tags as the payload.
     _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
     def __init__(self, config: AgentConfig):

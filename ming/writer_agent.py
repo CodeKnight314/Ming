@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass
+import json
 import logging
 from pathlib import Path
 import re
@@ -408,6 +409,7 @@ class WriterAgent:
         constraints_paragraph: str,
         sections: list[SectionPlan],
         draft_output_path: str | None = None,
+        runtime_observer: Any = None,
     ) -> str:
         draft_path = self._resolve_draft_path(
             report_title=report_title,
@@ -418,6 +420,34 @@ class WriterAgent:
 
         section_results = [None] * len(sections)
         all_found_urls = []
+
+        progress_rows = [
+            {"title": section.title, "status": "running"} for section in sections
+        ]
+        if runtime_observer is not None and sections:
+            runtime_observer.update_run(
+                metrics={
+                    "write_sections_progress_json": json.dumps(
+                        progress_rows, ensure_ascii=False
+                    ),
+                    "write_sections_completed": 0,
+                    "write_sections_total": len(sections),
+                }
+            )
+
+        def _emit_write_progress() -> None:
+            if runtime_observer is None or not sections:
+                return
+            done = sum(1 for row in progress_rows if row["status"] == "done")
+            runtime_observer.update_run(
+                metrics={
+                    "write_sections_progress_json": json.dumps(
+                        progress_rows, ensure_ascii=False
+                    ),
+                    "write_sections_completed": done,
+                    "write_sections_total": len(sections),
+                }
+            )
 
         with ThreadPoolExecutor(max_workers=self.config.num_parallel_sections) as executor:
             future_to_idx = {
@@ -431,9 +461,12 @@ class WriterAgent:
                     section_id, markdown, urls = future.result()
                     section_results[idx] = markdown
                     all_found_urls.extend(urls)
+                    progress_rows[idx]["status"] = "done"
                 except Exception as e:
                     logger.error(f"Failed to write section {sections[idx].title}: {e}")
                     section_results[idx] = f"## {sections[idx].title}\n\n_Error writing this section._"
+                    progress_rows[idx]["status"] = "failed"
+                _emit_write_progress()
 
         # Filter out any None results
         valid_sections = [res for res in section_results if res is not None]

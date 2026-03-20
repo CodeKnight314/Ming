@@ -32,6 +32,59 @@ For evaluation purposes, we submit standard depth (Quarter) reports to DeepResea
 
 ## Installation
 
+- **Python** 3.11 or newer
+- **Docker** — required to create `./startup.sh` to run Redis locally 
+- **Rust** — needed for the runtime TUI
+
+```bash 
+cd /path/to/Ming
+uv venv 
+.venv/source/activate
+pip install -e .
+```
+
+## Usage
+
+Ming DeepResearch offers two modes of user interface to utilize the deepresearch agent: A Terminal User Interface with complete observability and a Command Line Interface for direct query.
+
+### 1. Running Terminal User Interface
+
+Run the following to start hosting the Redis Docker containers and python backend.
+```bash 
+bash startup.sh
+```
+In a separate terminal, activate the Rust-based Terminal User Interface:
+```bash
+cargo run --manifest-path runtime-tui/Cargo.toml -- --redis-url redis://127.0.0.1:6379/0 --namespace runtime
+```
+
+### 2. Running Command Line Interface
+
+Start Redis first (same as the TUI flow), e.g. `bash startup.sh`, then run the orchestrator from the repo root.
+
+**Single query** — runs one research job and prints elapsed time (minutes):
+
+```bash
+python -m ming.orchestrator --query "Write me a deep research report on the history of artificial intelligence"
+```
+
+Optional **`--config path/to/config.json`** (default: `config.json`) selects which Redis endpoints are cleared before the run.
+
+**Batch (DeepResearch Bench)** — read `deepresearch-bench/query_data/query.jsonl` (one JSON object per line with `id` and `prompt`). Each row runs sequentially. Reports are written as `id_<id>.md`. If `id_<id>.md` already exists under the submission directory, that row is skipped. Research Redis (context, queries store, KG) is flushed before **each** new query so runs do not share state.
+
+Default submission directory is `../submission` relative to the JSONL file (e.g. `query_data/query.jsonl` → `deepresearch-bench/submission/`).
+
+```bash
+python -m ming.orchestrator --jsonl deepresearch-bench/query_data/query.jsonl
+```
+
+Override the output folder:
+
+```bash
+python -m ming.orchestrator --jsonl deepresearch-bench/query_data/query.jsonl \
+  --submission-dir deepresearch-bench/submission
+```
+
 ## Limitations 
 
 ## Acknowledgements

@@ -37,8 +37,10 @@ def _is_retryable_openrouter_error(exc: BaseException) -> bool:
         "timeout",
         "readtimeout",
         "connecttimeout",
+        "connecterror",  # httpx: DNS / refused / etc. (common right after wake-from-sleep)
         "remoteprotocolerror",
         "apiconnectionerror",
+        "gaierror",  # getaddrinfo failed (e.g. nodename nor servname not known)
     }
     retryable_message_fragments = (
         "eof while parsing",
@@ -50,6 +52,10 @@ def _is_retryable_openrouter_error(exc: BaseException) -> bool:
         "temporarily unavailable",
         "timed out",
         "code': 5",  # OpenRouter occasionally returns {'error': {'code': 5xx, ...}}
+        "nodename nor servname",
+        "name or service not known",
+        "network is unreachable",
+        "no route to host",
     )
 
     for error in _iter_exception_chain(exc):

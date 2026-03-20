@@ -95,7 +95,9 @@ class RuntimeObserver:
     ) -> RunSnapshot:
         with self._lock:
             merged_metrics = dict(self._run_snapshot.metrics)
-            if metrics:
+            # Use `is not None` so we do not treat an empty dict as "skip";
+            # also distinguishes "omit" (None) from explicit empty updates.
+            if metrics is not None:
                 merged_metrics.update(metrics)
             self._run_snapshot = replace(
                 self._run_snapshot,
@@ -118,6 +120,28 @@ class RuntimeObserver:
             )
             self.emitter.write_run_snapshot(self._run_snapshot)
             return self._run_snapshot
+
+    def snapshot_terminated(
+        self,
+        *,
+        status: str,
+        finished_at: str,
+        error: str | None = None,
+        extra_metrics: dict[str, Any] | None = None,
+    ) -> RunSnapshot:
+        """Build a final run snapshot for Redis without dropping pipeline metrics."""
+        with self._lock:
+            merged_metrics = dict(self._run_snapshot.metrics)
+            if extra_metrics is not None:
+                merged_metrics.update(extra_metrics)
+            return replace(
+                self._run_snapshot,
+                status=status,
+                finished_at=finished_at,
+                stage_status=status,
+                error=error,
+                metrics=merged_metrics,
+            )
 
     def stage_transition(
         self,
