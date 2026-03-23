@@ -9,15 +9,14 @@
   </span>
 </p>
 
+<div align="center">
+  <img src="assets/TUI.png" alt="Ming DeepResearch runtime TUI" style="max-width: min(100%, 960px); height: auto; border-radius: 8px;" />
+</div>
+
 ## Overview
-Ming DeepResearch (明 — "clarity") is a multi-agent deep research system that leverages knowledge graphs to structure and manage greater volume of web-sourced content at competitive precision. Designed for flexibility, Ming supports a range of report depths while delivering high-quality results at feasible cost. For reference, a standard ~13,000-word report, for example, costs only $0.68 (including web search credits) with Ming DeepResearch while out-performing proprietary services.
+Ming DeepResearch (明 — "clarity") is a multi-agent deep research system that leverages knowledge graphs to structure and manage greater volume of web-sourced content at competitive precision. Designed for cost-effectiveness, Ming delivers high-quality deep research reports at feasible cost. For reference, a standard 13,000~15,000 word report costs Ming DeepResearch only $0.72~ (including web search credits) with Ming DeepResearch while out-performing robust proprietary services. Furthermore, Ming can be configured for more flexible deployment through varied configurations.
 
-Ming offers the following research modes to support varying research needs:
-- 🌒 Crescent — concise, focused brief
-- 🌓 Quarter — standard depth report
-- 🌕 Lunar — exhaustive deep dive
-
-For evaluation purposes, we submit standard depth (Quarter) reports to DeepResearch Bench for review. We use the following models to support Ming DeepResearch: 
+We use the following models to support Ming DeepResearch: 
 
 | Purpose               | Model                         |
 |-----------------------|-------------------------------|
@@ -29,6 +28,9 @@ For evaluation purposes, we submit standard depth (Quarter) reports to DeepResea
 
 
 ## Results
+Below are our results on [DeepResearch Bench](https://muset-ai-deepresearch-bench-leaderboard.hf.space/#):
+
+Total evaluation cost (including reruning specific tasks): $76.32
 
 ## Installation
 
@@ -36,11 +38,17 @@ For evaluation purposes, we submit standard depth (Quarter) reports to DeepResea
 - **Docker** — required to create `./startup.sh` to run Redis locally 
 - **Rust** — needed for the runtime TUI
 
+You can optionally set up a virtual environment before running the installation script
 ```bash 
 cd /path/to/Ming
 uv venv 
 .venv/source/activate
+```
+Run the following in terminal to complete installtion
+```bash
 pip install -e .
+python -m spacy download en_core_web_sm
+python -m spacy download zh_core_web_sm
 ```
 
 ## Usage
@@ -62,13 +70,9 @@ cargo run --manifest-path runtime-tui/Cargo.toml -- --redis-url redis://127.0.0.
 
 Start Redis first (same as the TUI flow), e.g. `bash startup.sh`, then run the orchestrator from the repo root.
 
-**Single query** — runs one research job and prints elapsed time (minutes):
-
 ```bash
 python -m ming.orchestrator --query "Write me a deep research report on the history of artificial intelligence"
 ```
-
-Optional **`--config path/to/config.json`** (default: `config.json`) selects which Redis endpoints are cleared before the run.
 
 **Batch (DeepResearch Bench)** — read `deepresearch-bench/query_data/query.jsonl` (one JSON object per line with `id` and `prompt`). Each row runs sequentially. Reports are written as `id_<id>.md`. If `id_<id>.md` already exists under the submission directory, that row is skipped. Research Redis (context, queries store, KG) is flushed before **each** new query so runs do not share state.
 
@@ -76,13 +80,6 @@ Default submission directory is `../submission` relative to the JSONL file (e.g.
 
 ```bash
 python -m ming.orchestrator --jsonl deepresearch-bench/query_data/query.jsonl
-```
-
-Override the output folder:
-
-```bash
-python -m ming.orchestrator --jsonl deepresearch-bench/query_data/query.jsonl \
-  --submission-dir deepresearch-bench/submission
 ```
 
 ## Limitations 

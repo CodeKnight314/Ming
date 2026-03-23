@@ -167,7 +167,7 @@ def create_ming_deep_research_config(
     writer_fallback_cfg = config.get("writer_fallback_model")
     if writer_fallback_cfg:
         writer_fallback_model = OpenRouterModelConfig(
-            model_name=writer_fallback_cfg.get("model_name", "qwen/qwen-plus-2025-07-28"),
+            model_name=writer_fallback_cfg.get("model_name", "qwen/qwen3.5-flash-02-23"),
             temperature=float(writer_fallback_cfg.get("temperature", 0.2)),
             max_tokens=int(writer_fallback_cfg.get("max_tokens", 4096)),
             site_url=writer_fallback_cfg.get("site_url"),
@@ -176,6 +176,32 @@ def create_ming_deep_research_config(
         )
     else:
         writer_fallback_model = None
+
+    outline_model_cfg = config.get("outline_model")
+    if outline_model_cfg:
+        outline_model = OpenRouterModelConfig(
+            model_name=outline_model_cfg.get("model_name", "qwen/qwen3.5-plus-02-15"),
+            temperature=float(outline_model_cfg.get("temperature", 0.2)),
+            max_tokens=int(outline_model_cfg.get("max_tokens", 8192)),
+            site_url=outline_model_cfg.get("site_url"),
+            site_name=outline_model_cfg.get("site_name"),
+            model_kwargs=outline_model_cfg.get("model_kwargs"),
+        )
+    else:
+        outline_model = None
+
+    outline_fallback_cfg = config.get("outline_fallback_model")
+    if outline_fallback_cfg:
+        outline_fallback_model = OpenRouterModelConfig(
+            model_name=outline_fallback_cfg.get("model_name", "qwen/qwen3.5-flash-02-23"),
+            temperature=float(outline_fallback_cfg.get("temperature", 0.2)),
+            max_tokens=int(outline_fallback_cfg.get("max_tokens", 8192)),
+            site_url=outline_fallback_cfg.get("site_url"),
+            site_name=outline_fallback_cfg.get("site_name"),
+            model_kwargs=outline_fallback_cfg.get("model_kwargs"),
+        )
+    else:
+        outline_fallback_model = None
 
     kg_cfg = config.get("kg_redis")
     if kg_cfg:
@@ -195,6 +221,8 @@ def create_ming_deep_research_config(
         kg_redis_config=kg_redis_config,
         writer_model=writer_model,
         writer_fallback_model=writer_fallback_model,
+        outline_model=outline_model,
+        outline_fallback_model=outline_fallback_model,
         draft_output_path=config.get("draft_output_path"),
         num_research_subagents=int(config.get("num_research_subagents", 3)),
         outline_max_context_ids=int(config.get("outline_max_context_ids", 64)),
@@ -204,8 +232,10 @@ def create_ming_deep_research_config(
         outline_source_char_limit=int(config.get("outline_source_char_limit", 3000)),
         source_min_tokens=int(config.get("source_min_tokens", 400)),
         research_source_budget=int(config.get("research_source_budget", 250)),
+        max_sources_threshold=int(config.get("max_sources_threshold", 160)),
         max_chunks_per_source=int(config.get("max_chunks_per_source", 8)),
         source_score_cutoff=float(config.get("source_score_cutoff", 4.5)),
+        writer_num_parallel_sections=int(config.get("writer_num_parallel_sections", 8)),
     )
 
 

@@ -11,10 +11,10 @@ from typing import Any, Dict, List, Tuple
 
 from tqdm import tqdm
 
-from ming.core.prompts import REPORT_SECTION_WRITER_PROMPT
+from ming.core.prompts import READABILITY_POLISH_PROMPT, REPORT_SECTION_WRITER_PROMPT
 from ming.core.reference_cleanup import canonicalize_url, normalize_markdown_references
 from ming.core.outline_parser import SectionPlan, strip_markdown_fences
-from ming.models.openrouter_model import OpenRouterModelConfig
+from ming.models.openrouter_model import OpenRouterModel, OpenRouterModelConfig
 from ming.subagent import Agent, AgentConfig
 from ming.tools.kg_query_tool import KGQueryTool
 
@@ -28,9 +28,10 @@ class WriterAgentConfig:
     model: OpenRouterModelConfig
     kg_query_tool: KGQueryTool
     fallback_model: OpenRouterModelConfig | None = None
+    polish_model: OpenRouterModelConfig | None = None
     draft_output_path: str | None = None
     max_iterations: int = 16
-    num_parallel_sections: int = 4
+    num_parallel_sections: int = 8
 
 
 class WriterAgent:
@@ -40,6 +41,7 @@ class WriterAgent:
 
     def __init__(self, config: WriterAgentConfig):
         self.config = config
+        self.polish_model = OpenRouterModel(config.polish_model) if config.polish_model is not None else None
 
     @staticmethod
     def _slugify_report_title(report_title: str) -> str:
@@ -78,14 +80,23 @@ class WriterAgent:
 
         return "\n\n".join(part for part in parts if part.strip()).strip() + "\n"
 
-    def _create_agent(self, model_config: OpenRouterModelConfig | None = None) -> Agent:
-        model_config = model_config or self.config.model
-        model_config.max_tokens = max(8192, model_config.max_tokens)
+    def _create_agent(
+        self,
+        model_config: OpenRouterModelConfig | None = None,
+        *,
+        chain_fallback: bool = True,
+    ) -> Agent:
+        primary = model_config or self.config.model
+        fallback_eff = (
+            self.config.fallback_model
+            if chain_fallback and self.config.fallback_model is not None
+            else None
+        )
 
         return Agent(
             AgentConfig(
-                model=model_config,
-                fallback_model=self.config.fallback_model,
+                model=primary,
+                fallback_model=fallback_eff,
                 system_prompt=REPORT_SECTION_WRITER_PROMPT,
                 tools=[self.config.kg_query_tool],
                 max_iterations=self.config.max_iterations,
@@ -106,7 +117,10 @@ class WriterAgent:
                 "Primary writer model failed; retrying with fallback model: %s",
                 exc,
             )
-            fallback_agent = self._create_agent(self.config.fallback_model)
+            fallback_agent = self._create_agent(
+                self.config.fallback_model,
+                chain_fallback=False,
+            )
             fallback_result = fallback_agent.run(prompt)
             return fallback_result.output, fallback_result.messages
 
@@ -266,6 +280,23 @@ class WriterAgent:
             cleaned = f"## {section_title}\n\n{cleaned}".strip()
 
         return cleaned.strip() + "\n"
+
+    def _polish_report(self, markdown: str) -> str:
+        """Run a readability polish pass over the assembled report.
+
+        Adds an executive summary, smooths transitions, cleans prose, and
+        normalizes citation formatting — without altering content or citations.
+        Returns the original markdown unchanged if no polish_model is configured
+        or if the model call fails.
+        """
+        if self.polish_model is None:
+            return markdown
+        prompt = READABILITY_POLISH_PROMPT.format(report=markdown)
+        try:
+            return self.polish_model.generate(prompt)
+        except Exception:
+            logger.exception("Readability polish pass failed; returning original report")
+            return markdown
 
     def _extract_urls_from_tool_results(self, messages: List[Dict[str, str]]) -> List[str]:
         urls: List[str] = []
@@ -476,6 +507,7 @@ class WriterAgent:
 
         final_markdown = self._report_markdown(report_title, processed_sections, citations)
         final_markdown = normalize_markdown_references(final_markdown)
+        final_markdown = self._polish_report(final_markdown)
         draft_path.write_text(final_markdown, encoding="utf-8")
 
         return final_markdown

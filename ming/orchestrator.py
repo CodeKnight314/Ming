@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from dataclasses import dataclass
 import html
 import json
@@ -8,7 +9,7 @@ import re
 from typing import Any, Dict, List
 
 from ming.core.config import create_queries_store_from_config, create_redis_from_config
-from ming.core.outline_parser import extract_outline_block, outline_to_sections
+from ming.core.outline_parser import SectionPlan, extract_outline_block, outline_to_sections
 from ming.core.redis import QueryStoreConfig, RedisDatabaseConfig
 from ming.scout import ScoutSubagent
 from ming.subagent import ResearchSubagent
@@ -17,11 +18,15 @@ from ming.tools.kg_query_tool import KGQueryTool
 from ming.writer_agent import WriterAgent, WriterAgentConfig
 from ming.extraction.ner_re_pipeline import NERREPipeline
 from ming.models import OpenRouterModel, OpenRouterModelConfig
-from ming.core.prompts import PLANNING_PROMPT, OUTLINE_PROMPT
+from ming.core.prompts import CRESCENT_OUTLINE_PROMPT, OUTLINE_PROMPT, PLANNING_PROMPT
 import xml.etree.ElementTree
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_OUTLINE_PLUS = "qwen/qwen3.5-plus-02-15"
+_DEFAULT_FLASH_FALLBACK = "qwen/qwen3.5-flash-02-23"
+
 
 @dataclass
 class MingDeepResearchConfig:
@@ -32,6 +37,9 @@ class MingDeepResearchConfig:
     kg_redis_config: RedisDatabaseConfig | dict[str, Any] | None = None
     writer_model: OpenRouterModelConfig | None = None
     writer_fallback_model: OpenRouterModelConfig | None = None
+    writer_polish_model: OpenRouterModelConfig | None = None
+    outline_model: OpenRouterModelConfig | None = None
+    outline_fallback_model: OpenRouterModelConfig | None = None
     draft_output_path: str | None = None
     num_research_subagents: int = 3
     outline_max_context_ids: int = 180
@@ -39,8 +47,10 @@ class MingDeepResearchConfig:
     outline_source_char_limit: int = 2500
     source_min_tokens: int = 400
     research_source_budget: int = 250
+    max_sources_threshold: int = 160
     max_chunks_per_source: int = 8
     source_score_cutoff: float = 4.5
+    writer_num_parallel_sections: int = 8
 
 
 class MingDeepResearch:
@@ -79,7 +89,7 @@ class MingDeepResearch:
         self.nerre_pipeline = NERREPipeline(
             re_config=OpenRouterModelConfig(model_name="google/gemma-3n-e4b-it", max_tokens=1024),
             kg_store=self.kg_store,
-            max_workers=32,
+            max_workers=16,
             source_score_cutoff=config.source_score_cutoff,
         )
 
@@ -109,31 +119,64 @@ class MingDeepResearch:
 
         self.planning_model = OpenRouterModel(
             OpenRouterModelConfig(
-                model_name="qwen/qwen3.5-plus-02-15",
+                model_name=_DEFAULT_OUTLINE_PLUS,
                 temperature=0.2,
                 max_tokens=1024,
             )
         )
 
-        self.outline_model = OpenRouterModel(
-            OpenRouterModelConfig(
-                model_name="qwen/qwen3.5-plus-02-15",
-                temperature=0.2,
-                max_tokens=8192,
+        outline_primary_cfg = config.outline_model or OpenRouterModelConfig(
+            model_name=_DEFAULT_OUTLINE_PLUS,
+            temperature=0.2,
+            max_tokens=8192,
+        )
+        outline_fallback_cfg = config.outline_fallback_model
+        if outline_fallback_cfg is None:
+            outline_fallback_cfg = OpenRouterModelConfig(
+                model_name=_DEFAULT_FLASH_FALLBACK,
+                temperature=outline_primary_cfg.temperature,
+                max_tokens=outline_primary_cfg.max_tokens,
+                site_url=outline_primary_cfg.site_url,
+                site_name=outline_primary_cfg.site_name,
+                model_kwargs=deepcopy(outline_primary_cfg.model_kwargs)
+                if outline_primary_cfg.model_kwargs
+                else None,
             )
+        self.outline_model = OpenRouterModel(outline_primary_cfg)
+        self.outline_fallback_model = OpenRouterModel(outline_fallback_cfg)
+
+        writer_primary_cfg = config.writer_model or OpenRouterModelConfig(
+            model_name=_DEFAULT_OUTLINE_PLUS,
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        writer_fallback_cfg = config.writer_fallback_model
+        if writer_fallback_cfg is None:
+            writer_fallback_cfg = OpenRouterModelConfig(
+                model_name=_DEFAULT_FLASH_FALLBACK,
+                temperature=writer_primary_cfg.temperature,
+                max_tokens=writer_primary_cfg.max_tokens,
+                site_url=writer_primary_cfg.site_url,
+                site_name=writer_primary_cfg.site_name,
+                model_kwargs=deepcopy(writer_primary_cfg.model_kwargs)
+                if writer_primary_cfg.model_kwargs
+                else None,
+            )
+
+        writer_polish_cfg = config.writer_polish_model or OpenRouterModelConfig(
+            model_name=_DEFAULT_OUTLINE_PLUS,
+            temperature=0.2,
+            max_tokens=32000,
         )
 
         self.writer_agent = WriterAgent(
             WriterAgentConfig(
-                model=config.writer_model
-                or OpenRouterModelConfig(
-                    model_name="qwen/qwen3.5-plus-02-15",
-                    temperature=0.2,
-                    max_tokens=4096,
-                ),
-                fallback_model=config.writer_fallback_model,
+                model=writer_primary_cfg,
+                fallback_model=writer_fallback_cfg,
+                polish_model=writer_polish_cfg,
                 kg_query_tool=self.kg_query_tool,
                 draft_output_path=config.draft_output_path,
+                num_parallel_sections=config.writer_num_parallel_sections,
             )
         )
 
@@ -234,6 +277,23 @@ class MingDeepResearch:
             ]
         )
         return model.generate(prompt).strip()
+
+    def _generate_outline_with_system_prompt(self, system_prompt: str, user_input: str) -> str:
+        """Outline LLM call: primary model first, then flash fallback on any failure."""
+        try:
+            return self._generate_with_system_prompt(
+                self.outline_model, system_prompt, user_input
+            )
+        except Exception as exc:
+            fb_name = self.outline_fallback_model.config.model_name
+            logger.warning(
+                "Primary outline model failed; retrying with fallback model=%s: %s",
+                fb_name,
+                exc,
+            )
+            return self._generate_with_system_prompt(
+                self.outline_fallback_model, system_prompt, user_input
+            )
 
     @staticmethod
     def _strip_markdown_fences(raw_output: str) -> str:
@@ -380,6 +440,52 @@ class MingDeepResearch:
         )
         return "".join(parts)
 
+    def _plan_research(self, query: str, scout_result: Dict[str, Any]) -> Dict[str, Any]:
+        del query
+        planning_result = self._generate_with_system_prompt(
+            self.planning_model,
+            PLANNING_PROMPT,
+            scout_result["landscape_brief"],
+        )
+        return self._parse_planning_result(planning_result)
+
+    def _run_planning_stage(self, query: str, scout_result: Dict[str, Any]) -> Dict[str, Any]:
+        self._stage_started("planning", "Planning stage started.")
+        logger.info("Planning research angles...")
+        import time
+
+        start_time = time.time()
+        research_plan = self._plan_research(query, scout_result)
+        end_time = time.time()
+        logger.info(f"Planning research angles took {round(end_time - start_time, 2)} seconds")
+        self._stage_completed(
+            "planning",
+            "Planning stage completed.",
+            metrics={
+                "elapsed_seconds": round(end_time - start_time, 3),
+                "research_angle_count": len(research_plan.get("research_angles", [])),
+            },
+        )
+        return research_plan
+
+    def _outline_system_prompt(self) -> str:
+        return OUTLINE_PROMPT
+
+    def _finalize_report(
+        self,
+        query: str,
+        report_title: str,
+        constraints_paragraph: str,
+        sections: List[SectionPlan],
+    ) -> str:
+        del query
+        return self.writer_agent.run(
+            report_title=report_title,
+            constraints_paragraph=constraints_paragraph,
+            sections=sections,
+            draft_output_path=self.config.draft_output_path,
+            runtime_observer=self.runtime_observer,
+        )
 
     def run(self, query: str) -> str:
         # 1. Scout the web for information
@@ -400,27 +506,9 @@ class MingDeepResearch:
             },
         )
         
-        # 2. Plan the research
-        self._stage_started("planning", "Planning stage started.")
-        logger.info("Planning research angles...")
-        start_time = time.time()
-        planning_result = self._generate_with_system_prompt(
-            self.planning_model,
-            PLANNING_PROMPT,
-            scout_result["landscape_brief"],
-        )
-        research_plan = self._parse_planning_result(planning_result)
-        end_time = time.time()
-        logger.info(f"Planning research angles took {round(end_time - start_time, 2)} seconds")
-        self._stage_completed(
-            "planning",
-            "Planning stage completed.",
-            metrics={
-                "elapsed_seconds": round(end_time - start_time, 3),
-                "research_angle_count": len(research_plan.get("research_angles", [])),
-            },
-        )
-        
+        # 2. Plan the research (subclasses may skip the LLM planner, e.g. Crescent)
+        research_plan = self._run_planning_stage(query, scout_result)
+
         # 3. Parallel Execution of Research Subagents
         for index, angle in enumerate(research_plan["research_angles"], start=1):
             angle["_angle_id"] = f"angle_{index}"
@@ -587,6 +675,7 @@ class MingDeepResearch:
             collected_sources,
             min_tokens=self.config.source_min_tokens,
             source_budget=self.config.research_source_budget,
+            max_sources_threshold=self.config.max_sources_threshold,
         )
         retained_context_ids = [source.context_id for source in retained_sources if source.context_id]
         logger.info(
@@ -702,9 +791,8 @@ class MingDeepResearch:
         constraints_paragraph = ""
         sections = []
         for attempt in range(1, max_iterations + 1):
-            outline_result = self._generate_with_system_prompt(
-                self.outline_model,
-                OUTLINE_PROMPT,
+            outline_result = self._generate_outline_with_system_prompt(
+                self._outline_system_prompt(),
                 initial_context,
             )
             try:
@@ -762,12 +850,11 @@ class MingDeepResearch:
             )
         logger.info("Writing iterative markdown report...")
         start_time = time.time()
-        report_markdown = self.writer_agent.run(
-            report_title=report_title,
-            constraints_paragraph=constraints_paragraph,
-            sections=sections,
-            draft_output_path=self.config.draft_output_path,
-            runtime_observer=self.runtime_observer,
+        report_markdown = self._finalize_report(
+            query,
+            report_title,
+            constraints_paragraph,
+            sections,
         )
         end_time = time.time()
         logger.info(f"Writing report took {round(end_time - start_time, 2)} seconds")
@@ -781,6 +868,161 @@ class MingDeepResearch:
         )
 
         return report_markdown
+
+class MingDeepResearchCrescent(MingDeepResearch):
+    """Crescent (fast brief): scout → one research iteration per subagent → KG → flat outline → single-pass write.
+
+    See ``plans.md``: no LLM planning decomposition, ``max_iterations=0`` on research (one query/fetch/synthesize
+    round, decide node exits without an LLM), flat 3–4 section outline, monolithic writer with KG tool (~4–6k words).
+    """
+
+    _CRESCENT_WRITER_MIN_TOKENS = 16_384
+
+    def __init__(self, config: MingDeepResearchConfig, runtime_observer: Any | None = None):
+        super().__init__(config, runtime_observer)
+
+        crescent_sub_cfg = dict(self.subagent_config)
+        crescent_sub_cfg["max_iterations"] = 0
+        n_workers = min(2, max(1, config.num_research_subagents))
+        self.research_subagents = [
+            ResearchSubagent(
+                config=crescent_sub_cfg,
+                database=self.context_redis,
+                query_store=self.queries_redis,
+            )
+            for _ in range(n_workers)
+        ]
+
+        base_writer = config.writer_model or OpenRouterModelConfig(
+            model_name=_DEFAULT_OUTLINE_PLUS,
+            temperature=0.2,
+            max_tokens=self._CRESCENT_WRITER_MIN_TOKENS,
+        )
+        prev_max = base_writer.max_tokens if base_writer.max_tokens is not None else 4096
+        writer_primary_cfg = OpenRouterModelConfig(
+            model_name=base_writer.model_name,
+            temperature=base_writer.temperature,
+            max_tokens=max(self._CRESCENT_WRITER_MIN_TOKENS, prev_max),
+            site_url=base_writer.site_url,
+            site_name=base_writer.site_name,
+            model_kwargs=deepcopy(base_writer.model_kwargs) if base_writer.model_kwargs else None,
+        )
+        writer_fallback_cfg = config.writer_fallback_model
+        if writer_fallback_cfg is None:
+            writer_fallback_cfg = OpenRouterModelConfig(
+                model_name=_DEFAULT_FLASH_FALLBACK,
+                temperature=writer_primary_cfg.temperature,
+                max_tokens=writer_primary_cfg.max_tokens,
+                site_url=writer_primary_cfg.site_url,
+                site_name=writer_primary_cfg.site_name,
+                model_kwargs=deepcopy(writer_primary_cfg.model_kwargs)
+                if writer_primary_cfg.model_kwargs
+                else None,
+            )
+        else:
+            fb_max = writer_fallback_cfg.max_tokens if writer_fallback_cfg.max_tokens is not None else 4096
+            writer_fallback_cfg = OpenRouterModelConfig(
+                model_name=writer_fallback_cfg.model_name,
+                temperature=writer_fallback_cfg.temperature,
+                max_tokens=max(self._CRESCENT_WRITER_MIN_TOKENS, fb_max),
+                site_url=writer_fallback_cfg.site_url,
+                site_name=writer_fallback_cfg.site_name,
+                model_kwargs=deepcopy(writer_fallback_cfg.model_kwargs)
+                if writer_fallback_cfg.model_kwargs
+                else None,
+            )
+
+        self.writer_agent = WriterAgent(
+            WriterAgentConfig(
+                model=writer_primary_cfg,
+                fallback_model=writer_fallback_cfg,
+                kg_query_tool=self.kg_query_tool,
+                draft_output_path=config.draft_output_path,
+                num_parallel_sections=1,
+                max_iterations=24,
+            )
+        )
+
+    def _plan_research(self, query: str, scout_result: Dict[str, Any]) -> Dict[str, Any]:
+        del scout_result
+        n = len(self.research_subagents)
+        angles: List[Dict[str, str]] = []
+        if n <= 1:
+            angles.append(
+                {
+                    "topic": (
+                        f"User question:\n{query.strip()}\n\n"
+                        "Success Criteria: In a single retrieval-and-synthesis round, answer the full question. "
+                        "Use the scout brief for scope, entities, and language. Cover the main landscape themes; "
+                        "prefer accuracy and clear sourcing over exhaustive breadth.\n\n"
+                        "Constraints: One pass only—do not assume follow-up iterations."
+                    ),
+                    "success_criteria": "Single-pass synthesis of the entire user question.",
+                }
+            )
+        else:
+            angles.append(
+                {
+                    "topic": (
+                        f"User question:\n{query.strip()}\n\n"
+                        "Success Criteria: Establish definitions, core facts, and the dominant narrative from sources.\n\n"
+                        "Constraints: One pass only; align with the scout brief."
+                    ),
+                    "success_criteria": "Foundational coverage.",
+                }
+            )
+            angles.append(
+                {
+                    "topic": (
+                        f"User question:\n{query.strip()}\n\n"
+                        "Success Criteria: Highlight disagreements, limits of evidence, counterarguments, and recent "
+                        "developments that are not yet settled.\n\n"
+                        "Constraints: One pass only; complement the other angle without redundant queries when possible."
+                    ),
+                    "success_criteria": "Critical and divergent coverage.",
+                }
+            )
+        return {"research_angles": angles[:n], "constraints": ""}
+
+    def _run_planning_stage(self, query: str, scout_result: Dict[str, Any]) -> Dict[str, Any]:
+        self._stage_started(
+            "planning",
+            "Crescent: skipping planner LLM; framing full-topic research angle(s).",
+        )
+        import time
+
+        start_time = time.time()
+        research_plan = self._plan_research(query, scout_result)
+        end_time = time.time()
+        self._stage_completed(
+            "planning",
+            "Crescent research framing completed.",
+            metrics={
+                "elapsed_seconds": round(end_time - start_time, 3),
+                "research_angle_count": len(research_plan.get("research_angles", [])),
+            },
+        )
+        return research_plan
+
+    def _outline_system_prompt(self) -> str:
+        return CRESCENT_OUTLINE_PROMPT
+
+    def _finalize_report(
+        self,
+        query: str,
+        report_title: str,
+        constraints_paragraph: str,
+        sections: List[SectionPlan],
+    ) -> str:
+        return self.writer_agent.run_crescent_monolith(
+            user_query=query,
+            report_title=report_title,
+            constraints_paragraph=constraints_paragraph,
+            sections=sections,
+            draft_output_path=self.config.draft_output_path,
+            runtime_observer=self.runtime_observer,
+        )
+
 
 if __name__ == "__main__":
     import argparse

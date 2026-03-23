@@ -29,10 +29,16 @@
     "max_tokens": 8192
   },
   "writer_fallback_model": {
-    "model_name": "qwen/qwen-plus-2025-07-28",
+    "model_name": "qwen/qwen3.5-flash-02-23",
     "temperature": 0.2,
     "max_tokens": 8192
   },
+  "writer_polish_model": {
+    "model_name": "qwen/qwen3.5-plus-02-15",
+    "temperature": 0.2,
+    "max_tokens": 32000
+  },
+  "writer_num_parallel_sections": 8,
   "scout": {
     "model": {
       "provider": "openrouter",

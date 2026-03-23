@@ -277,6 +277,59 @@ You must follow a strict two-phase process for this entire section:
 """
 
 
+READABILITY_POLISH_PROMPT = """
+You are a senior editorial reviewer improving the final presentation of a completed deep research report.
+Your goal is to make the report easier to scan, easier to follow, and easier to digest while preserving the original meaning, evidence, and conclusions.
+The report to polish is:
+<Report>
+{report}
+</Report>
+
+Optimize for the following qualities:
+
+1. **Structure and Scannability**
+   - Use a clean markdown hierarchy: # for the title, ## for major sections, ### for subsections
+   - Ensure section and subsection headings are specific and descriptive
+   - Improve local flow within sections so ideas appear in a logical order
+   - Add short transition sentences ONLY where they genuinely improve continuity (for example, between sections that shift topics abruptly)
+   - Break up visually dense passages so the report is easier to skim
+   - Identify repeated statistics (such as recurring population figures, asset thresholds, percentage breakdowns, or source citations that appear multiple times across sections) and consolidate them into a single “数据来源与定义” box or table placed near the top (modeled after the reference report’s Table 3 style). Replace later mentions with inline cross-references such as “（见数据来源框）”.
+
+2. **Language Fluency**
+   - Rewrite awkward, verbose, or overly passive sentences for clarity and directness
+   - Split overly long sentences (especially complex definitional or comparative sentences) into shorter ones or convert them into bullets / side-by-side tables
+   - Remove filler phrases, empty preambles, and repetitive framing
+   - Ensure most paragraphs begin with a clear controlling idea or topic sentence
+   - Prefer concise, professional prose over ornamental wording
+
+3. **Data Presentation**
+   - When information is hard to digest in prose, convert it into bullets, numbered lists, or simple markdown tables
+   - Convert any dense, multi-item bullet lists describing hierarchical frameworks, classifications, or multi-level models into clean markdown tables (recommended columns: Level/Category | Definition & Threshold | Estimated Scale) for better scannability
+   - Add a standardized “数据截止日期” footnote or small box immediately after the title / inside the “数据来源与定义” box that clearly states source cut-off dates and ensures all year references and rounding are consistent thereafter.
+   - Use lists for enumerations, comparisons, stepwise processes, grouped findings, or repeated entity-level facts
+   - Use tables only when they materially improve comparison across a small number of dimensions
+   - Preserve every fact, statistic, qualifier, and citation when reformatting prose into lists or tables
+   - Do not force tables where prose is already clearer
+
+4. **Citation and Reference Integrity**
+   - Preserve all citation numbers and source mappings
+   - Keep every claim supported by the same citation(s) as in the original
+   - Inline citations may be repositioned within the same rewritten sentence, bullet, or paragraph if needed for natural reading, but do not change which claim they support
+   - Preserve the References section and all [N]: URL entries exactly as-is
+
+CRITICAL RULES:
+- Do NOT add new facts, analysis, claims, or conclusions
+- Do NOT remove substantive content
+- Do NOT weaken precision, nuance, uncertainty, or caveats
+- Do NOT change the report's language; keep it in the same language as the input
+- Do NOT invent transitions, bullets, or tables that introduce information not already present
+- Make the smallest set of edits necessary to produce a noticeably clearer report
+
+Before writing, silently evaluate where the report is hardest to digest (especially repetition fatigue, long definitional sentences, dense classification lists, data-year inconsistency, and abrupt section jumps), then revise those areas first.
+Return ONLY the refined report.
+"""
+
+
 def build_prompt(prompt: str, images: Optional[List[str]] = None) -> str:
     """Build a prompt for model generation. Returns the prompt string.
     For simple text-only prompts, use directly with model.generate(prompt, ...).

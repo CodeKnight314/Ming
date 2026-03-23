@@ -16,6 +16,8 @@ from langchain_openrouter import ChatOpenRouter
 
 from ming.models.base_model import BaseModel
 
+load_dotenv(override=True)
+
 logger = logging.getLogger(__name__)
 
 _MAX_INVOKE_ATTEMPTS = 5
@@ -151,8 +153,6 @@ def _build_chat_openrouter(
 
 class OpenRouterModel(BaseModel):
     def __init__(self, config: Optional[OpenRouterModelConfig] = None):
-        # Prefer repo-local .env over any pre-exported shell variables.
-        load_dotenv(override=True)
         self.config = config or OpenRouterModelConfig()
         self.prompt = ""
 
