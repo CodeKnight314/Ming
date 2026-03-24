@@ -245,6 +245,7 @@ def create_ming_deep_research_config(
         max_chunks_per_source=int(config.get("max_chunks_per_source", 8)),
         source_score_cutoff=float(config.get("source_score_cutoff", 4.5)),
         writer_num_parallel_sections=int(config.get("writer_num_parallel_sections", 8)),
+        writer_enable_stitch_pass=bool(config.get("writer_enable_stitch_pass", True)),
     )
 
 

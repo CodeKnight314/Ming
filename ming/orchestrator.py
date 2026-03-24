@@ -52,6 +52,7 @@ class MingDeepResearchConfig:
     max_chunks_per_source: int = 8
     source_score_cutoff: float = 4.5
     writer_num_parallel_sections: int = 8
+    writer_enable_stitch_pass: bool = True
 
 
 class MingDeepResearch:
@@ -174,6 +175,7 @@ class MingDeepResearch:
                 kg_query_tool=self.kg_query_tool,
                 draft_output_path=config.draft_output_path,
                 num_parallel_sections=config.writer_num_parallel_sections,
+                enable_stitch_pass=config.writer_enable_stitch_pass,
             )
         )
 

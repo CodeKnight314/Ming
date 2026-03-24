@@ -11,9 +11,15 @@ from typing import Any, Dict, List, Tuple
 
 from tqdm import tqdm
 
-from ming.core.prompts import READABILITY_POLISH_PROMPT, REPORT_SECTION_WRITER_PROMPT
+from ming.core.prompts import (
+    CONCLUSION_SECTION_WRITER_PROMPT,
+    INTRO_SECTION_WRITER_PROMPT,
+    READABILITY_POLISH_PROMPT,
+    REPORT_SECTION_WRITER_PROMPT,
+    STITCH_TRANSITIONS_PROMPT,
+)
 from ming.core.reference_cleanup import canonicalize_url, normalize_markdown_references
-from ming.core.outline_parser import SectionPlan, strip_markdown_fences
+from ming.core.outline_parser import SectionPlan, outline_toc_summary, strip_markdown_fences
 from ming.models.openrouter_model import OpenRouterModel, OpenRouterModelConfig
 from ming.subagent import Agent, AgentConfig
 from ming.tools.kg_query_tool import KGQueryTool
@@ -22,6 +28,7 @@ from ming.tools.think_tool import ThinkTool
 logger = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"https?://[^\s\]\"'>,)]+")
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
 
 
 @dataclass
@@ -33,6 +40,7 @@ class WriterAgentConfig:
     draft_output_path: str | None = None
     max_iterations: int = 18
     num_parallel_sections: int = 8
+    enable_stitch_pass: bool = True
 
 
 class WriterAgent:
@@ -43,6 +51,8 @@ class WriterAgent:
     def __init__(self, config: WriterAgentConfig):
         self.config = config
         self.polish_model = OpenRouterModel(config.polish_model) if config.polish_model is not None else None
+        # Lightweight single-shot calls (stitch pass) share the primary writer model config.
+        self._stitch_llm = OpenRouterModel(config.model)
 
     @staticmethod
     def _slugify_report_title(report_title: str) -> str:
@@ -86,6 +96,7 @@ class WriterAgent:
         model_config: OpenRouterModelConfig | None = None,
         *,
         chain_fallback: bool = True,
+        system_prompt: str | None = None,
     ) -> Agent:
         primary = model_config or self.config.model
         fallback_eff = (
@@ -93,21 +104,27 @@ class WriterAgent:
             if chain_fallback and self.config.fallback_model is not None
             else None
         )
+        sp = system_prompt if system_prompt is not None else REPORT_SECTION_WRITER_PROMPT
 
         return Agent(
             AgentConfig(
                 model=primary,
                 fallback_model=fallback_eff,
-                system_prompt=REPORT_SECTION_WRITER_PROMPT,
+                system_prompt=sp,
                 tools=[self.config.kg_query_tool, ThinkTool()],
                 max_iterations=self.config.max_iterations,
                 max_tool_calls_per_turn=8,
             )
         )
 
-    def _run_writer_prompt_with_fallback(self, prompt: str) -> Tuple[str, List[Dict[str, str]]]:
+    def _run_writer_prompt_with_fallback(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str | None = None,
+    ) -> Tuple[str, List[Dict[str, str]]]:
         """Run the writer model; on failure retry with fallback model."""
-        agent = self._create_agent(self.config.model)
+        agent = self._create_agent(self.config.model, system_prompt=system_prompt)
         try:
             result = agent.run(prompt)
             return result.output, result.messages
@@ -121,6 +138,7 @@ class WriterAgent:
             fallback_agent = self._create_agent(
                 self.config.fallback_model,
                 chain_fallback=False,
+                system_prompt=system_prompt,
             )
             fallback_result = fallback_agent.run(prompt)
             return fallback_result.output, fallback_result.messages
@@ -261,6 +279,8 @@ class WriterAgent:
         canonical_entities_context: str,
         audit_feedback: str = "",
         user_query: str = "",
+        report_structure_context: str = "",
+        additional_context: str = "",
     ) -> str:
         constraints = constraints_paragraph.strip() or "No additional constraints provided."
 
@@ -282,11 +302,26 @@ class WriterAgent:
                 f"{user_query.strip()}\n\n"
             )
 
+        structure_block = ""
+        if report_structure_context.strip():
+            structure_block = (
+                f"### Report Structure (full outline)\n"
+                f"Use this to understand where this section sits in the narrative, what precedes/follows it, "
+                f"and to align tone and hand-offs (without duplicating other sections' detailed content).\n\n"
+                f"{report_structure_context.strip()}\n\n"
+            )
+
+        extra_block = ""
+        if additional_context.strip():
+            extra_block = f"{additional_context.strip()}\n\n"
+
         return (
             f"## TASK ASSIGNMENT\n"
             f"Report Title: {report_title}\n"
             f"Section to Write: {section.title}\n\n"
             f"{user_query_section}"
+            f"{structure_block}"
+            f"{extra_block}"
             f"### Section Context & Instructions\n"
             f"{section.instruction}\n\n"
             f"### Subsection Guidelines\n"
@@ -372,6 +407,73 @@ class WriterAgent:
         for url in _URL_RE.findall(markdown):
             counts[canonicalize_url(url)] += 1
         return counts
+
+    @staticmethod
+    def _strip_top_level_heading_and_following_blank(body: str) -> str:
+        """Remove the first `## ...` line and leading blank lines."""
+        lines = body.splitlines()
+        i = 0
+        while i < len(lines) and not lines[i].strip().startswith("## "):
+            i += 1
+        if i < len(lines):
+            i += 1
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        return "\n".join(lines[i:]).strip()
+
+    @classmethod
+    def _first_paragraph_excerpt(cls, markdown: str, *, max_sentences: int = 2) -> str:
+        body = cls._strip_top_level_heading_and_following_blank(markdown)
+        if not body:
+            return ""
+        paragraphs: List[str] = []
+        buf: List[str] = []
+        for line in body.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                if buf:
+                    paragraphs.append(" ".join(buf).strip())
+                    buf = []
+                if paragraphs:
+                    break
+            elif stripped.startswith("#"):
+                # Skip subsection headers; keep scanning for first prose block.
+                continue
+            else:
+                buf.append(stripped)
+        if buf and not paragraphs:
+            paragraphs.append(" ".join(buf).strip())
+        text = paragraphs[0] if paragraphs else ""
+        sents = [s for s in _SENT_SPLIT_RE.split(text) if s.strip()]
+        return " ".join(sents[:max_sentences]).strip()
+
+    @classmethod
+    def _last_paragraph_excerpt(cls, markdown: str, *, max_sentences: int = 2) -> str:
+        body = cls._strip_top_level_heading_and_following_blank(markdown)
+        if not body:
+            return ""
+        paragraphs: List[str] = []
+        buf: List[str] = []
+        for line in body.splitlines():
+            if not line.strip():
+                if buf:
+                    paragraphs.append(" ".join(buf).strip())
+                    buf = []
+            elif line.lstrip().startswith("### "):
+                if buf:
+                    paragraphs.append(" ".join(buf).strip())
+                    buf = []
+            elif line.lstrip().startswith("## "):
+                if buf:
+                    paragraphs.append(" ".join(buf).strip())
+                    buf = []
+            else:
+                buf.append(line.strip())
+        if buf:
+            paragraphs.append(" ".join(buf).strip())
+        text = paragraphs[-1] if paragraphs else ""
+        sents = [s for s in _SENT_SPLIT_RE.split(text) if s.strip()]
+        return " ".join(sents[-max_sentences:]).strip() if sents else ""
 
     def _search_initial_evidence(
         self, section: SectionPlan
@@ -496,6 +598,10 @@ class WriterAgent:
         constraints_paragraph: str,
         section: SectionPlan,
         user_query: str = "",
+        *,
+        report_structure_context: str = "",
+        additional_context: str = "",
+        system_prompt: str | None = None,
     ) -> Tuple[str, str, List[str]]:
         initial_evidence, subsection_grouping = self._search_initial_evidence(section)
         initial_evidence_text = self._format_evidence_cards(
@@ -523,8 +629,13 @@ class WriterAgent:
             initial_evidence_text=initial_evidence_text,
             canonical_entities_context=canonical_entities_context,
             user_query=user_query,
+            report_structure_context=report_structure_context,
+            additional_context=additional_context,
         )
-        output, messages = self._run_writer_prompt_with_fallback(prompt)
+        output, messages = self._run_writer_prompt_with_fallback(
+            prompt,
+            system_prompt=system_prompt,
+        )
         urls = sorted(set(surfaced_urls + self._extract_urls_from_tool_results(messages)))
 
         markdown = self._clean_section_markdown(
@@ -547,8 +658,13 @@ class WriterAgent:
                 canonical_entities_context=canonical_entities_context,
                 audit_feedback=audit_feedback,
                 user_query=user_query,
+                report_structure_context=report_structure_context,
+                additional_context=additional_context,
             )
-            rerun_output, rerun_messages = self._run_writer_prompt_with_fallback(rerun_prompt)
+            rerun_output, rerun_messages = self._run_writer_prompt_with_fallback(
+                rerun_prompt,
+                system_prompt=system_prompt,
+            )
             urls = sorted(set(urls + self._extract_urls_from_tool_results(rerun_messages)))
             markdown = self._clean_section_markdown(
                 report_title=report_title,
@@ -557,6 +673,94 @@ class WriterAgent:
             )
 
         return section.section_id, markdown, urls
+
+    @staticmethod
+    def _build_intro_body_excerpt_context(
+        body_sections: list[SectionPlan],
+        body_markdowns: list[str],
+    ) -> str:
+        lines = [
+            "### Drafted body sections — opening excerpts",
+            "Align the introduction with these specific themes (do not copy verbatim; foreshadow and frame).",
+        ]
+        for sec, md in zip(body_sections, body_markdowns):
+            ex = WriterAgent._first_paragraph_excerpt(md)
+            lines.append(f"- **{sec.title}**: {ex or '(no excerpt)'}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_conclusion_body_excerpt_context(
+        body_sections: list[SectionPlan],
+        body_markdowns: list[str],
+    ) -> str:
+        lines = [
+            "### Drafted body sections — closing excerpts",
+            "Synthesize across these threads; do not contradict them.",
+        ]
+        for sec, md in zip(body_sections, body_markdowns):
+            ex = WriterAgent._last_paragraph_excerpt(md)
+            lines.append(f"- **{sec.title}**: {ex or '(no excerpt)'}")
+        return "\n".join(lines)
+
+    def _generate_transitions(
+        self,
+        ordered_markdowns: list[str],
+        ordered_titles: list[str],
+        user_query: str = "",
+    ) -> list[str]:
+        """Return one transition string per boundary (len == len(sections) - 1)."""
+        n = len(ordered_markdowns)
+        if n < 2:
+            return []
+        boundary_parts: list[str] = []
+        for i in range(n - 1):
+            tail = self._last_paragraph_excerpt(ordered_markdowns[i])
+            head = self._first_paragraph_excerpt(ordered_markdowns[i + 1])
+            boundary_parts.append(
+                f"Boundary {i + 1}: after «{ordered_titles[i]}» → before «{ordered_titles[i + 1]}»\n"
+                f"  End of earlier section: {tail or '(empty)'}\n"
+                f"  Start of next section: {head or '(empty)'}\n"
+            )
+        boundaries_block = "\n".join(boundary_parts)
+        prompt = STITCH_TRANSITIONS_PROMPT.format(boundaries_block=boundaries_block)
+        if user_query.strip():
+            prompt = (
+                f"User request (context only; do not add new factual claims):\n{user_query.strip()}\n\n"
+                + prompt
+            )
+        try:
+            raw = self._stitch_llm.generate(prompt)
+        except Exception:
+            logger.exception("Stitch transitions generation failed; skipping bridges")
+            return [""] * (n - 1)
+
+        cleaned = strip_markdown_fences(raw.strip())
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            logger.warning("Stitch transitions JSON parse failed; skipping bridges")
+            return [""] * (n - 1)
+        if not isinstance(data, list):
+            return [""] * (n - 1)
+        out = [str(x).strip() for x in data]
+        need = n - 1
+        if len(out) < need:
+            out.extend([""] * (need - len(out)))
+        return out[:need]
+
+    @staticmethod
+    def _interleave_sections_and_transitions(
+        sections: list[str],
+        transitions: list[str],
+    ) -> list[str]:
+        if not sections:
+            return []
+        out: list[str] = [sections[0]]
+        for i in range(1, len(sections)):
+            if i - 1 < len(transitions) and transitions[i - 1].strip():
+                out.append(transitions[i - 1].strip())
+            out.append(sections[i])
+        return out
 
     def _process_citations(
         self,
@@ -599,14 +803,32 @@ class WriterAgent:
             draft_output_path=draft_output_path or self.config.draft_output_path,
         )
 
-        logger.info(f"Writing {len(sections)} sections in parallel (max_workers={self.config.num_parallel_sections})...")
+        section_results: list[str | None] = [None] * len(sections)
+        all_found_urls: list[str] = []
 
-        section_results = [None] * len(sections)
-        all_found_urls = []
+        use_three_phase = len(sections) >= 3
+        progress_rows = [{"title": section.title, "status": "pending"} for section in sections]
 
-        progress_rows = [
-            {"title": section.title, "status": "running"} for section in sections
-        ]
+        if use_three_phase:
+            last_i = len(sections) - 1
+            for i in range(len(sections)):
+                if i == 0 or i == last_i:
+                    progress_rows[i]["status"] = "pending"
+                else:
+                    progress_rows[i]["status"] = "running"
+            logger.info(
+                "Writing report: body sections in parallel, then intro/conclusion with body context "
+                "(stitch=%s)...",
+                self.config.enable_stitch_pass,
+            )
+        else:
+            for row in progress_rows:
+                row["status"] = "running"
+            logger.info(
+                f"Writing {len(sections)} sections in parallel "
+                f"(max_workers={self.config.num_parallel_sections})..."
+            )
+
         if runtime_observer is not None and sections:
             runtime_observer.update_run(
                 metrics={
@@ -632,27 +854,106 @@ class WriterAgent:
                 }
             )
 
-        with ThreadPoolExecutor(max_workers=self.config.num_parallel_sections) as executor:
-            future_to_idx = {
-                executor.submit(self._write_section, report_title, constraints_paragraph, section, user_query): i
-                for i, section in enumerate(sections)
-            }
+        def _record_result(idx: int, markdown: str, urls: List[str]) -> None:
+            section_results[idx] = markdown
+            all_found_urls.extend(urls)
+            progress_rows[idx]["status"] = "done"
+            _emit_write_progress()
 
-            for future in tqdm(as_completed(future_to_idx), total=len(sections), desc="Writing Sections"):
-                idx = future_to_idx[future]
-                try:
-                    section_id, markdown, urls = future.result()
-                    section_results[idx] = markdown
-                    all_found_urls.extend(urls)
-                    progress_rows[idx]["status"] = "done"
-                except Exception as e:
-                    logger.error(f"Failed to write section {sections[idx].title}: {e}")
-                    section_results[idx] = f"## {sections[idx].title}\n\n_Error writing this section._"
-                    progress_rows[idx]["status"] = "failed"
-                _emit_write_progress()
+        def _record_failure(idx: int, exc: Exception) -> None:
+            logger.error(f"Failed to write section {sections[idx].title}: {exc}")
+            section_results[idx] = f"## {sections[idx].title}\n\n_Error writing this section._"
+            progress_rows[idx]["status"] = "failed"
+            _emit_write_progress()
 
-        # Filter out any None results
-        valid_sections = [res for res in section_results if res is not None]
+        def _write_at_index(idx: int, **kwargs: Any) -> Tuple[str, str, List[str]]:
+            return self._write_section(
+                report_title,
+                constraints_paragraph,
+                sections[idx],
+                user_query,
+                report_structure_context=outline_toc_summary(sections, current_index=idx),
+                **kwargs,
+            )
+
+        if use_three_phase:
+            body_indices = list(range(1, len(sections) - 1))
+            with ThreadPoolExecutor(max_workers=self.config.num_parallel_sections) as executor:
+                future_to_idx = {
+                    executor.submit(_write_at_index, idx): idx for idx in body_indices
+                }
+                for future in tqdm(
+                    as_completed(future_to_idx),
+                    total=len(body_indices),
+                    desc="Writing body sections",
+                ):
+                    idx_p = future_to_idx[future]
+                    try:
+                        _sid, md, urls = future.result()
+                        _record_result(idx_p, md, urls)
+                    except Exception as e:
+                        _record_failure(idx_p, e)
+
+            body_markdowns = [section_results[i] or "" for i in body_indices]
+            body_plans = [sections[i] for i in body_indices]
+
+            # Introduction (body-aware)
+            intro_i = 0
+            progress_rows[intro_i]["status"] = "running"
+            _emit_write_progress()
+            intro_ctx = self._build_intro_body_excerpt_context(body_plans, body_markdowns)
+            try:
+                _sid, md, urls = _write_at_index(
+                    intro_i,
+                    additional_context=intro_ctx,
+                    system_prompt=INTRO_SECTION_WRITER_PROMPT,
+                )
+                _record_result(intro_i, md, urls)
+            except Exception as e:
+                _record_failure(intro_i, e)
+
+            # Conclusion (body-aware)
+            concl_i = len(sections) - 1
+            progress_rows[concl_i]["status"] = "running"
+            _emit_write_progress()
+            concl_ctx = self._build_conclusion_body_excerpt_context(body_plans, body_markdowns)
+            try:
+                _sid, md, urls = _write_at_index(
+                    concl_i,
+                    additional_context=concl_ctx,
+                    system_prompt=CONCLUSION_SECTION_WRITER_PROMPT,
+                )
+                _record_result(concl_i, md, urls)
+            except Exception as e:
+                _record_failure(concl_i, e)
+
+        else:
+            with ThreadPoolExecutor(max_workers=self.config.num_parallel_sections) as executor:
+                future_to_idx = {
+                    executor.submit(_write_at_index, i): i
+                    for i in range(len(sections))
+                }
+                for future in tqdm(as_completed(future_to_idx), total=len(sections), desc="Writing Sections"):
+                    idx = future_to_idx[future]
+                    try:
+                        _section_id, markdown, urls = future.result()
+                        _record_result(idx, markdown, urls)
+                    except Exception as e:
+                        _record_failure(idx, e)
+
+        # Filter out any None results (should not happen after failures handled)
+        base_ordered = [res if res is not None else "" for res in section_results]
+        titles_ordered = [s.title for s in sections]
+
+        if (
+            self.config.enable_stitch_pass
+            and len(base_ordered) >= 2
+            and any(base_ordered)
+        ):
+            transitions = self._generate_transitions(base_ordered, titles_ordered, user_query)
+            valid_sections = self._interleave_sections_and_transitions(base_ordered, transitions)
+        else:
+            valid_sections = base_ordered
 
         # Process citations: Convert [URL] to [N] and build reference list
         processed_sections, citations = self._process_citations(valid_sections, all_found_urls)

@@ -49,6 +49,7 @@
     "max_new_tokens": 32000
   },
   "writer_num_parallel_sections": 8,
+  "writer_enable_stitch_pass": true,
   "scout": {
     "model": {
       "provider": "openrouter",

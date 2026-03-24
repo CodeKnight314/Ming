@@ -191,3 +191,30 @@ def outline_to_section_lists(outline_xml: str) -> tuple[str, str, list[list[str]
         for section in sections
     ]
     return report_title, constraints_paragraph, section_lists
+
+
+def outline_toc_summary(sections: list[SectionPlan], *, current_index: int | None = None) -> str:
+    """Format the full outline as compact text for section writers (narrative awareness).
+
+    When *current_index* is set, labels that section as **YOU ARE HERE** so the model
+    knows its position relative to the rest of the report.
+    """
+    if not sections:
+        return "(No sections in outline.)"
+
+    lines: list[str] = []
+    for i, sec in enumerate(sections):
+        marker = ""
+        if current_index is not None and i == current_index:
+            marker = " **← YOU ARE HERE**"
+        depth = sec.depth_target.strip()
+        depth_line = f"    Depth target: {depth}" if depth else ""
+        lines.append(f"{i + 1}. [{sec.section_id}] {sec.title}{marker}")
+        if depth_line:
+            lines.append(depth_line)
+        for sub in sec.subsections:
+            desc = sub.description.strip()
+            desc_part = f" — {desc}" if desc else ""
+            lines.append(f"   - {sub.subsection_id} {sub.title}{desc_part}")
+        lines.append("")
+    return "\n".join(lines).strip()
