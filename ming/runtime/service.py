@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,7 +54,7 @@ class RuntimeServiceConfig:
     max_queue_depth: int = 100
     command_block_ms: int = 1000
     command_count: int = 10
-    start_from_latest: bool = True
+    start_from_latest: bool = False
 
 
 @dataclass
@@ -118,7 +119,7 @@ def default_job_executor_factory(
 
         prompt_id = job.payload.get("prompt_id")
         if prompt_id is not None:
-            draft_name = f"runtime_{job.job_id}_{prompt_id}.md"
+            draft_name = f"id_{prompt_id}.md"
         else:
             draft_name = f"runtime_{job.job_id}.md"
         config.draft_output_path = str(Path("reports") / draft_name)
@@ -282,6 +283,16 @@ class RuntimeService:
             )
         )
 
+        if job.type == JobType.BATCH_PARENT:
+            logger.info("Finishing BATCH_PARENT job %s instantly.", job.job_id)
+            job.status = RuntimeStatus.COMPLETED
+            job.finished_at = self.now_fn()
+            self.emitter.write_job_snapshot(job.to_snapshot())
+            self._active_job_id = None
+            self._write_queue_snapshot()
+            time.sleep(0.1)  # small delay so TUI can catch the transition
+            return True
+
         try:
             result = self.executor(job) or {}
             report_markdown = str(result.get("report_markdown", "") or "")
@@ -388,10 +399,12 @@ class RuntimeService:
         self._accept_command(command)
 
     def _accept_command(self, command: RuntimeCommand) -> None:
+        logger.info("Accepting command %s (type: %s)", command.command_id, command.type.value)
         queued_depth = len(self._queue) + (1 if self._active_job_id else 0)
         planned_job_count = 1
         if command.type.value == "run_batch":
             planned_job_count = len(command.payload.items) + 1
+            logger.info("Batch command detected with %d items", len(command.payload.items))
         if queued_depth + planned_job_count > self.config.max_queue_depth:
             detail = (
                 f"Queue full: current depth {queued_depth}, "
@@ -452,7 +465,7 @@ class RuntimeService:
             },
             parent_job_id=None,
             position=None,
-            queue_job=False,
+            queue_job=True,
         )
 
         for index, item in enumerate(command.payload.items, start=1):

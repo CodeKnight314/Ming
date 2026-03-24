@@ -111,7 +111,7 @@ def _exception_chain_summary(exc: BaseException) -> str:
 class OpenRouterModelConfig:
     model_name: str = "openai/gpt-4o"
     temperature: float = 0.0
-    max_tokens: Optional[int] = None
+    max_new_tokens: Optional[int] = None
     site_url: Optional[str] = None
     site_name: Optional[str] = None
     model_kwargs: Optional[dict[str, Any]] = None
@@ -122,7 +122,7 @@ def _build_chat_openrouter(
     api_key: str,
     *,
     temperature: float = 0.0,
-    max_tokens: Optional[int] = None,
+    max_new_tokens: Optional[int] = None,
     model_kwargs: Optional[dict[str, Any]] = None,
     site_url: Optional[str] = None,
     site_name: Optional[str] = None,
@@ -133,7 +133,8 @@ def _build_chat_openrouter(
         "model": model,
         "api_key": api_key,
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        # LangChain / OpenRouter HTTP field name remains max_tokens.
+        "max_tokens": max_new_tokens,
     }
     if site_url:
         kwargs["app_url"] = site_url
@@ -166,7 +167,7 @@ class OpenRouterModel(BaseModel):
             model=self.config.model_name,
             api_key=api_key,
             temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
+            max_new_tokens=self.config.max_new_tokens,
             model_kwargs=self.config.model_kwargs,
             site_url=self.config.site_url,
             site_name=self.config.site_name,
@@ -229,9 +230,16 @@ class OpenRouterModel(BaseModel):
         )
         start_time = time.time()
         last_exception: Exception | None = None
+        invoke_kw: dict[str, Any] = {}
+        max_out = generation_kwargs.get("max_new_tokens")
+        if max_out is not None:
+            invoke_kw["max_tokens"] = int(max_out)
+
         for attempt in range(1, _MAX_INVOKE_ATTEMPTS + 1):
             try:
-                response = self.client.invoke([HumanMessage(content=content)])
+                response = self.client.invoke(
+                    [HumanMessage(content=content)], **invoke_kw
+                )
                 break
             except Exception as exc:
                 last_exception = exc

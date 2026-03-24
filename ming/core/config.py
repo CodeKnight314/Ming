@@ -23,6 +23,15 @@ def load_config(path: str | Path = "config.json") -> dict[str, Any]:
         return json.load(f)
 
 
+def _config_max_new_tokens(cfg: dict[str, Any], default: int | None) -> int | None:
+    """Read generation cap; prefer max_new_tokens, accept legacy max_tokens."""
+    if cfg.get("max_new_tokens") is not None:
+        return int(cfg["max_new_tokens"])
+    if cfg.get("max_tokens") is not None:
+        return int(cfg["max_tokens"])
+    return default
+
+
 def create_redis_from_config(
     config: dict[str, Any] | RedisDatabaseConfig | None = None,
 ) -> RedisDatabase:
@@ -156,7 +165,7 @@ def create_ming_deep_research_config(
         writer_model = OpenRouterModelConfig(
             model_name=writer_model_cfg.get("model_name", "qwen/qwen3.5-plus-02-15"),
             temperature=float(writer_model_cfg.get("temperature", 0.2)),
-            max_tokens=int(writer_model_cfg.get("max_tokens", 4096)),
+            max_new_tokens=_config_max_new_tokens(writer_model_cfg, 4096),
             site_url=writer_model_cfg.get("site_url"),
             site_name=writer_model_cfg.get("site_name"),
             model_kwargs=writer_model_cfg.get("model_kwargs"),
@@ -169,7 +178,7 @@ def create_ming_deep_research_config(
         writer_fallback_model = OpenRouterModelConfig(
             model_name=writer_fallback_cfg.get("model_name", "qwen/qwen3.5-flash-02-23"),
             temperature=float(writer_fallback_cfg.get("temperature", 0.2)),
-            max_tokens=int(writer_fallback_cfg.get("max_tokens", 4096)),
+            max_new_tokens=_config_max_new_tokens(writer_fallback_cfg, 4096),
             site_url=writer_fallback_cfg.get("site_url"),
             site_name=writer_fallback_cfg.get("site_name"),
             model_kwargs=writer_fallback_cfg.get("model_kwargs"),
@@ -182,7 +191,7 @@ def create_ming_deep_research_config(
         outline_model = OpenRouterModelConfig(
             model_name=outline_model_cfg.get("model_name", "qwen/qwen3.5-plus-02-15"),
             temperature=float(outline_model_cfg.get("temperature", 0.2)),
-            max_tokens=int(outline_model_cfg.get("max_tokens", 8192)),
+            max_new_tokens=_config_max_new_tokens(outline_model_cfg, 8192),
             site_url=outline_model_cfg.get("site_url"),
             site_name=outline_model_cfg.get("site_name"),
             model_kwargs=outline_model_cfg.get("model_kwargs"),
@@ -195,7 +204,7 @@ def create_ming_deep_research_config(
         outline_fallback_model = OpenRouterModelConfig(
             model_name=outline_fallback_cfg.get("model_name", "qwen/qwen3.5-flash-02-23"),
             temperature=float(outline_fallback_cfg.get("temperature", 0.2)),
-            max_tokens=int(outline_fallback_cfg.get("max_tokens", 8192)),
+            max_new_tokens=_config_max_new_tokens(outline_fallback_cfg, 8192),
             site_url=outline_fallback_cfg.get("site_url"),
             site_name=outline_fallback_cfg.get("site_name"),
             model_kwargs=outline_fallback_cfg.get("model_kwargs"),

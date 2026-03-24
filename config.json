@@ -23,30 +23,47 @@
   "outline_max_context_ids": 200,
   "outline_context_token_budget": 196000,
   "outline_source_char_limit": 3000,
+  "outline_model": {
+    "model_name": "qwen/qwen3.5-plus-02-15",
+    "temperature": 0.2,
+    "max_new_tokens": 8192
+  },
+  "outline_fallback_model": {
+    "model_name": "xiaomi/mimo-v2-pro",
+    "temperature": 0.2,
+    "max_new_tokens": 8192
+  },
   "writer_model": {
     "model_name": "qwen/qwen3.5-plus-02-15",
     "temperature": 0.2,
-    "max_tokens": 8192
+    "max_new_tokens": 8192
   },
   "writer_fallback_model": {
-    "model_name": "qwen/qwen3.5-flash-02-23",
+    "model_name": "xiaomi/mimo-v2-pro",
     "temperature": 0.2,
-    "max_tokens": 8192
+    "max_new_tokens": 8192
   },
   "writer_polish_model": {
-    "model_name": "qwen/qwen3.5-plus-02-15",
+    "model_name": "xiaomi/mimo-v2-pro",
     "temperature": 0.2,
-    "max_tokens": 32000
+    "max_new_tokens": 32000
   },
   "writer_num_parallel_sections": 8,
   "scout": {
     "model": {
       "provider": "openrouter",
+      "model_name": "nvidia/nemotron-3-super-120b-a12b",
+      "temperature": 0.2,
+      "max_new_tokens": 8192
+    },
+    "fallback_model": {
+      "provider": "openrouter",
       "model_name": "qwen/qwen3.5-flash-02-23",
       "temperature": 0.2,
-      "max_tokens": 512
+      "max_new_tokens": 8192
     },
-    "max_new_tokens": 512,
+    "landscape_max_new_tokens": 4096,
+    "max_new_tokens": 4096,
     "temperature": 0.2,
     "do_sample": false,
     "use_cache": true,
@@ -67,17 +84,17 @@
   "subagent": {
     "model": {
       "provider": "openrouter",
-      "model_name": "qwen/qwen3.5-flash-02-23",
+      "model_name": "nvidia/nemotron-3-super-120b-a12b",
       "temperature": 0.7,
-      "max_tokens": 1024
+      "max_new_tokens": 8192
     },
     "fallback_model": {
       "provider": "openrouter",
-      "model_name": "qwen/qwen3.5-plus-02-15",
+      "model_name": "qwen/qwen3.5-flash-02-23",
       "temperature": 0.4,
-      "max_tokens": 1024
+      "max_new_tokens": 8192
     },
-    "max_new_tokens": 1024,
+    "max_new_tokens": 8192,
     "temperature": 0.7,
     "do_sample": true,
     "use_cache": true,
@@ -87,8 +104,8 @@
     "max_open_urls_per_iteration": 10,
     "max_url_wait_seconds": 8,
     "max_iterations": 6,
-    "recursion_limit": 40,
-    "max_total_queries": 10,
+    "recursion_limit": 60,
+    "max_total_queries": 20,
     "tool_configs": [
       {
         "type": "web_search_tool",

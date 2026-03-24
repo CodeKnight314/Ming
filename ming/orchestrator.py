@@ -18,14 +18,15 @@ from ming.tools.kg_query_tool import KGQueryTool
 from ming.writer_agent import WriterAgent, WriterAgentConfig
 from ming.extraction.ner_re_pipeline import NERREPipeline
 from ming.models import OpenRouterModel, OpenRouterModelConfig
-from ming.core.prompts import CRESCENT_OUTLINE_PROMPT, OUTLINE_PROMPT, PLANNING_PROMPT
+from ming.core.prompts import OUTLINE_PROMPT, PLANNING_PROMPT
 import xml.etree.ElementTree
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_OUTLINE_PLUS = "qwen/qwen3.5-plus-02-15"
+_DEFAULT_RESEARCH_PRIMARY = "nvidia/nemotron-3-super-120b-a12b"
 _DEFAULT_FLASH_FALLBACK = "qwen/qwen3.5-flash-02-23"
+_DEFAULT_WRITER_PRIMARY = "qwen/qwen3.5-plus-02-15"
 
 
 @dataclass
@@ -87,7 +88,9 @@ class MingDeepResearch:
         self.kg_store = KGRedisStore(self.kg_redis, ERConfig(threshold=0.5, num_perm=128))
         self.kg_query_tool = KGQueryTool(self.kg_store)
         self.nerre_pipeline = NERREPipeline(
-            re_config=OpenRouterModelConfig(model_name="google/gemma-3n-e4b-it", max_tokens=1024),
+            re_config=OpenRouterModelConfig(
+                model_name="google/gemma-3n-e4b-it", max_new_tokens=1024
+            ),
             kg_store=self.kg_store,
             max_workers=16,
             source_score_cutoff=config.source_score_cutoff,
@@ -119,23 +122,23 @@ class MingDeepResearch:
 
         self.planning_model = OpenRouterModel(
             OpenRouterModelConfig(
-                model_name=_DEFAULT_OUTLINE_PLUS,
+                model_name=_DEFAULT_RESEARCH_PRIMARY,
                 temperature=0.2,
-                max_tokens=1024,
+                max_new_tokens=8192,
             )
         )
 
         outline_primary_cfg = config.outline_model or OpenRouterModelConfig(
-            model_name=_DEFAULT_OUTLINE_PLUS,
+            model_name=_DEFAULT_RESEARCH_PRIMARY,
             temperature=0.2,
-            max_tokens=8192,
+            max_new_tokens=8192,
         )
         outline_fallback_cfg = config.outline_fallback_model
         if outline_fallback_cfg is None:
             outline_fallback_cfg = OpenRouterModelConfig(
                 model_name=_DEFAULT_FLASH_FALLBACK,
                 temperature=outline_primary_cfg.temperature,
-                max_tokens=outline_primary_cfg.max_tokens,
+                max_new_tokens=outline_primary_cfg.max_new_tokens,
                 site_url=outline_primary_cfg.site_url,
                 site_name=outline_primary_cfg.site_name,
                 model_kwargs=deepcopy(outline_primary_cfg.model_kwargs)
@@ -146,16 +149,16 @@ class MingDeepResearch:
         self.outline_fallback_model = OpenRouterModel(outline_fallback_cfg)
 
         writer_primary_cfg = config.writer_model or OpenRouterModelConfig(
-            model_name=_DEFAULT_OUTLINE_PLUS,
+            model_name=_DEFAULT_WRITER_PRIMARY,
             temperature=0.2,
-            max_tokens=4096,
+            max_new_tokens=4096,
         )
         writer_fallback_cfg = config.writer_fallback_model
         if writer_fallback_cfg is None:
             writer_fallback_cfg = OpenRouterModelConfig(
                 model_name=_DEFAULT_FLASH_FALLBACK,
                 temperature=writer_primary_cfg.temperature,
-                max_tokens=writer_primary_cfg.max_tokens,
+                max_new_tokens=writer_primary_cfg.max_new_tokens,
                 site_url=writer_primary_cfg.site_url,
                 site_name=writer_primary_cfg.site_name,
                 model_kwargs=deepcopy(writer_primary_cfg.model_kwargs)
@@ -163,17 +166,11 @@ class MingDeepResearch:
                 else None,
             )
 
-        writer_polish_cfg = config.writer_polish_model or OpenRouterModelConfig(
-            model_name=_DEFAULT_OUTLINE_PLUS,
-            temperature=0.2,
-            max_tokens=32000,
-        )
-
         self.writer_agent = WriterAgent(
             WriterAgentConfig(
                 model=writer_primary_cfg,
                 fallback_model=writer_fallback_cfg,
-                polish_model=writer_polish_cfg,
+                polish_model=None,
                 kg_query_tool=self.kg_query_tool,
                 draft_output_path=config.draft_output_path,
                 num_parallel_sections=config.writer_num_parallel_sections,
@@ -328,10 +325,21 @@ class MingDeepResearch:
         return "".join(parts)
 
     @staticmethod
+    def _extract_research_plan_xml(fragment: str) -> str:
+        """If the model added chatter before/after, pull the research_plan element only."""
+        cleaned = MingDeepResearch._strip_markdown_fences(fragment.strip())
+        match = re.search(
+            r"<research_plan\b[^>]*>.*?</research_plan>",
+            cleaned,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        return match.group(0).strip() if match else cleaned
+
+    @staticmethod
     def _parse_planning_result(planning_result: str) -> Dict[str, Any]:
         # Parse the planning result using xml.etree.ElementTree
         raw_output = planning_result
-        cleaned = MingDeepResearch._strip_markdown_fences(raw_output)
+        cleaned = MingDeepResearch._extract_research_plan_xml(raw_output)
 
         try:
             root = xml.etree.ElementTree.fromstring(cleaned)
@@ -383,7 +391,7 @@ class MingDeepResearch:
             return 0
         return max(1, (len(text) + cls._CHARS_PER_TOKEN_ESTIMATE - 1) // cls._CHARS_PER_TOKEN_ESTIMATE)
 
-    def _build_outline_context(self, context_ids: List[str], scout_brief: str) -> str:
+    def _build_outline_context(self, context_ids: List[str], scout_brief: str, user_query: str = "") -> str:
         budget_tokens = max(1, self.config.outline_context_token_budget)
         budget_chars = budget_tokens * self._CHARS_PER_TOKEN_ESTIMATE
         max_context_ids = max(0, self.config.outline_max_context_ids)
@@ -391,6 +399,11 @@ class MingDeepResearch:
 
         parts = ["---Truncated context---\n\n"]
         used_chars = len(parts[0])
+
+        if user_query.strip():
+            query_section = f"Original user query:\n{user_query.strip()}\n\n"
+            parts.append(query_section)
+            used_chars += len(query_section)
 
         scout_section = f"Scout brief:\n{(scout_brief or '').strip()}"
         if scout_section.strip():
@@ -441,13 +454,30 @@ class MingDeepResearch:
         return "".join(parts)
 
     def _plan_research(self, query: str, scout_result: Dict[str, Any]) -> Dict[str, Any]:
-        del query
+        brief = (scout_result.get("landscape_brief") or "").strip()
+        user_block = (
+            f"Original user topic (match this language in your angle topics):\n{query.strip()}\n\n"
+            f"Scout brief (landscape and evidence orientation):\n{brief}\n"
+        )
         planning_result = self._generate_with_system_prompt(
             self.planning_model,
             PLANNING_PROMPT,
-            scout_result["landscape_brief"],
+            user_block,
         )
-        return self._parse_planning_result(planning_result)
+        parsed = self._parse_planning_result(planning_result)
+        if not parsed.get("research_angles"):
+            fb_name = self.outline_fallback_model.config.model_name
+            logger.warning(
+                "Planning produced no parseable angles; retrying with outline fallback model=%s",
+                fb_name,
+            )
+            planning_result = self._generate_with_system_prompt(
+                self.outline_fallback_model,
+                PLANNING_PROMPT,
+                user_block,
+            )
+            parsed = self._parse_planning_result(planning_result)
+        return parsed
 
     def _run_planning_stage(self, query: str, scout_result: Dict[str, Any]) -> Dict[str, Any]:
         self._stage_started("planning", "Planning stage started.")
@@ -477,23 +507,29 @@ class MingDeepResearch:
         report_title: str,
         constraints_paragraph: str,
         sections: List[SectionPlan],
+        draft_output_path: str | None = None,
     ) -> str:
-        del query
+        path = (
+            draft_output_path
+            if draft_output_path is not None
+            else self.config.draft_output_path
+        )
         return self.writer_agent.run(
             report_title=report_title,
             constraints_paragraph=constraints_paragraph,
             sections=sections,
-            draft_output_path=self.config.draft_output_path,
+            draft_output_path=path,
             runtime_observer=self.runtime_observer,
+            user_query=query,
         )
 
-    def run(self, query: str) -> str:
+    def run(self, query: str, *, draft_output_path: str | None = None) -> str:
         # 1. Scout the web for information
         import time
         self._stage_started("scout", "Scout stage started.")
         logger.info(f"Scouting landscape for: {query}")
         start_time = time.time()
-        scout_result = self.scout.run(query, observer=self.runtime_observer)
+        scout_result = self.scout.run(query, observer=self.runtime_observer, query_store=self.queries_redis)
         end_time = time.time()
         logger.info(f"Scouting landscape for: {query} took {round(end_time - start_time, 2)} seconds")
         self._stage_completed(
@@ -533,6 +569,7 @@ class MingDeepResearch:
             angle_id: str,
             angle_topic: str,
             success_criteria: str,
+            project_topic: str,
         ) -> Dict[str, Any]:
             subagent = subagent_pool.get()
             try:
@@ -543,6 +580,7 @@ class MingDeepResearch:
                     angle_id=angle_id,
                     angle_topic=angle_topic,
                     success_criteria=success_criteria,
+                    project_topic=project_topic,
                 )
             finally:
                 subagent_pool.put(subagent)
@@ -563,6 +601,7 @@ class MingDeepResearch:
                     angle["_angle_id"],
                     angle["topic"],
                     angle["success_criteria"],
+                    query,
                 )
                 future_to_angle[future] = angle
             
@@ -779,6 +818,7 @@ class MingDeepResearch:
         initial_context = self._build_outline_context(
             context_ids=retained_context_ids,
             scout_brief=scout_result["landscape_brief"],
+            user_query=query,
         )
 
         # 4. Generate Outline
@@ -855,6 +895,7 @@ class MingDeepResearch:
             report_title,
             constraints_paragraph,
             sections,
+            draft_output_path=draft_output_path,
         )
         end_time = time.time()
         logger.info(f"Writing report took {round(end_time - start_time, 2)} seconds")
@@ -869,163 +910,168 @@ class MingDeepResearch:
 
         return report_markdown
 
-class MingDeepResearchCrescent(MingDeepResearch):
-    """Crescent (fast brief): scout → one research iteration per subagent → KG → flat outline → single-pass write.
 
-    See ``plans.md``: no LLM planning decomposition, ``max_iterations=0`` on research (one query/fetch/synthesize
-    round, decide node exits without an LLM), flat 3–4 section outline, monolithic writer with KG tool (~4–6k words).
-    """
+def _docker_redis_container_name(worker_id: int, role: str) -> str:
+    return f"ming-worker-{worker_id}-{role}"
 
-    _CRESCENT_WRITER_MIN_TOKENS = 16_384
 
-    def __init__(self, config: MingDeepResearchConfig, runtime_observer: Any | None = None):
-        super().__init__(config, runtime_observer)
+def _worker_redis_ports(worker_id: int, base_port: int = 6390) -> Dict[str, int]:
+    """Return (context_port, queries_port, kg_port) for a worker."""
+    offset = worker_id * 3
+    return {
+        "context": base_port + offset,
+        "queries": base_port + offset + 1,
+        "kg": base_port + offset + 2,
+    }
 
-        crescent_sub_cfg = dict(self.subagent_config)
-        crescent_sub_cfg["max_iterations"] = 0
-        n_workers = min(2, max(1, config.num_research_subagents))
-        self.research_subagents = [
-            ResearchSubagent(
-                config=crescent_sub_cfg,
-                database=self.context_redis,
-                query_store=self.queries_redis,
-            )
-            for _ in range(n_workers)
-        ]
 
-        base_writer = config.writer_model or OpenRouterModelConfig(
-            model_name=_DEFAULT_OUTLINE_PLUS,
-            temperature=0.2,
-            max_tokens=self._CRESCENT_WRITER_MIN_TOKENS,
+def _start_worker_redis(worker_id: int, base_port: int = 6390) -> Dict[str, int]:
+    """Spin up 3 isolated Redis containers for a single worker. Returns port dict."""
+    import subprocess
+
+    ports = _worker_redis_ports(worker_id, base_port)
+    for role, port in ports.items():
+        name = _docker_redis_container_name(worker_id, role)
+        # Remove if leftover from a previous run
+        subprocess.run(
+            ["docker", "rm", "-f", name],
+            capture_output=True,
         )
-        prev_max = base_writer.max_tokens if base_writer.max_tokens is not None else 4096
-        writer_primary_cfg = OpenRouterModelConfig(
-            model_name=base_writer.model_name,
-            temperature=base_writer.temperature,
-            max_tokens=max(self._CRESCENT_WRITER_MIN_TOKENS, prev_max),
-            site_url=base_writer.site_url,
-            site_name=base_writer.site_name,
-            model_kwargs=deepcopy(base_writer.model_kwargs) if base_writer.model_kwargs else None,
+        subprocess.run(
+            ["docker", "run", "-d", "-p", f"{port}:6379", "--name", name, "redis:latest"],
+            capture_output=True,
+            check=True,
         )
-        writer_fallback_cfg = config.writer_fallback_model
-        if writer_fallback_cfg is None:
-            writer_fallback_cfg = OpenRouterModelConfig(
-                model_name=_DEFAULT_FLASH_FALLBACK,
-                temperature=writer_primary_cfg.temperature,
-                max_tokens=writer_primary_cfg.max_tokens,
-                site_url=writer_primary_cfg.site_url,
-                site_name=writer_primary_cfg.site_name,
-                model_kwargs=deepcopy(writer_primary_cfg.model_kwargs)
-                if writer_primary_cfg.model_kwargs
-                else None,
-            )
-        else:
-            fb_max = writer_fallback_cfg.max_tokens if writer_fallback_cfg.max_tokens is not None else 4096
-            writer_fallback_cfg = OpenRouterModelConfig(
-                model_name=writer_fallback_cfg.model_name,
-                temperature=writer_fallback_cfg.temperature,
-                max_tokens=max(self._CRESCENT_WRITER_MIN_TOKENS, fb_max),
-                site_url=writer_fallback_cfg.site_url,
-                site_name=writer_fallback_cfg.site_name,
-                model_kwargs=deepcopy(writer_fallback_cfg.model_kwargs)
-                if writer_fallback_cfg.model_kwargs
-                else None,
-            )
+    return ports
 
-        self.writer_agent = WriterAgent(
-            WriterAgentConfig(
-                model=writer_primary_cfg,
-                fallback_model=writer_fallback_cfg,
-                kg_query_tool=self.kg_query_tool,
-                draft_output_path=config.draft_output_path,
-                num_parallel_sections=1,
-                max_iterations=24,
-            )
+
+def _stop_worker_redis(worker_id: int) -> None:
+    """Tear down all Redis containers for a worker."""
+    import subprocess
+
+    for role in ("context", "queries", "kg"):
+        name = _docker_redis_container_name(worker_id, role)
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+def _build_worker_config(
+    raw_config: Dict[str, Any],
+    ports: Dict[str, int],
+) -> "MingDeepResearchConfig":
+    """Clone the base config but point Redis at the worker's isolated ports."""
+    from copy import deepcopy
+    worker_cfg = deepcopy(raw_config)
+
+    worker_cfg["redis"] = {
+        "hostname": "localhost",
+        "port": ports["context"],
+        "db": 0,
+    }
+    worker_cfg["queries_redis"] = {
+        "hostname": "localhost",
+        "port": ports["queries"],
+        "db": 0,
+    }
+    worker_cfg["kg_redis"] = {
+        "hostname": "localhost",
+        "port": ports["kg"],
+        "db": 0,
+    }
+    return worker_cfg
+
+
+def _flush_worker_redis(worker_cfg: Dict[str, Any]) -> None:
+    """FLUSHDB on all three worker Redis instances."""
+    import redis as _redis
+
+    for key in ("redis", "queries_redis", "kg_redis"):
+        cfg = worker_cfg.get(key)
+        if not cfg:
+            continue
+        cl = _redis.Redis(
+            host=str(cfg.get("hostname", "localhost")),
+            port=int(cfg.get("port", 6379)),
+            db=int(cfg.get("db", 0)),
+            decode_responses=True,
         )
+        try:
+            cl.flushdb()
+        finally:
+            cl.close()
 
-    def _plan_research(self, query: str, scout_result: Dict[str, Any]) -> Dict[str, Any]:
-        del scout_result
-        n = len(self.research_subagents)
-        angles: List[Dict[str, str]] = []
-        if n <= 1:
-            angles.append(
-                {
-                    "topic": (
-                        f"User question:\n{query.strip()}\n\n"
-                        "Success Criteria: In a single retrieval-and-synthesis round, answer the full question. "
-                        "Use the scout brief for scope, entities, and language. Cover the main landscape themes; "
-                        "prefer accuracy and clear sourcing over exhaustive breadth.\n\n"
-                        "Constraints: One pass only—do not assume follow-up iterations."
-                    ),
-                    "success_criteria": "Single-pass synthesis of the entire user question.",
-                }
-            )
-        else:
-            angles.append(
-                {
-                    "topic": (
-                        f"User question:\n{query.strip()}\n\n"
-                        "Success Criteria: Establish definitions, core facts, and the dominant narrative from sources.\n\n"
-                        "Constraints: One pass only; align with the scout brief."
-                    ),
-                    "success_criteria": "Foundational coverage.",
-                }
-            )
-            angles.append(
-                {
-                    "topic": (
-                        f"User question:\n{query.strip()}\n\n"
-                        "Success Criteria: Highlight disagreements, limits of evidence, counterarguments, and recent "
-                        "developments that are not yet settled.\n\n"
-                        "Constraints: One pass only; complement the other angle without redundant queries when possible."
-                    ),
-                    "success_criteria": "Critical and divergent coverage.",
-                }
-            )
-        return {"research_angles": angles[:n], "constraints": ""}
 
-    def _run_planning_stage(self, query: str, scout_result: Dict[str, Any]) -> Dict[str, Any]:
-        self._stage_started(
-            "planning",
-            "Crescent: skipping planner LLM; framing full-topic research angle(s).",
-        )
-        import time
+def _worker_loop(
+    worker_id: int,
+    work_queue: "queue.Queue[Dict[str, Any] | None]",
+    submission_dir: "Path",
+    raw_config: Dict[str, Any],
+    base_port: int,
+    counters: Dict[str, Any],
+    counter_lock: "threading.Lock",
+) -> None:
+    """Long-running worker: own Redis triplet, pulls jobs from shared queue."""
+    import time as _time
+    from ming.core.config import create_ming_deep_research_config
 
-        start_time = time.time()
-        research_plan = self._plan_research(query, scout_result)
-        end_time = time.time()
-        self._stage_completed(
-            "planning",
-            "Crescent research framing completed.",
-            metrics={
-                "elapsed_seconds": round(end_time - start_time, 3),
-                "research_angle_count": len(research_plan.get("research_angles", [])),
-            },
-        )
-        return research_plan
+    ports = _start_worker_redis(worker_id, base_port)
+    worker_cfg = _build_worker_config(raw_config, ports)
+    ming_config = create_ming_deep_research_config(worker_cfg)
+    orchestrator = MingDeepResearch(ming_config)
 
-    def _outline_system_prompt(self) -> str:
-        return CRESCENT_OUTLINE_PROMPT
+    try:
+        while True:
+            row = work_queue.get()
+            if row is None:
+                break  # Poison pill
 
-    def _finalize_report(
-        self,
-        query: str,
-        report_title: str,
-        constraints_paragraph: str,
-        sections: List[SectionPlan],
-    ) -> str:
-        return self.writer_agent.run_crescent_monolith(
-            user_query=query,
-            report_title=report_title,
-            constraints_paragraph=constraints_paragraph,
-            sections=sections,
-            draft_output_path=self.config.draft_output_path,
-            runtime_observer=self.runtime_observer,
-        )
+            qid = row["id"]
+            prompt = str(row["prompt"])
+            out_path = submission_dir / f"id_{qid}.md"
+
+            if out_path.exists():
+                with counter_lock:
+                    counters["skipped"] += 1
+                tqdm.write(f"[worker {worker_id}] Skip id={qid} (exists)")
+                continue
+
+            _flush_worker_redis(worker_cfg)
+            start = _time.time()
+            try:
+                result = orchestrator.run(
+                    prompt, draft_output_path=str(out_path.resolve())
+                )
+            except Exception as exc:
+                with counter_lock:
+                    counters["failed"] += 1
+                tqdm.write(f"[worker {worker_id}] FAILED id={qid}: {exc}")
+                continue
+
+            elapsed_min = round(_time.time() - start, 2) / 60
+
+            # Point draft_output_path at out_path so WriterAgent persists here (not only
+            # config's reports/draft.md). Sync return value when non-empty.
+            if result:
+                out_path.write_text(result, encoding="utf-8")
+            if out_path.exists():
+                with counter_lock:
+                    counters["written"] += 1
+                tqdm.write(
+                    f"[worker {worker_id}] Wrote id={qid} -> {out_path} ({elapsed_min:.2f} min)"
+                )
+            else:
+                with counter_lock:
+                    counters["failed"] += 1
+                tqdm.write(
+                    f"[worker {worker_id}] Empty report for id={qid} ({elapsed_min:.2f} min)"
+                )
+    finally:
+        _stop_worker_redis(worker_id)
 
 
 if __name__ == "__main__":
     import argparse
+    import queue
+    import threading
     import time
     from pathlib import Path
 
@@ -1049,17 +1095,29 @@ if __name__ == "__main__":
     parser.add_argument(
         "--submission-dir",
         type=str,
-        default=None,
+        default="deepresearch-bench/submission/",
         help="Output directory for id_<id>.md with --jsonl (default: <jsonl>/../submission).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for --jsonl batch mode (default: 1, sequential).",
+    )
+    parser.add_argument(
+        "--base-port",
+        type=int,
+        default=6390,
+        help="Starting port for parallel worker Redis containers (default: 6390).",
     )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     raw_config = load_config(args.config)
-    config = create_ming_deep_research_config(raw_config)
-    orchestrator = MingDeepResearch(config)
 
     if args.query:
+        config = create_ming_deep_research_config(raw_config)
+        orchestrator = MingDeepResearch(config)
         flush_research_redis_for_new_run(raw_config)
         start_time = time.time()
         orchestrator.run(args.query)
@@ -1089,40 +1147,89 @@ if __name__ == "__main__":
                     continue
                 entries.append(row)
 
-        n_skipped = n_written = n_failed = 0
-        pbar = tqdm(entries, desc="JSONL queries", unit="query", dynamic_ncols=True)
-        for row in pbar:
-            qid = row["id"]
-            prompt = str(row["prompt"])
-            out_path = submission_dir / f"id_{qid}.md"
-            pbar.set_postfix(
-                skipped=n_skipped, written=n_written, failed=n_failed, id=qid, refresh=False
+        num_workers = max(1, args.workers)
+
+        if num_workers == 1:
+            # Sequential mode: use the original Redis from config (no extra containers)
+            config = create_ming_deep_research_config(raw_config)
+            orchestrator = MingDeepResearch(config)
+
+            n_skipped = n_written = n_failed = 0
+            pbar = tqdm(entries, desc="JSONL queries", unit="query", dynamic_ncols=True)
+            for row in pbar:
+                qid = row["id"]
+                prompt = str(row["prompt"])
+                out_path = submission_dir / f"id_{qid}.md"
+                pbar.set_postfix(
+                    skipped=n_skipped, written=n_written, failed=n_failed, id=qid, refresh=False
+                )
+                if out_path.exists():
+                    n_skipped += 1
+                    pbar.set_postfix(
+                        skipped=n_skipped, written=n_written, failed=n_failed, id=qid
+                    )
+                    tqdm.write(f"Skip id={qid} (exists: {out_path})")
+                    continue
+
+                flush_research_redis_for_new_run(raw_config)
+                start_time = time.time()
+                result = orchestrator.run(
+                    prompt, draft_output_path=str(out_path.resolve())
+                )
+                elapsed_min = round(time.time() - start_time, 2) / 60
+
+                if result:
+                    out_path.write_text(result, encoding="utf-8")
+                if out_path.exists():
+                    n_written += 1
+                    pbar.set_postfix(
+                        skipped=n_skipped, written=n_written, failed=n_failed, id=qid
+                    )
+                    tqdm.write(f"Wrote id={qid} -> {out_path} ({elapsed_min:.2f} min)")
+                else:
+                    n_failed += 1
+                    pbar.set_postfix(
+                        skipped=n_skipped, written=n_written, failed=n_failed, id=qid
+                    )
+                    tqdm.write(
+                        f"Empty report for id={qid}; not writing {out_path} ({elapsed_min:.2f} min)"
+                    )
+        else:
+            # Parallel mode: each worker gets its own Redis container triplet
+            print(f"Starting {num_workers} parallel workers (base port {args.base_port})...")
+
+            work_q: queue.Queue[Dict[str, Any] | None] = queue.Queue()
+            for entry in entries:
+                work_q.put(entry)
+            # Poison pills to signal workers to exit
+            for _ in range(num_workers):
+                work_q.put(None)
+
+            counters: Dict[str, int] = {"skipped": 0, "written": 0, "failed": 0}
+            counter_lock = threading.Lock()
+
+            threads: List[threading.Thread] = []
+            for wid in range(num_workers):
+                t = threading.Thread(
+                    target=_worker_loop,
+                    args=(
+                        wid,
+                        work_q,
+                        submission_dir,
+                        raw_config,
+                        args.base_port,
+                        counters,
+                        counter_lock,
+                    ),
+                    daemon=True,
+                )
+                t.start()
+                threads.append(t)
+
+            for t in threads:
+                t.join()
+
+            print(
+                f"\nDone. written={counters['written']}  "
+                f"skipped={counters['skipped']}  failed={counters['failed']}"
             )
-            if out_path.exists():
-                n_skipped += 1
-                pbar.set_postfix(
-                    skipped=n_skipped, written=n_written, failed=n_failed, id=qid
-                )
-                tqdm.write(f"Skip id={qid} (exists: {out_path})")
-                continue
-
-            flush_research_redis_for_new_run(raw_config)
-            start_time = time.time()
-            result = orchestrator.run(prompt)
-            elapsed_min = round(time.time() - start_time, 2) / 60
-
-            if result:
-                out_path.write_text(result, encoding="utf-8")
-                n_written += 1
-                pbar.set_postfix(
-                    skipped=n_skipped, written=n_written, failed=n_failed, id=qid
-                )
-                tqdm.write(f"Wrote id={qid} -> {out_path} ({elapsed_min:.2f} min)")
-            else:
-                n_failed += 1
-                pbar.set_postfix(
-                    skipped=n_skipped, written=n_written, failed=n_failed, id=qid
-                )
-                tqdm.write(
-                    f"Empty report for id={qid}; not writing {out_path} ({elapsed_min:.2f} min)"
-                )

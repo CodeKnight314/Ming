@@ -17,6 +17,7 @@ from ming.core.outline_parser import SectionPlan, strip_markdown_fences
 from ming.models.openrouter_model import OpenRouterModel, OpenRouterModelConfig
 from ming.subagent import Agent, AgentConfig
 from ming.tools.kg_query_tool import KGQueryTool
+from ming.tools.think_tool import ThinkTool
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +31,12 @@ class WriterAgentConfig:
     fallback_model: OpenRouterModelConfig | None = None
     polish_model: OpenRouterModelConfig | None = None
     draft_output_path: str | None = None
-    max_iterations: int = 16
+    max_iterations: int = 18
     num_parallel_sections: int = 8
 
 
 class WriterAgent:
-    _INITIAL_EVIDENCE_LIMIT = 16
+    _INITIAL_EVIDENCE_LIMIT = 32
     _MIN_UNIQUE_URLS = 8
     _MAX_URL_SHARE = 0.35
 
@@ -98,7 +99,7 @@ class WriterAgent:
                 model=primary,
                 fallback_model=fallback_eff,
                 system_prompt=REPORT_SECTION_WRITER_PROMPT,
-                tools=[self.config.kg_query_tool],
+                tools=[self.config.kg_query_tool, ThinkTool()],
                 max_iterations=self.config.max_iterations,
                 max_tool_calls_per_turn=8,
             )
@@ -136,43 +137,92 @@ class WriterAgent:
             if part.strip()
         )
 
-    def _canonical_entities_context(self, limit: int = 2000) -> str:
-        canonical_entities = sorted(
-            self.config.kg_query_tool.kg_store.get_canonical_entities(),
-            key=lambda entity: (-len(getattr(entity, "relationships", []) or []), (entity.text or "").lower()),
-        )
-        seen: set[str] = set()
-        names: List[str] = []
-        for entity in canonical_entities:
-            name = " ".join((entity.text or "").split())
-            if not name:
-                continue
-            key = name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            names.append(name)
-            if len(names) >= limit:
-                break
-        return ", ".join(names)
+    def _canonical_entities_context(
+        self,
+        limit: int = 80,
+        *,
+        section_entity_names: set[str] | None = None,
+    ) -> str:
+        """Build an enriched entity context string for the writer prompt.
 
-    def _format_evidence_cards(self, evidence_result: Dict[str, Any]) -> str:
+        If *section_entity_names* is provided, only entities whose name (lowered)
+        appears in the set are included — giving the writer a section-relevant
+        subgraph instead of the full KG dump.
+        """
+        summaries = self.config.kg_query_tool.kg_store.get_enriched_entity_summaries(
+            limit=limit,
+            filter_entity_names=section_entity_names,
+        )
+        if not summaries:
+            return "None available."
+
+        lines: List[str] = []
+        for s in summaries:
+            preds = ", ".join(s["top_predicates"]) if s["top_predicates"] else "—"
+            label = s["label"] or "?"
+            lines.append(f"- {s['name']} ({label}, {s['rel_count']} facts): {preds}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_entity_names_from_cards(cards: List[Dict[str, Any]]) -> set[str]:
+        """Extract subject/object entity names from evidence card fact strings.
+
+        Fact format: ``subject -[predicate]-> object (object_type)``
+        Returns a lowercased set of entity names for filtering.
+        """
+        _FACT_RE = re.compile(r"^(.+?)\s+-\[.*?\]->\s+(.+?)\s+\(.*\)$")
+        names: set[str] = set()
+        for card in cards:
+            fact = card.get("fact", "")
+            m = _FACT_RE.match(fact)
+            if m:
+                names.add(m.group(1).strip().lower())
+                names.add(m.group(2).strip().lower())
+        return names
+
+    def _format_evidence_cards(
+        self,
+        evidence_result: Dict[str, Any],
+        grouped_by_subsection: Dict[str, List[int]] | None = None,
+    ) -> str:
         cards = evidence_result.get("cards") or []
         if not cards:
             return "No evidence cards were returned from the KG."
 
-        lines: List[str] = []
-        for index, card in enumerate(cards, start=1):
+        def _format_card(index: int, card: Dict[str, Any]) -> List[str]:
+            lines: List[str] = []
             lines.append(f"[Evidence Card {index}]")
             lines.append(f"Fact: {card.get('fact', '')}")
             supporting_urls = card.get("supporting_urls") or []
             if supporting_urls:
                 lines.append("Supporting URLs: " + ", ".join(supporting_urls[:6]))
             for excerpt_index, chunk in enumerate(card.get("chunks") or [], start=1):
-                if excerpt_index > 3:
+                if excerpt_index > 2:
                     break
                 lines.append(f"Excerpt {excerpt_index} ({chunk.get('url', '')}): {chunk.get('excerpt', '')}")
             lines.append("")
+            return lines
+
+        if grouped_by_subsection:
+            lines: List[str] = []
+            emitted: set[int] = set()
+            for sub_title, card_indices in grouped_by_subsection.items():
+                lines.append(f"--- Evidence for: {sub_title} ---")
+                for ci in card_indices:
+                    if 0 <= ci < len(cards):
+                        lines.extend(_format_card(ci + 1, cards[ci]))
+                        emitted.add(ci)
+            # Emit remaining cards under broad heading
+            remaining = [i for i in range(len(cards)) if i not in emitted]
+            if remaining:
+                lines.append("--- Broad evidence ---")
+                for ci in remaining:
+                    lines.extend(_format_card(ci + 1, cards[ci]))
+            return "\n".join(lines).strip()
+
+        lines = []
+        for index, card in enumerate(cards, start=1):
+            lines.extend(_format_card(index, card))
         return "\n".join(lines).strip()
 
     def _build_audit_feedback(
@@ -210,6 +260,7 @@ class WriterAgent:
         initial_evidence_text: str,
         canonical_entities_context: str,
         audit_feedback: str = "",
+        user_query: str = "",
     ) -> str:
         constraints = constraints_paragraph.strip() or "No additional constraints provided."
 
@@ -223,10 +274,19 @@ class WriterAgent:
         if audit_feedback.strip():
             audit_section = f"### Audit Feedback\n{audit_feedback.strip()}\n\n"
 
+        user_query_section = ""
+        if user_query.strip():
+            user_query_section = (
+                f"### Original User Query\n"
+                f"This report was requested to answer the following query. Ensure your section contributes to addressing it:\n"
+                f"{user_query.strip()}\n\n"
+            )
+
         return (
             f"## TASK ASSIGNMENT\n"
             f"Report Title: {report_title}\n"
             f"Section to Write: {section.title}\n\n"
+            f"{user_query_section}"
             f"### Section Context & Instructions\n"
             f"{section.instruction}\n\n"
             f"### Subsection Guidelines\n"
@@ -247,7 +307,8 @@ class WriterAgent:
             f"4. **Citations**: Cite source URLs using [URL] format from KG results. Cite multiple sources for one claim when corroboration or disagreement matters, using adjacent citations like [URL][URL].\n"
             f"5. **Order Discipline**: Follow the mandatory subsection order exactly. Do not discuss a later subsection in detail before its own `###` header.\n"
             f"6. **Scope Discipline**: Keep each subsection focused on its assigned topic. If evidence is more relevant later, save it for the later subsection.\n"
-            f"7. **Write**: Output the full Markdown section starting with `## {section.title}` and including all `###` subsections."
+            f"7. **Depth over Breadth**: For each subsection, explain *why* things happen (causal mechanisms) not just *what* happened. Present trade-offs and tensions when they exist. Use comparison tables when comparing 3+ items or dimensions.\n"
+            f"8. **Write**: Output the full Markdown section starting with `## {section.title}` and including all `###` subsections."
         )
 
     def _clean_section_markdown(
@@ -281,7 +342,7 @@ class WriterAgent:
 
         return cleaned.strip() + "\n"
 
-    def _polish_report(self, markdown: str) -> str:
+    def _polish_report(self, markdown: str, user_query: str = "") -> str:
         """Run a readability polish pass over the assembled report.
 
         Adds an executive summary, smooths transitions, cleans prose, and
@@ -291,7 +352,7 @@ class WriterAgent:
         """
         if self.polish_model is None:
             return markdown
-        prompt = READABILITY_POLISH_PROMPT.format(report=markdown)
+        prompt = READABILITY_POLISH_PROMPT.format(report=markdown, user_query=user_query)
         try:
             return self.polish_model.generate(prompt)
         except Exception:
@@ -312,12 +373,91 @@ class WriterAgent:
             counts[canonicalize_url(url)] += 1
         return counts
 
-    def _search_initial_evidence(self, section: SectionPlan) -> Dict[str, Any]:
-        return self.config.kg_query_tool.search_evidence(
+    def _search_initial_evidence(
+        self, section: SectionPlan
+    ) -> Tuple[Dict[str, Any], Dict[str, List[int]] | None]:
+        """Search evidence per-subsection and merge into a single result.
+
+        Returns (merged_evidence_dict, subsection_grouping) where the grouping
+        maps subsection titles to card indices in the merged list.
+        """
+        if not section.subsections:
+            result = self.config.kg_query_tool.search_evidence(
+                query=self._build_initial_query(section),
+                limit=self._INITIAL_EVIDENCE_LIMIT,
+                diversify_by_url=True,
+            )
+            return result, None
+
+        # One broad query + one per subsection
+        broad_limit = 10
+        per_sub_limit = max(4, (self._INITIAL_EVIDENCE_LIMIT - broad_limit) // len(section.subsections))
+
+        broad_result = self.config.kg_query_tool.search_evidence(
             query=self._build_initial_query(section),
-            limit=self._INITIAL_EVIDENCE_LIMIT,
+            limit=broad_limit,
             diversify_by_url=True,
         )
+
+        sub_results: List[Tuple[str, Dict[str, Any]]] = []
+        for sub in section.subsections:
+            sub_query = f"{sub.title}: {sub.description}" if sub.description else sub.title
+            sub_result = self.config.kg_query_tool.search_evidence(
+                query=sub_query,
+                limit=per_sub_limit,
+                diversify_by_url=True,
+            )
+            sub_results.append((sub.title, sub_result))
+
+        # Merge and deduplicate cards by fact string
+        seen_facts: Dict[str, int] = {}  # fact -> index in merged list
+        merged_cards: List[Dict[str, Any]] = []
+        subsection_grouping: Dict[str, List[int]] = {}
+        thin_pool_any = broad_result.get("thin_pool", False)
+
+        # Add subsection cards first (higher priority for grouping)
+        for sub_title, sub_result in sub_results:
+            thin_pool_any = thin_pool_any or sub_result.get("thin_pool", False)
+            indices: List[int] = []
+            for card in sub_result.get("cards") or []:
+                fact = card.get("fact", "")
+                if fact in seen_facts:
+                    indices.append(seen_facts[fact])
+                    continue
+                idx = len(merged_cards)
+                seen_facts[fact] = idx
+                merged_cards.append(card)
+                indices.append(idx)
+            subsection_grouping[sub_title] = indices
+
+        # Add broad cards that weren't already seen
+        for card in broad_result.get("cards") or []:
+            fact = card.get("fact", "")
+            if fact not in seen_facts:
+                seen_facts[fact] = len(merged_cards)
+                merged_cards.append(card)
+
+        # Cap at budget
+        merged_cards = merged_cards[: self._INITIAL_EVIDENCE_LIMIT]
+        # Prune grouping indices that exceeded the cap
+        for sub_title in subsection_grouping:
+            subsection_grouping[sub_title] = [
+                i for i in subsection_grouping[sub_title] if i < len(merged_cards)
+            ]
+
+        all_urls = {
+            url
+            for card in merged_cards
+            for url in (card.get("supporting_urls") or [])
+        }
+        merged_result: Dict[str, Any] = {
+            "query": self._build_initial_query(section),
+            "limit": self._INITIAL_EVIDENCE_LIMIT,
+            "thin_pool": thin_pool_any,
+            "unique_url_count": len(all_urls),
+            "cards": merged_cards,
+        }
+        return merged_result, subsection_grouping
 
     def _needs_audit_rerun(
         self,
@@ -355,10 +495,19 @@ class WriterAgent:
         report_title: str,
         constraints_paragraph: str,
         section: SectionPlan,
+        user_query: str = "",
     ) -> Tuple[str, str, List[str]]:
-        initial_evidence = self._search_initial_evidence(section)
-        initial_evidence_text = self._format_evidence_cards(initial_evidence)
-        canonical_entities_context = self._canonical_entities_context()
+        initial_evidence, subsection_grouping = self._search_initial_evidence(section)
+        initial_evidence_text = self._format_evidence_cards(
+            initial_evidence, grouped_by_subsection=subsection_grouping
+        )
+        # Extract entity names from evidence cards to scope the entity context
+        section_entity_names = self._extract_entity_names_from_cards(
+            initial_evidence.get("cards") or []
+        )
+        canonical_entities_context = self._canonical_entities_context(
+            section_entity_names=section_entity_names or None,
+        )
         surfaced_urls = sorted(
             {
                 canonicalize_url(url)
@@ -373,6 +522,7 @@ class WriterAgent:
             section=section,
             initial_evidence_text=initial_evidence_text,
             canonical_entities_context=canonical_entities_context,
+            user_query=user_query,
         )
         output, messages = self._run_writer_prompt_with_fallback(prompt)
         urls = sorted(set(surfaced_urls + self._extract_urls_from_tool_results(messages)))
@@ -396,6 +546,7 @@ class WriterAgent:
                 initial_evidence_text=initial_evidence_text,
                 canonical_entities_context=canonical_entities_context,
                 audit_feedback=audit_feedback,
+                user_query=user_query,
             )
             rerun_output, rerun_messages = self._run_writer_prompt_with_fallback(rerun_prompt)
             urls = sorted(set(urls + self._extract_urls_from_tool_results(rerun_messages)))
@@ -441,6 +592,7 @@ class WriterAgent:
         sections: list[SectionPlan],
         draft_output_path: str | None = None,
         runtime_observer: Any = None,
+        user_query: str = "",
     ) -> str:
         draft_path = self._resolve_draft_path(
             report_title=report_title,
@@ -482,7 +634,7 @@ class WriterAgent:
 
         with ThreadPoolExecutor(max_workers=self.config.num_parallel_sections) as executor:
             future_to_idx = {
-                executor.submit(self._write_section, report_title, constraints_paragraph, section): i
+                executor.submit(self._write_section, report_title, constraints_paragraph, section, user_query): i
                 for i, section in enumerate(sections)
             }
 
@@ -507,7 +659,7 @@ class WriterAgent:
 
         final_markdown = self._report_markdown(report_title, processed_sections, citations)
         final_markdown = normalize_markdown_references(final_markdown)
-        final_markdown = self._polish_report(final_markdown)
+        final_markdown = self._polish_report(final_markdown, user_query=user_query)
         draft_path.write_text(final_markdown, encoding="utf-8")
 
         return final_markdown

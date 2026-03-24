@@ -38,7 +38,8 @@
         "command_id": "cmd_099",
         "status": "completed"
       }
-    ]
+    ],
+    "failed": []
   },
   "active_run": {
     "run_id": "run_101",
@@ -119,3 +120,4 @@
   ],
   "direct_query_draft": "Investigate why angle 2 is stalled in retrieve and whether URL caching is masking low-value sources.",
   "batch_json_draft": "[\n  {\n    \"id\": \"b1\",\n    \"prompt\": \"Summarize runtime queue health\"\n  },\n  {\n    \"id\": \"b2\",\n    \"prompt\": \"Inspect angle-level query efficiency\"\n  }\n]\n"
+}

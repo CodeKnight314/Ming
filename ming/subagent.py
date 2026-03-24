@@ -53,6 +53,53 @@ def _extract_gaps_from_history(history: List[str]) -> List[str]:
     return []
 
 
+_SKIP_HISTORY_PREFIXES = (
+    "generated queries:",
+    "continuing research.",
+    "stopping research.",
+    "cached web content from tavily",
+    "no queries generated.",
+    "query budget exhausted",
+    "max query budget reached",
+    "no context retrieved",
+)
+
+
+def _last_research_synthesis_text(history: List[str]) -> str:
+    """Last history entry that looks like a THINK synthesis (not tool/status chatter)."""
+    for entry in reversed(history or []):
+        stripped = (entry or "").strip()
+        if not stripped:
+            continue
+        low = stripped.lower()
+        if any(low.startswith(p) for p in _SKIP_HISTORY_PREFIXES):
+            continue
+        return stripped
+    return ""
+
+
+_OPEN_CRITERION_STATUS = re.compile(
+    r"STATUS:\s*(UNSATISFIED|PARTIALLY)\b",
+    re.IGNORECASE,
+)
+
+
+def _decide_should_continue_despite_stop(
+    *,
+    synthesis: str,
+    remaining_budget: int,
+    max_query_batch: int,
+) -> bool:
+    """When the LLM says stop but budget/gaps say we should keep searching."""
+    if remaining_budget <= 0:
+        return False
+    if _OPEN_CRITERION_STATUS.search(synthesis):
+        return True
+    if remaining_budget >= max_query_batch and "## criteria assessment" not in synthesis.lower():
+        return True
+    return False
+
+
 def _count_criteria(criteria_text: str) -> int:
     """Count the number of distinct success criteria in a criteria block."""
     if not criteria_text:
@@ -62,10 +109,8 @@ def _count_criteria(criteria_text: str) -> int:
 
 
 def _compute_think_tokens(num_sources: int, num_criteria: int) -> int:
-    """Compute a dynamic token budget for the think synthesis.
-
-    Formula: 300 base + 40 per source + 120 per criterion, clamped to [768, 2048].
-    """
+    """Token budget for think synthesis; aligned with subagent max_new_tokens default."""
+    del num_sources, num_criteria
     return 8192
 
 
@@ -74,6 +119,7 @@ class ResearchSubagentConfig(TypedDict, total=False):
     min_query_count: int
     max_query_count: int
     max_total_queries: int
+    max_new_queries: int
     max_open_urls_per_iteration: int
     max_url_wait_seconds: float
     model: dict[str, Any]
@@ -84,6 +130,7 @@ class ResearchSubagentConfig(TypedDict, total=False):
 
 class ResearchSubagentState(TypedDict, total=False):
     topic: str
+    project_topic: str
     context_ids: List[str]
     history: List[str]
     iteration: int
@@ -163,7 +210,7 @@ class ResearchSubagent:
 
     def _generation_kwargs(self, **overrides: Any):
         base = {
-            "max_new_tokens": self.config.get("max_new_tokens", 1024),
+            "max_new_tokens": self.config.get("max_new_tokens", 8192),
             "temperature": self.config.get("temperature", 0.7),
             "do_sample": self.config.get("do_sample", True),
             "use_cache": self.config.get("use_cache", True),
@@ -192,6 +239,8 @@ class ResearchSubagent:
         return int(state.get("iteration", 0)) + 1
 
     def _max_total_queries(self) -> int:
+        if self.config.get("max_total_queries") is not None:
+            return max(1, int(self.config["max_total_queries"]))
         raw_limit = self.config.get("max_new_queries", 10)
         return max(1, int(raw_limit))
 
@@ -241,6 +290,7 @@ class ResearchSubagent:
             message="Generating research queries.",
         )
         topic = state["topic"]
+        project_topic = state.get("project_topic") or ""
         history = state.get("history") or []
         all_queries = state.get("all_queries") or []
         scout_report = (state.get("scout_report") or "").strip()
@@ -273,16 +323,20 @@ class ResearchSubagent:
 
         previous_queries_list = list(all_queries)
         if self.query_store:
-            stored = self.query_store.get_queries(topic)
+            # Fetch queries for this specific angle
+            angle_stored = self.query_store.get_queries(topic)
+            # Fetch queries for the entire project (scout + other subagents)
+            project_stored = self.query_store.get_queries(project_topic) if project_topic else []
+            
             seen = set(q.lower() for q in previous_queries_list)
-            for q in stored:
+            for q in angle_stored + project_stored:
                 if q.lower() not in seen:
                     seen.add(q.lower())
                     previous_queries_list.append(q)
 
         if previous_queries_list:
             previous_queries_section = (
-                "Queries already run (avoid repeating; fill gaps or explore new angles):\n"
+                "Queries already run in this project (avoid repeating; fill gaps or explore new angles):\n"
                 + "\n".join(f"- {q}" for q in previous_queries_list)
                 + "\n\n"
             )
@@ -306,12 +360,18 @@ class ResearchSubagent:
         else:
             gaps_section = ""
 
+        total_budget = self._max_total_queries()
+        remaining_queries_info = (
+            f"Query budget: {remaining_budget} queries remaining out of a total budget of {total_budget}."
+        )
+
         prompt = GENERATE_QUERIES_PROMPT.format(
             topic=topic,
             scout_section=scout_section,
             previous_queries_section=previous_queries_section,
             history_section=history_section,
             gaps_section=gaps_section,
+            remaining_queries_info=remaining_queries_info,
             min_queries=min_q,
             max_queries=max_q,
             guidance=guidance,
@@ -556,8 +616,11 @@ class ResearchSubagent:
 
         if self.query_store:
             topic = state.get("topic", "")
+            project_topic = state.get("project_topic", "")
             if topic:
                 self.query_store.add_queries(topic, queries)
+            if project_topic:
+                self.query_store.add_queries(project_topic, queries)
 
         candidate_results = self._select_open_candidates(web_results)
 
@@ -679,7 +742,15 @@ class ResearchSubagent:
 
         context_str = "\n\n---\n\n".join(context_parts)
 
-        prompt = THINK_PROMPT.format(context=context_str)
+        total_budget = self._max_total_queries()
+        remaining_budget = max(0, total_budget - len(all_queries))
+        remaining_queries_info = (
+            f"Query budget: {remaining_budget} queries remaining out of a total budget of {total_budget}."
+        )
+
+        prompt = THINK_PROMPT.format(
+            context=context_str, remaining_queries_info=remaining_queries_info
+        )
         response = self._generate_with_fallback(
             prompt,
             max_new_tokens=think_tokens,
@@ -734,13 +805,37 @@ class ResearchSubagent:
 
         history = state.get("history") or []
         history_str = "\n\n".join(history) if history else "No prior research yet."
-        prompt = DECISION_PROMPT.format(history=history_str)
+
+        total_budget = self._max_total_queries()
+        remaining_budget = max(0, total_budget - len(state.get("all_queries", [])))
+        remaining_queries_info = (
+            f"Query budget: {remaining_budget} queries remaining out of a total budget of {total_budget}."
+        )
+
+        prompt = DECISION_PROMPT.format(
+            history=history_str, remaining_queries_info=remaining_queries_info
+        )
         response = self._generate_with_fallback(
             prompt,
             max_new_tokens=32,
         )
 
-        decision = "continue" if "continue" in response.lower() else "stop"
+        raw_stop = "continue" not in response.lower()
+        synthesis = _last_research_synthesis_text(state.get("history") or [])
+        max_batch = max(1, int(self.config.get("max_query_count", 4)))
+        if raw_stop and _decide_should_continue_despite_stop(
+            synthesis=synthesis,
+            remaining_budget=remaining_budget,
+            max_query_batch=max_batch,
+        ):
+            logger.info(
+                "Decide: overriding model stop -> continue (%d queries left, max_batch=%d)",
+                remaining_budget,
+                max_batch,
+            )
+            decision = "continue"
+        else:
+            decision = "stop" if raw_stop else "continue"
         history_entry = (
             "Continuing research." if decision == "continue" else "Stopping research."
         )
@@ -796,6 +891,7 @@ class ResearchSubagent:
         angle_id: str | None = None,
         angle_topic: str | None = None,
         success_criteria: str = "",
+        project_topic: str = "",
     ) -> Dict[str, Any]:
         self.statistics = self._empty_statistics()
         self._runtime_observer = observer
@@ -805,6 +901,7 @@ class ResearchSubagent:
         self._ensure_angle_registered()
         initial_state: ResearchSubagentState = {
             "topic": topic,
+            "project_topic": project_topic,
             "context_ids": [],
             "history": [],
             "iteration": 0,

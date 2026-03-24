@@ -15,7 +15,10 @@ import re
 from collections import Counter
 import numpy as np
 import faiss 
+import threading
 from sentence_transformers import SentenceTransformer
+
+from ming.extraction.st_loader import load_sentence_transformer
 
 T = TypeVar("T")
 
@@ -31,6 +34,47 @@ class KGRedisStore:
     def __init__(self, database: RedisDatabase, er_config: ERConfig):
         self.database = database
         self.er_config = er_config
+        self._embed_model: Optional[SentenceTransformer] = None
+        self._lock = threading.Lock()
+
+    def _get_embed_model(self) -> Optional[SentenceTransformer]:
+        with self._lock:
+            if self._embed_model is not None:
+                return self._embed_model
+            try:
+                self._embed_model = load_sentence_transformer(
+                    self.er_config.embedding_model_name, local_files_only=True
+                )
+            except Exception:
+                pass
+            return self._embed_model
+
+    def _semantic_relevance_scores(
+        self,
+        query: str,
+        fact_texts: List[str],
+    ) -> List[float]:
+        """Return cosine similarities between *query* and each fact text."""
+        model = self._get_embed_model()
+        if model is None or not fact_texts:
+            return [0.0] * len(fact_texts)
+        try:
+            all_texts = [query] + fact_texts
+            emb = model.encode(all_texts, batch_size=128, normalize_embeddings=True)
+            vectors = np.array(emb, dtype="float32")
+            query_vec = vectors[:1]
+            fact_vecs = vectors[1:]
+            dim = int(vectors.shape[1])
+            index = faiss.IndexFlatIP(dim)
+            index.add(fact_vecs)
+            scores, _ = index.search(query_vec, len(fact_texts))
+            # scores is shape (1, N) — return as flat list in original order
+            # faiss IndexFlatIP returns results sorted by score desc; we need original order
+            # Simpler: just compute dot products directly
+            sims = (fact_vecs @ query_vec.T).flatten().tolist()
+            return sims
+        except Exception:
+            return [0.0] * len(fact_texts)
 
     def save_entities(self, entities: List[Entity]) -> None:
         for entity in entities:
@@ -178,7 +222,9 @@ class KGRedisStore:
                 rep_labels.append(Counter(labels).most_common(1)[0][0] if labels else "")
 
             try:
-                model = SentenceTransformer(self.er_config.embedding_model_name, local_files_only=True)
+                model = self._get_embed_model()
+                if model is None:
+                    raise ValueError("Failed to load embedding model")
                 emb = model.encode(rep_texts, batch_size=128, normalize_embeddings=True)
                 vectors = np.array(emb, dtype="float32")
 
@@ -309,6 +355,104 @@ class KGRedisStore:
             for canonical_entity_data in canonical_entities.values()
         ]
 
+    def get_enriched_entity_summaries(
+        self,
+        limit: int = 200,
+        *,
+        filter_entity_names: set[str] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Return entity summaries enriched with label, relationship count, and top predicates.
+
+        If *filter_entity_names* is provided (lowercased set), only entities whose
+        canonical name appears in the set are returned.
+        """
+        relationships, _, _, canonical_entities = self._scan_all_entries()
+
+        # Build rel_id → predicate lookup
+        rel_predicates: Dict[str, str] = {}
+        for rel_data in relationships.values():
+            rid = rel_data.get("relationship_id", "")
+            if rid:
+                rel_predicates[rid] = self._normalize_predicate(rel_data.get("predicate", ""))
+
+        summaries: List[Dict[str, Any]] = []
+        for ce_data in canonical_entities.values():
+            text = normalize_whitespace(ce_data.get("text", ""))
+            if not text:
+                continue
+            if filter_entity_names is not None and text.lower() not in filter_entity_names:
+                continue
+            label = ce_data.get("label", "")
+            rel_ids_raw = ce_data.get("relationships", "[]")
+            rel_ids = json.loads(rel_ids_raw) if isinstance(rel_ids_raw, str) else (rel_ids_raw or [])
+            rel_count = len(rel_ids)
+            # Collect top predicates by frequency
+            pred_counter: Counter = Counter()
+            for rid in rel_ids:
+                pred = rel_predicates.get(rid)
+                if pred:
+                    pred_counter[pred] += 1
+            top_preds = [p for p, _ in pred_counter.most_common(5)]
+            summaries.append({
+                "name": text,
+                "label": label,
+                "rel_count": rel_count,
+                "top_predicates": top_preds,
+            })
+
+        summaries.sort(key=lambda s: (-s["rel_count"], s["name"].lower()))
+        return summaries[:limit]
+
+    def list_entities(
+        self,
+        keyword: str = "",
+        label: str = "",
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Search canonical entities by keyword and/or label filter.
+
+        Returns enriched summaries matching the query.
+        """
+        relationships, _, _, canonical_entities = self._scan_all_entries()
+
+        rel_predicates: Dict[str, str] = {}
+        for rel_data in relationships.values():
+            rid = rel_data.get("relationship_id", "")
+            if rid:
+                rel_predicates[rid] = self._normalize_predicate(rel_data.get("predicate", ""))
+
+        keyword_lower = keyword.strip().lower()
+        label_lower = label.strip().lower()
+        results: List[Dict[str, Any]] = []
+
+        for ce_data in canonical_entities.values():
+            text = normalize_whitespace(ce_data.get("text", ""))
+            if not text:
+                continue
+            ce_label = ce_data.get("label", "")
+            if label_lower and ce_label.lower() != label_lower:
+                continue
+            if keyword_lower and keyword_lower not in text.lower():
+                continue
+            rel_ids_raw = ce_data.get("relationships", "[]")
+            rel_ids = json.loads(rel_ids_raw) if isinstance(rel_ids_raw, str) else (rel_ids_raw or [])
+            rel_count = len(rel_ids)
+            pred_counter: Counter = Counter()
+            for rid in rel_ids:
+                pred = rel_predicates.get(rid)
+                if pred:
+                    pred_counter[pred] += 1
+            top_preds = [p for p, _ in pred_counter.most_common(5)]
+            results.append({
+                "name": text,
+                "label": ce_label,
+                "rel_count": rel_count,
+                "top_predicates": top_preds,
+            })
+
+        results.sort(key=lambda s: (-s["rel_count"], s["name"].lower()))
+        return results[:limit]
+
     # ── Query helpers ──────────────────────────────────────────────────
 
     def _scan_all_entries(
@@ -371,7 +515,7 @@ class KGRedisStore:
         return normalize_whitespace(predicate).lower()
 
     @staticmethod
-    def _truncate_excerpt(text: str, max_chars: int = 280) -> str:
+    def _truncate_excerpt(text: str, max_chars: int = 600) -> str:
         cleaned = normalize_whitespace(text)
         if len(cleaned) <= max_chars:
             return cleaned
@@ -540,7 +684,7 @@ class KGRedisStore:
     def search_evidence(
         self,
         query: str,
-        limit: int = 10,
+        limit: int = 20,
         diversify_by_url: bool = True,
     ) -> Dict[str, Any]:
         relationships, entities, chunks, canonical_entities = self._scan_all_entries()
@@ -594,9 +738,6 @@ class KGRedisStore:
             fact_text = f"{canonical_subject} {predicate_norm} {canonical_object}".strip()
             excerpt = self._truncate_excerpt(chunk_data.get("text", ""))
             overlap_score = self._query_overlap_score(query_tokens, fact_text, excerpt)
-
-            if query_tokens and overlap_score == 0:
-                continue
 
             raw_url = normalize_whitespace(chunk_data.get("url", ""))
             if not raw_url:
@@ -718,12 +859,33 @@ class KGRedisStore:
                     "query_relevance": group["query_relevance"],
                     "best_source_score": group["best_source_score"],
                     "avg_confidence": avg_confidence,
+                    "semantic_relevance": 0.0,
+                    "composite_relevance": 0.0,
                 }
             )
 
+        # Compute semantic relevance scores via embeddings
+        if query_tokens and cards:
+            fact_texts = [card["fact"] for card in cards]
+            sem_scores = self._semantic_relevance_scores(query, fact_texts)
+            max_overlap = max((card["query_relevance"] for card in cards), default=1) or 1
+            for card, sem_score in zip(cards, sem_scores):
+                card["semantic_relevance"] = round(sem_score, 4)
+                normalized_overlap = card["query_relevance"] / max_overlap
+                card["composite_relevance"] = round(
+                    sem_score * 0.6 + normalized_overlap * 0.4, 4
+                )
+
+        # Filter: remove cards with no lexical overlap AND low semantic relevance
+        if query_tokens:
+            cards = [
+                card for card in cards
+                if card["query_relevance"] > 0 or card["semantic_relevance"] >= 0.25
+            ]
+
         cards.sort(
             key=lambda card: (
-                card["query_relevance"],
+                card["composite_relevance"],
                 card["support_count"],
                 card["best_source_score"],
                 card["fact"],

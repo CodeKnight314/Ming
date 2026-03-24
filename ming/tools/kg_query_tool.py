@@ -12,8 +12,11 @@ class KGQueryTool(BaseTool):
         action = parameters.get("action")
         if action is None:
             return False, "Missing required parameter 'action'."
-        if action not in ["get_neighbors", "find_connection", "search_evidence"]:
-            return False, "Invalid action. Must be 'get_neighbors', 'find_connection', or 'search_evidence'."
+        valid_actions = [
+            "get_neighbors", "find_connection", "search_evidence", "list_entities",
+        ]
+        if action not in valid_actions:
+            return False, f"Invalid action. Must be one of: {', '.join(valid_actions)}."
         if action == "get_neighbors":
             subject = parameters.get("subject")
             if subject is None:
@@ -42,6 +45,17 @@ class KGQueryTool(BaseTool):
             if not isinstance(diversify_by_url, bool):
                 return False, "diversify_by_url must be a boolean."
             return True, ""
+        if action == "list_entities":
+            keyword = parameters.get("keyword", "")
+            if not isinstance(keyword, str):
+                return False, "keyword must be a string."
+            label = parameters.get("label", "")
+            if not isinstance(label, str):
+                return False, "label must be a string."
+            limit = parameters.get("limit", 30)
+            if not isinstance(limit, int) or limit <= 0:
+                return False, "Limit must be a positive integer."
+            return True, ""
         return False, "Invalid action."
 
     def preflight_check(self) -> bool:
@@ -53,13 +67,25 @@ class KGQueryTool(BaseTool):
 
     def get_parameters(self):
         return {
-            "description": "Query the knowledge graph for information and ranked evidence cards.",
-            "when_to_use": "Use `search_evidence` first to surface ranked facts and supporting URLs for a topic. Use `get_neighbors` or `find_connection` only when you need targeted drill-down after reviewing evidence.",
+            "description": "Query the knowledge graph for information, ranked evidence cards, and entity discovery.",
+            "when_to_use": (
+                "Use `search_evidence` first to surface ranked facts and supporting URLs for a topic. "
+                "Use `list_entities` to discover what entities exist in the KG matching a keyword or label — "
+                "this helps you find valid names for `get_neighbors` and `find_connection`. "
+                "Use `get_neighbors` to explore all facts about a specific entity. "
+                "Use `find_connection` to trace relationships between two entities."
+            ),
             "parameters": [
                 {
                     "name": "action",
                     "type": "string",
-                    "description": "The type of query: 'search_evidence' (ranked evidence cards for a query), 'get_neighbors' (all facts for an entity), 'find_connection' (path between two entities)",
+                    "description": (
+                        "The type of query: "
+                        "'search_evidence' (ranked evidence cards for a query), "
+                        "'list_entities' (discover entities in the KG by keyword/label filter — returns entity names, labels, fact counts, and top predicates), "
+                        "'get_neighbors' (all facts for an entity), "
+                        "'find_connection' (path between two entities)"
+                    ),
                     "required": True,
                 },
                 {
@@ -81,9 +107,21 @@ class KGQueryTool(BaseTool):
                     "required": False,
                 },
                 {
+                    "name": "keyword",
+                    "type": "string",
+                    "description": "Substring filter for entity names. Used with 'list_entities' to find entities containing this keyword (case-insensitive). Optional — omit or pass empty string to list top entities by fact count.",
+                    "required": False,
+                },
+                {
+                    "name": "label",
+                    "type": "string",
+                    "description": "Entity type filter for 'list_entities'. Common labels: ORG, PERSON, GPE, PRODUCT, EVENT, LOC, FAC, WORK_OF_ART, LAW. Case-insensitive. Optional.",
+                    "required": False,
+                },
+                {
                     "name": "limit",
                     "type": "integer",
-                    "description": "Maximum number of evidence cards to return for 'search_evidence'.",
+                    "description": "Maximum number of results to return. Used by 'search_evidence' and 'list_entities'.",
                     "required": False,
                 },
                 {
@@ -122,6 +160,12 @@ class KGQueryTool(BaseTool):
                 limit=parameters.get("limit", 10),
                 diversify_by_url=parameters.get("diversify_by_url", True),
             )
+        if action == "list_entities":
+            return self._list_entities(
+                keyword=parameters.get("keyword", ""),
+                label=parameters.get("label", ""),
+                limit=parameters.get("limit", 30),
+            )
         return []
 
     def _get_neighbors(self, subject: str) -> List[str]:
@@ -129,6 +173,14 @@ class KGQueryTool(BaseTool):
 
     def _find_connection(self, subject: str, object: str) -> List[str]:
         return self.kg_store.find_connection(subject, object)
+
+    def _list_entities(
+        self,
+        keyword: str = "",
+        label: str = "",
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        return self.kg_store.list_entities(keyword=keyword, label=label, limit=limit)
 
     def search_evidence(
         self,
