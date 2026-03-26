@@ -31,6 +31,9 @@ pub struct App {
     pub last_refresh: Option<Instant>,
     pub last_run_id: Option<String>,
     pub last_active_job_id: Option<String>,
+    /// Wall-clock instant when the TUI first observed the current run_id.
+    /// Used to drive a live elapsed timer independent of backend metrics.
+    pub run_started_at: Option<Instant>,
     /// Active batch, if one is in progress.
     pub batch_state: Option<BatchState>,
     pub ui_tick: u32,
@@ -62,6 +65,7 @@ impl App {
             last_refresh: Some(Instant::now()),
             last_run_id,
             last_active_job_id: None,
+            run_started_at: None,
             batch_state: None,
             ui_tick: 0,
             exit_requested: false,
@@ -80,6 +84,10 @@ impl App {
 
                 let new_id = &dashboard.active_run.run_id;
                 if new_id != "none" && !new_id.is_empty() {
+                    if self.last_run_id.as_deref() != Some(new_id.as_str()) {
+                        // First time we see this run_id — start the local clock.
+                        self.run_started_at = Some(Instant::now());
+                    }
                     self.last_run_id = Some(new_id.clone());
                 }
                 self.dashboard = dashboard;
@@ -125,14 +133,14 @@ impl App {
         let total = batch.total;
         let completed = batch.completed;
 
-        if let Some((_, prompt)) = batch.pending.pop_front() {
+        if let Some((item_id, prompt)) = batch.pending.pop_front() {
             // Flush Redis state before submitting the next item.
             if let Err(e) = self.data_source.flush_namespace_state() {
                 self.last_status = format!("Redis flush failed: {e:#}");
                 // Abort the batch rather than risk dirty state.
                 return;
             }
-            match self.data_source.submit_run_query(&prompt) {
+            match self.data_source.submit_run_query(&prompt, Some(&item_id)) {
                 Ok(_) => {
                     self.reset_dashboard_for_new_command();
                     batch.waiting_for_new_run = true;
@@ -154,6 +162,7 @@ impl App {
 
     pub fn reset_dashboard_for_new_command(&mut self) {
         self.last_run_id = None;
+        self.run_started_at = None;
         self.dashboard.active_run = RunView {
             run_id: "none".to_string(),
             prompt: String::new(),
@@ -175,7 +184,7 @@ impl App {
     }
 
     pub fn finish_run_query_submit(&mut self, prompt: &str) -> Result<String> {
-        let msg = self.data_source.submit_run_query(prompt)?;
+        let msg = self.data_source.submit_run_query(prompt, None)?;
         self.batch_state = None;
         self.reset_dashboard_for_new_command();
         self.direct_query_draft.clear();
@@ -184,13 +193,31 @@ impl App {
 
     /// Load a batch file, submit the first item immediately, and keep the
     /// remaining items in `batch_state` for sequential TUI-side dispatch.
+    /// Items whose `reports/id_{id}.md` already exists are skipped.
     pub fn finish_batch_submit(&mut self, path: PathBuf) -> Result<String> {
-        let mut items: VecDeque<(String, String)> =
-            load_batch_items_from_path(&path)?.into_iter().collect();
+        let all_items = load_batch_items_from_path(&path)?;
+        let total_loaded = all_items.len();
+
+        let pending_items: Vec<(String, String)> = all_items
+            .into_iter()
+            .filter(|(id, _)| {
+                let report = PathBuf::from("reports").join(format!("id_{id}.md"));
+                !report.exists()
+            })
+            .collect();
+
+        let skipped = total_loaded - pending_items.len();
+        if pending_items.is_empty() {
+            return Ok(format!(
+                "All {total_loaded} items already have reports; nothing to do."
+            ));
+        }
+
+        let mut items: VecDeque<(String, String)> = pending_items.into_iter().collect();
         let total = items.len();
 
-        let (_, first_prompt) = items.pop_front().unwrap(); // guaranteed ≥ 1
-        let msg = self.data_source.submit_run_query(&first_prompt)?;
+        let (first_id, first_prompt) = items.pop_front().unwrap(); // guaranteed ≥ 1
+        let msg = self.data_source.submit_run_query(&first_prompt, Some(&first_id))?;
 
         self.batch_state = Some(BatchState {
             pending: items,
@@ -200,7 +227,12 @@ impl App {
         });
         self.reset_dashboard_for_new_command();
         self.direct_query_draft.clear();
-        Ok(format!("Batch started ({total} items): {msg}"))
+        let skip_note = if skipped > 0 {
+            format!(", {skipped} skipped")
+        } else {
+            String::new()
+        };
+        Ok(format!("Batch started ({total} items{skip_note}): {msg}"))
     }
 
     pub fn handle_slash_command(&mut self, line: &str) {

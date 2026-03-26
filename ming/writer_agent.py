@@ -23,7 +23,6 @@ from ming.core.outline_parser import SectionPlan, outline_toc_summary, strip_mar
 from ming.models.openrouter_model import OpenRouterModel, OpenRouterModelConfig
 from ming.subagent import Agent, AgentConfig
 from ming.tools.kg_query_tool import KGQueryTool
-from ming.tools.think_tool import ThinkTool
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +110,7 @@ class WriterAgent:
                 model=primary,
                 fallback_model=fallback_eff,
                 system_prompt=sp,
-                tools=[self.config.kg_query_tool, ThinkTool()],
+                tools=[self.config.kg_query_tool],
                 max_iterations=self.config.max_iterations,
                 max_tool_calls_per_turn=8,
             )

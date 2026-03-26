@@ -109,7 +109,14 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("   stage ", Style::default().fg(theme::MUTED)),
         Span::styled(run.stage.clone(), Style::default().fg(stage_color)),
         Span::styled(
-            format!("   {}s", run.elapsed_seconds),
+            format!(
+                "   {}",
+                format_elapsed(
+                    app.run_started_at
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(run.elapsed_seconds)
+                )
+            ),
             Style::default().fg(theme::TEXT),
         ),
         Span::styled("   ↻ ", Style::default().fg(theme::MUTED)),
@@ -740,6 +747,20 @@ fn metric_value(app: &App, key: &str) -> Option<String> {
         .iter()
         .find(|metric| metric.label == key)
         .map(|metric| metric.value.clone())
+}
+
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m{s:02}s")
+        }
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

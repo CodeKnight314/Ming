@@ -55,7 +55,10 @@ impl DataSource {
         }
     }
 
-    pub fn submit_run_query(&self, prompt: &str) -> Result<String> {
+    /// Submit a single research query. `batch_item_id`, when provided, is
+    /// forwarded in metadata so the backend can name the output file
+    /// `id_{batch_item_id}.md` instead of a generic job-id-based name.
+    pub fn submit_run_query(&self, prompt: &str, batch_item_id: Option<&str>) -> Result<String> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Err(anyhow!("prompt is empty"));
@@ -70,6 +73,10 @@ impl DataSource {
                     .get_connection()
                     .context("failed to connect to Redis for command submission")?;
                 let command_id = format!("cmd_rs_{}", unix_millis()?);
+                let metadata = match batch_item_id {
+                    Some(id) => json!({ "prompt_id": id }),
+                    None => json!({}),
+                };
                 let payload = json!({
                     "command_id": command_id,
                     "type": "run_query",
@@ -81,7 +88,7 @@ impl DataSource {
                     },
                     "payload": {
                         "prompt": prompt,
-                        "metadata": {}
+                        "metadata": metadata
                     }
                 });
                 xadd_command(&mut con, namespace, &payload, &command_id)

@@ -117,7 +117,7 @@ def default_job_executor_factory(
         )
         config = create_ming_deep_research_config(config_dict)
 
-        prompt_id = job.payload.get("prompt_id")
+        prompt_id = job.payload.get("prompt_id") or job.payload.get("metadata", {}).get("prompt_id")
         if prompt_id is not None:
             draft_name = f"id_{prompt_id}.md"
         else:

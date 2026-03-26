@@ -14,7 +14,7 @@
 </div>
 
 ## Overview
-Ming DeepResearch (明 — "clarity") is a multi-agent deep research system that leverages knowledge graphs to structure and manage greater volume of web-sourced content at competitive precision. Designed for cost-effectiveness, Ming delivers high-quality deep research reports at feasible cost. For reference, a standard 13,000~15,000 word report costs Ming DeepResearch only $0.72~ (including web search credits) with Ming DeepResearch while out-performing robust proprietary services. Furthermore, Ming can be configured for more flexible deployment through varied configurations.
+Ming DeepResearch (明 — "clarity") is a multi-agent deep research system that leverages knowledge graphs to structure and manage greater volume of web-sourced content at competitive precision. Designed for cost-effectiveness, Ming delivers high-quality deep research reports at feasible cost. For reference, a standard 13,000~15,000 word report costs Ming DeepResearch only $0.82~ (including web search credits) with Ming DeepResearch while matching robust proprietary services. Furthermore, Ming can be configured for more flexible deployment through varied configurations, such as increased search budget for each subagent. 
 
 We use the following models to support Ming DeepResearch: 
 
@@ -30,7 +30,8 @@ We use the following models to support Ming DeepResearch:
 ## Results
 Below are our results on [DeepResearch Bench](https://muset-ai-deepresearch-bench-leaderboard.hf.space/#):
 
-Total evaluation cost (including reruning specific tasks): $76.32
+Total evaluation cost for Ming-10 (including reruning specific tasks): $76.32
+Total evaluation cost for Ming-20 (including reruning specific tasks): $132.7
 
 ## Installation
 
@@ -65,6 +66,21 @@ In a separate terminal, activate the Rust-based Terminal User Interface:
 ```bash
 cargo run --manifest-path runtime-tui/Cargo.toml -- --redis-url redis://127.0.0.1:6379/0 --namespace runtime
 ```
+The Rust TUI supports both single query mode (type your query directly in the text field) and batched query mode, which is triggered with the `/batch` command on a `.jsonl` file.
+
+To use batched queries, prepare a `.jsonl` file where each line is a JSON object with the following keys:
+
+```json
+{
+  "id": <unique_integer>, 
+  "topic": "<topic or category>", 
+  "language": "<'en'|'zh' etc.>", 
+  "prompt": "<your question or research prompt>"
+}
+```
+
+Once your file is ready, type `/batch /path/to/your_file.jsonl` in the TUI to begin processing all queries in batch mode. Each result will be associated with its `id` field for easy tracking.
+
 
 ### 2. Running Command Line Interface
 
@@ -73,16 +89,6 @@ Start Redis first (same as the TUI flow), e.g. `bash startup.sh`, then run the o
 ```bash
 python -m ming.orchestrator --query "Write me a deep research report on the history of artificial intelligence"
 ```
-
-**Batch (DeepResearch Bench)** — read `deepresearch-bench/query_data/query.jsonl` (one JSON object per line with `id` and `prompt`). Each row runs sequentially. Reports are written as `id_<id>.md`. If `id_<id>.md` already exists under the submission directory, that row is skipped. Research Redis (context, queries store, KG) is flushed before **each** new query so runs do not share state.
-
-Default submission directory is `../submission` relative to the JSONL file (e.g. `query_data/query.jsonl` → `deepresearch-bench/submission/`).
-
-```bash
-python -m ming.orchestrator --jsonl deepresearch-bench/query_data/query.jsonl
-```
-
-## Limitations 
 
 ## Acknowledgements
 Special thanks to the following repositories for sharing their inspiring designs and insights!

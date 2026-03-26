@@ -117,6 +117,9 @@ class OpenRouterModelConfig:
     model_kwargs: Optional[dict[str, Any]] = None
 
 
+_LLM_CALL_TIMEOUT_MS = 180_000
+
+
 def _build_chat_openrouter(
     model: str,
     api_key: str,
@@ -135,6 +138,9 @@ def _build_chat_openrouter(
         "temperature": temperature,
         # LangChain / OpenRouter HTTP field name remains max_tokens.
         "max_tokens": max_new_tokens,
+        # Without this, ChatOpenRouter default is None (no timeout), which can
+        # cause a thread to block forever if OpenRouter stops sending chunks.
+        "request_timeout": _LLM_CALL_TIMEOUT_MS,
     }
     if site_url:
         kwargs["app_url"] = site_url

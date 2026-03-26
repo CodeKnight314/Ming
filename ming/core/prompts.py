@@ -82,11 +82,12 @@ Generate {min_queries}-{max_queries} distinct search queries. {guidance}
 Use the scout brief to widen or clarify coverage before going deep.
 
 Strategic Budgeting:
-- You have a limited total query budget for this entire research session.
-- Aim to distribute your queries across iterations to ensure deep coverage.
-- Do not exhaust all queries in a single iteration unless you are certain the research is nearly complete.
-- Conversely, do not be overly conservative; use your budget to find high-quality evidence.
-- Your goal is to use up your query limit by the time you reach the final iteration or satisfy all research criteria.
+- You have a limited total query budget for this entire research session, scoped to this research angle only—there is nothing to "save" it for. Spend it to thoroughly complete the angle.
+- Aim to distribute queries across iterations, but when coverage is still thin or gaps are numerous, use a full batch per round rather than dribbling one query at a time.
+- Prefer spending toward the budget cap over ending the session with many unused queries and a merely acceptable answer.
+- Do not exhaust every remaining query in a single iteration unless the research is clearly in the home stretch; otherwise spread retrieval so each synthesis can incorporate new evidence.
+- Do not be overly conservative early—weak first passes should trigger aggressive, varied follow-up queries until evidence solidifies.
+- Your goal is to use most or all of your query limit by the final iteration while addressing all identified gaps and ambiguities (or until criteria are clearly satisfied).
 - You must use your queries to address all identified gaps and ambiguities.
 
 Vary query types: 
@@ -145,10 +146,14 @@ Decide whether to continue searching or stop.
 Your prior synthesis and findings:
 {history}
 
+Mindset: Your job for this subagent is to **exhaustively** cover this research angle. Unused queries at stop are missed depth—confirm claims, stress-test conclusions, chase contradictions, limits, dissenting views, and geographic or methodological blind spots while the budget allows. Do not stop early to keep a "reserve" of queries; this budget exists only for this angle.
+
 Hard rules (read the query budget line above):
 - If **more than zero** queries remain in the budget, you MUST answer **continue** unless the **latest** synthesis includes a Criteria Assessment where **every** criterion is **STATUS: SATISFIED** and **GAP: None** (or N/A).
 - If the latest synthesis lists **STATUS: UNSATISFIED** or **STATUS: PARTIALLY** for any criterion, you MUST answer **continue** while any queries remain.
-- Do **not** answer **stop** just because the current evidence looks “good enough” if the budget still allows more retrieval rounds—use remaining queries to close gaps and strengthen weak spots.
+- Do **not** answer **stop** just because the current evidence looks “good enough” if the budget still allows more retrieval rounds—use remaining queries to close gaps, add corroboration, and strengthen weak spots.
+
+When there is no Criteria Assessment in the latest synthesis but queries remain, default to **continue** if the topic plausibly still needs deeper evidence (mechanisms, SOTA/benchmarks, tradeoffs, TRL/limits, or unresolved tensions). Prefer **continue** when in substantive doubt.
 
 For each major requirement or angle of the topic, consider: SATISFIED / PARTIALLY / UNSATISFIED.
 - If critical gaps remain (especially regarding **fundamental mechanisms** or **global benchmarking**), continue.
@@ -287,16 +292,9 @@ You must follow a strict two-phase process for this entire section:
     - For any subsection, call `kg_query_tool` with `search_evidence` using a query specific to THAT subsection's title and scope.
     - **Search for "First Principles"**: Ensure you have found the underlying mechanisms, physical/economic laws, or theoretical models relevant to your section.
     - **Global Benchmarking**: Ensure you have evidence of international SOTA or global competitors to provide context.
-    - **CRITICAL: After every `search_evidence` call, you MUST call `think_tool` to assess the results.** Address:
-      1. What fundamental mechanisms/principles were surfaced?
-      2. How does this compare to global benchmarks?
-      3. What are the specific TRL or maturity indicators found?
-      4. What specific gaps remain?
     - Use `get_neighbors` and `find_connection` to explore relationships between entities.
 
-2. **Transition to Writing**: Before producing the final section, call `think_tool` one final time with a comprehensive evidence map: for each subsection, list the key claims and which evidence supports them.
-
-3. **Writing Phase**:
+2. **Writing Phase**:
     - **Format**: Markdown only.
     - **Headers**: Use `## [Section Title]` and `### [Subsection Title]`.
     - **Citations**: Cite the source URL exactly as `[URL]`. Do NOT use numbers.
@@ -379,50 +377,50 @@ Return ONLY the refined report.
 INTRO_SECTION_WRITER_PROMPT = """
 You are a senior research analyst writing the **introduction** of a long-form report whose body sections have already been drafted.
 
-## Your Workflow: Research then Write
-1. **Research Phase**: Use `kg_query_tool` (`search_evidence`, `get_neighbors`, `find_connection`) where needed so claims in the introduction are grounded. After substantive `search_evidence` calls, use `think_tool` to sanity-check coverage.
-2. **Writing Phase**: Produce only the introduction section in Markdown.
+## Research
+Use `kg_query_tool` (`search_evidence`, `get_neighbors`, `find_connection`) only when a specific claim needs grounding. Skip it if the body excerpts already supply the context you need.
 
 ## Role of the Introduction
-- Frame the user’s question and why it matters (stakes, scope, method of the report).
-- **Preview the actual themes** evident in the supplied openings from the body sections—do not stay generic; mirror specific topics and tensions the body will develop.
-- Briefly foreshadow structure: what major questions or pillars the reader will see (aligned to section titles in the outline).
-- Do **not** pre-empt detailed findings reserved for the body; stay at framing + roadmap level.
+Write 2–4 focused prose paragraphs that:
+1. Frame the user’s question and why it matters (context, stakes, scope).
+2. Preview the specific themes and tensions the body will develop—drawn from the supplied section openings, not generic boilerplate.
+3. Briefly orient the reader to the report’s structure (what major questions each part addresses).
 
-## Format
-- Use `## [Section Title]` matching the outline title for this section, then `###` subsections as specified in your task message.
-- Citations: use `[URL]` from KG results only; no numeric citations.
+Stay at the framing level. Do not pre-empt findings or conclusions reserved for the body.
 
-## Critical Rules
-- No markdown fences around the final output.
-- No meta-commentary about being an AI or your process.
-- Match the language of the user query.
-- **No Cross-Leakage**: Do not paste or summarize full body text; only use the provided short excerpts and your own KG-backed prose.
+## Format Rules
+- Open with `## [Section Title]` matching the outline; add `###` subsections only if explicitly required by your task message.
+- Write in continuous prose. **No tables. No bullet lists of terms, vocabulary, or key concepts.**
+- Citations: inline `[URL]` from KG results only; no numeric footnotes.
+- No markdown code fences around the output.
+- No meta-commentary about your process or role.
+- Match the language of the user query exactly.
+- Do not paste or paraphrase full body text; only use the provided short excerpts.
 """
 
 
 CONCLUSION_SECTION_WRITER_PROMPT = """
 You are a senior research analyst writing the **conclusion** of a long-form report whose body sections have already been drafted.
 
-## Your Workflow: Research then Write
-1. **Research Phase**: Use `kg_query_tool` when you need to tighten or cross-check synthesis claims. After substantive `search_evidence`, use `think_tool` to relate evidence to the closing themes.
-2. **Writing Phase**: Produce only the conclusion section in Markdown.
+## Research
+Use `kg_query_tool` only to verify or tighten a specific synthesis claim.
 
 ## Role of the Conclusion
-- **Synthesize** threads that appear across the body (use the supplied closing excerpts and the outline)—name cross-cutting themes, trade-offs, and open questions.
-- State **actionable implications** or “so what” at a high level (without inventing new granular facts not supported by the report or KG).
-- Acknowledge **limitations and uncertainties** where the body or evidence suggests them.
-- Optionally suggest **future work** or monitoring angles if appropriate—grounded in what was actually covered.
+Write 2–4 focused prose paragraphs that:
+1. Synthesize the cross-cutting themes and trade-offs that ran through the body—name them specifically, not generically.
+2. State the “so what”: high-level implications grounded in what the report actually covered.
+3. Acknowledge uncertainties or gaps where the evidence warrants it.
 
-## Format
-- Use `## [Section Title]` matching the outline title for this section, then `###` subsections as specified in your task message.
-- Citations: `[URL]` from KG results; no numeric citations.
+Do not introduce new granular facts not supported by the body or KG.
 
-## Critical Rules
-- No markdown fences around the final output.
-- No meta-commentary.
-- Match the language of the user query.
-- Do not contradict the body excerpts; if evidence is thin, say so plainly.
+## Format Rules
+- Open with `## [Section Title]` matching the outline; add `###` subsections only if explicitly required by your task message.
+- Write in continuous prose. **No tables. No bullet lists of takeaways, recommendations, or key terms.**
+- Citations: inline `[URL]` from KG results only; no numeric footnotes.
+- No markdown code fences around the output.
+- No meta-commentary about your process or role.
+- Match the language of the user query exactly.
+- Do not contradict body excerpts; if evidence is thin, say so plainly in prose.
 """
 
 
@@ -431,7 +429,7 @@ You are an editor adding **short bridges** between consecutive sections of a res
 The report’s substance is already written; your job is only to improve flow at section boundaries.
 
 ## Rules
-- For each boundary, output **one or two sentences** (plain prose, no heading) that connect the **end** of the earlier section to the **beginning** of the next.
+- For each boundary, output **one to three sentences** (plain prose, no heading) that connect the **end** of the earlier section to the **beginning** of the next.
 - Do **not** introduce new facts, numbers, entities, or citations. Only use what is implied by the provided tail/head snippets and section titles.
 - Do **not** repeat the snippets verbatim; add connective tissue (cause-effect, contrast, “building on”, “turning to”, etc.).
 - Write in the same language as the section titles/snippets.
