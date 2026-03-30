@@ -2,7 +2,7 @@ from ming.extraction.ner_module import Chunk
 from math import log
 from collections import Counter
 from typing import List, Set
-from sentence_transformers import SentenceTransformer
+from ming.extraction.st_loader import load_sentence_transformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 import faiss
 import numpy as np
@@ -160,7 +160,7 @@ def chunk_optimization(chunks: List[Chunk], k: int = 20, sim_threshold: float = 
     if len(chunks) <= 1:
         return list(chunks)
 
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    model = load_sentence_transformer("all-MiniLM-L6-v2")
     tfidf_model = TfidfVectorizer(tokenizer=tokenize, token_pattern=None)
     
     corpus = [chunk.text for chunk in chunks]

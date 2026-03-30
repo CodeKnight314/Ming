@@ -1,7 +1,7 @@
 <p align="center" style="margin: 0;">
   <span style="display: inline-flex; align-items: center; gap: 10px;">
     <picture>
-      <img src="ming.png" alt="Ming-DeepResearch logo" height="60" style="border-radius: 8px;" />
+      <img src="assets/ming.png" alt="Ming-DeepResearch logo" height="60" style="border-radius: 8px;" />
     </picture>
     <span style="font-size: 2.2rem; font-weight: 700;">
       <u>Ming DeepResearch</u>
@@ -9,21 +9,86 @@
   </span>
 </p>
 
+<div align="center">
+  <img src="assets/TUI.png" alt="Ming DeepResearch runtime TUI" style="max-width: min(100%, 960px); height: auto; border-radius: 8px;" />
+</div>
+
 ## Overview
-Ming (明 — meaning "clarity") is a deep research multi-agent system that incorporates knowledge graphs to manage websearch content more intentionally as context. Ming is built for flexibility, supporting report depths from focused briefs to exhaustive deep dives. 
+Ming DeepResearch (明 — "clarity") is a multi-agent deep research system that leverages knowledge graphs to structure and manage greater volume of web-sourced content at competitive precision. Designed for cost-effectiveness, Ming delivers high-quality deep research reports at feasible cost. For reference, a standard 13,000~15,000 word report costs Ming DeepResearch only $0.82~ (including web search credits) with Ming DeepResearch while matching robust proprietary services. Furthermore, Ming can be configured for more flexible deployment through varied configurations, such as increased search budget for each subagent. 
 
-Ming offers the following research modes to support varying research needs:
-- 🌒 Crescent — concise, focused brief
-- 🌓 Quarter — standard depth report
-- 🌕 Lunar — exhaustive deep dive
+We use the following models to support Ming DeepResearch: 
 
-For evaluation purposes, we submit standard depth reports to DeepResearch Bench.
+| Purpose               | Model                         |
+|-----------------------|-------------------------------|
+| Scout                 | qwen/qwen3.5-flash-02-23      |
+| Research              | qwen/qwen3.5-flash-02-23      |
+| Entity Extraction     | google/gemma-3n-e4b-it        |
+| Outline               | qwen/qwen3.5-plus-02-15       |
+| Writing               | qwen/qwen3.5-plus-02-15       | 
+
 
 ## Results
+Below are our results on [DeepResearch Bench](https://muset-ai-deepresearch-bench-leaderboard.hf.space/#):
+
+Total evaluation cost for Ming-10 (including reruning specific tasks): $76.32
+Total evaluation cost for Ming-20 (including reruning specific tasks): $132.7
 
 ## Installation
 
-## Limitations 
+- **Python** 3.11 or newer
+- **Docker** — required to create `./startup.sh` to run Redis locally 
+- **Rust** — needed for the runtime TUI
+
+You can optionally set up a virtual environment before running the installation script
+```bash 
+cd /path/to/Ming
+uv venv 
+.venv/source/activate
+```
+Run the following in terminal to complete installtion
+```bash
+pip install -e .
+python -m spacy download en_core_web_sm
+python -m spacy download zh_core_web_sm
+```
+
+## Usage
+
+Ming DeepResearch offers two modes of user interface to utilize the deepresearch agent: A Terminal User Interface with complete observability and a Command Line Interface for direct query.
+
+### 1. Running Terminal User Interface
+
+Run the following to start hosting the Redis Docker containers and python backend.
+```bash 
+bash startup.sh
+```
+In a separate terminal, activate the Rust-based Terminal User Interface:
+```bash
+cargo run --manifest-path runtime-tui/Cargo.toml -- --redis-url redis://127.0.0.1:6379/0 --namespace runtime
+```
+The Rust TUI supports both single query mode (type your query directly in the text field) and batched query mode, which is triggered with the `/batch` command on a `.jsonl` file.
+
+To use batched queries, prepare a `.jsonl` file where each line is a JSON object with the following keys:
+
+```json
+{
+  "id": <unique_integer>, 
+  "topic": "<topic or category>", 
+  "language": "<'en'|'zh' etc.>", 
+  "prompt": "<your question or research prompt>"
+}
+```
+
+Once your file is ready, type `/batch /path/to/your_file.jsonl` in the TUI to begin processing all queries in batch mode. Each result will be associated with its `id` field for easy tracking.
+
+
+### 2. Running Command Line Interface
+
+Start Redis first (same as the TUI flow), e.g. `bash startup.sh`, then run the orchestrator from the repo root.
+
+```bash
+python -m ming.orchestrator --query "Write me a deep research report on the history of artificial intelligence"
+```
 
 ## Acknowledgements
 Special thanks to the following repositories for sharing their inspiring designs and insights!

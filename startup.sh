@@ -19,3 +19,8 @@ recreate_redis_container() {
 recreate_redis_container "redis" "6379" "Context Redis"
 recreate_redis_container "redis-queries" "6380" "Queries Redis"
 recreate_redis_container "redis-kg" "6381" "KG Redis"
+
+# Per research job, ming.runtime.service flushes queries + KG DBs and clears
+# context keys except runtime:* (control plane lives on 6379 with research context).
+
+python -m ming.runtime.service

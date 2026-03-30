@@ -7,3 +7,4 @@ re_json_errors/
 scripts/
 .DS_Store
 reports/
+runtime-tui/target/

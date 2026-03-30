@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from threading import local
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Callable, Dict, Iterable, List, Optional, Union
 
 from ming.extraction.ner_module import Chunk, Entity, NERModule
 from ming.extraction.re_module import REModule, Relationship
@@ -18,6 +19,8 @@ from ming.extraction.selection_policy import (
 from ming.extraction.kg_module import KGRedisStore
 from ming.extraction.kg_schema import Chunk as KGChunk, Entity as KGEntity
 from ming.core.text_metrics import count_language_aware_tokens
+
+logger = logging.getLogger(__name__)
 
 SOURCE_SCORE_CUTOFF = 4.5
 
@@ -112,7 +115,10 @@ class NERREPipeline:
         )
 
     def collect_sources(
-        self, sources: Iterable[tuple[str, str] | tuple[str, str, str]]
+        self,
+        sources: Iterable[tuple[str, str] | tuple[str, str, str]],
+        *,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> List[SourceChunkCollection]:
         normalized_sources = list(sources)
         if not normalized_sources:
@@ -140,6 +146,8 @@ class NERREPipeline:
             for future in as_completed(future_map):
                 idx = future_map[future]
                 collected_by_index[idx] = future.result()
+                if progress_callback is not None:
+                    progress_callback(len(collected_by_index), len(normalized_sources))
 
         collected: List[SourceChunkCollection] = []
         for idx in range(len(normalized_sources)):
@@ -154,7 +162,14 @@ class NERREPipeline:
         min_tokens: int = 400,
         source_score_cutoff: Optional[float] = None,
         source_budget: Optional[int] = None,
+        max_sources_threshold: int = 160,
     ) -> List[SourceChunkCollection]:
+        # If the number of sources is within the threshold, return them all
+        # without any filtering or pruning.
+        if len(sources) <= max_sources_threshold:
+            return list(sources)
+
+        # Beyond the threshold, apply ranking and keep the top N sources.
         # First filter by minimum token requirement only.
         eligible = [
             source
@@ -182,6 +197,9 @@ class NERREPipeline:
             key=lambda source: (source.source_score, source.token_count, source.url),
             reverse=True,
         )
+
+        # Cap to the threshold.
+        retained = retained[:max_sources_threshold]
 
         if source_budget is not None and source_budget > 0:
             retained = retained[:source_budget]
@@ -299,7 +317,12 @@ class NERREPipeline:
 
         return kg_chunks, kg_entities, entity_map
 
-    def run_re_on_chunks(self, chunks: List[Chunk]) -> List[KGEntity]:
+    def run_re_on_chunks(
+        self,
+        chunks: List[Chunk],
+        *,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> List[KGEntity]:
         if not chunks:
             return []
 
@@ -313,6 +336,7 @@ class NERREPipeline:
 
         max_workers = min(self.max_workers, len(chunks_with_entities_indices))
         results_by_chunk_idx = {}
+        processed_count = 0
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
@@ -331,6 +355,10 @@ class NERREPipeline:
                         getattr(chunk, "url", ""),
                         exc,
                     )
+                finally:
+                    processed_count += 1
+                    if progress_callback is not None:
+                        progress_callback(processed_count, len(chunks_with_entities_indices))
 
         all_relationships = []
         rel_to_entities = []

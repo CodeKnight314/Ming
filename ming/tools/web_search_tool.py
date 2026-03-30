@@ -3,9 +3,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import os
 import re
 import requests
+import logging
 from urllib.parse import urlparse
 
 from ming.tools.base_tools import BaseTool, ToolSchema
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class WebSearchToolConfig:
@@ -42,6 +45,14 @@ class WebSearchTool(BaseTool):
     def __init__(self, config: WebSearchToolConfig, name: str = "web_search_tool"):
         super().__init__(name)
         self.config = config
+        try:
+            from dotenv import load_dotenv
+
+            # Prefer repo-local .env over any pre-exported shell variables.
+            load_dotenv(override=True)
+        except Exception:
+            # dotenv is optional; tool can still work with env vars set externally.
+            pass
         self.api_key = (config.api_key or os.environ.get("TAVILY_API_KEY", "")).strip()
         self._client = None
 
@@ -183,9 +194,11 @@ class WebSearchTool(BaseTool):
     def run(self, query: str) -> Dict[str, Any]:
         is_valid, error = self.validate_parameters({"query": query})
         if not is_valid:
+            logger.warning("WebSearchTool invalid query: %s", error)
             return []
 
         if not self.api_key:
+            logger.warning("WebSearchTool missing TAVILY_API_KEY; returning no results.")
             return []
 
         try:
@@ -193,6 +206,7 @@ class WebSearchTool(BaseTool):
             results = self._normalize_results(response.get("results"))
             return results
         except Exception as exc:
+            logger.warning("WebSearchTool Tavily search failed: %s", exc)
             return []
 
     def check_api_usage(self) -> Dict[str, Any]:

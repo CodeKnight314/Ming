@@ -23,7 +23,7 @@ def _config_to_spec(config: Union[dict, OpenRouterModelConfig]) -> dict:
         "provider": "openrouter",
         "model_name": config.model_name,
         "temperature": config.temperature,
-        "max_tokens": config.max_tokens,
+        "max_new_tokens": config.max_new_tokens,
         "site_url": config.site_url,
         "site_name": config.site_name,
     }

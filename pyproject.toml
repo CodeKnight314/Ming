@@ -21,7 +21,14 @@ dependencies = [
     "tavily-python",
     "trafilatura",
     "datasketch",
-    "faiss-cpu"
+    "faiss-cpu",
+    "numpy",
+    "sentence-transformers",
+    "python-louvain",
+    "networkx",
+    "scikit-learn",
+    "spacy",
+    "tqdm",
 ]
 
 [project.optional-dependencies]

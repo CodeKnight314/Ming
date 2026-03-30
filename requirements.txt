@@ -3,8 +3,10 @@ httpx
 json-repair
 langchain-core
 langchain-openrouter
+langgraph
 python-dotenv
 pytz
+redis
 requests
 tavily-python
 trafilatura
@@ -13,3 +15,7 @@ sentence-transformers
 datasketch
 faiss-cpu
 python-louvain
+networkx
+scikit-learn
+spacy
+tqdm

@@ -1,0 +1,123 @@
+{
+  "queue": {
+    "queued": [
+      {
+        "job_id": "job_102",
+        "kind": "single_run",
+        "prompt_label": "Investigate scheduler backpressure metrics",
+        "command_id": "cmd_102",
+        "status": "queued"
+      },
+      {
+        "job_id": "job_103",
+        "kind": "batch_child_run",
+        "prompt_label": "Batch item b2",
+        "command_id": "cmd_103",
+        "status": "queued"
+      }
+    ],
+    "active": {
+      "job_id": "job_101",
+      "kind": "single_run",
+      "prompt_label": "Explain runtime stalls during KG extraction",
+      "command_id": "cmd_101",
+      "status": "running"
+    },
+    "completed": [
+      {
+        "job_id": "job_099",
+        "kind": "batch_child_run",
+        "prompt_label": "Batch item a1",
+        "command_id": "cmd_099",
+        "status": "completed"
+      },
+      {
+        "job_id": "job_100",
+        "kind": "batch_child_run",
+        "prompt_label": "Batch item a2",
+        "command_id": "cmd_099",
+        "status": "completed"
+      }
+    ],
+    "failed": []
+  },
+  "active_run": {
+    "run_id": "run_101",
+    "prompt": "Explain runtime stalls during KG extraction",
+    "status": "running",
+    "stage": "kg_re",
+    "elapsed_seconds": 187,
+    "progress_ratio": 0.66,
+    "stage_progress": [
+      { "label": "scout", "status": "completed", "duration_seconds": 11 },
+      { "label": "planning", "status": "completed", "duration_seconds": 7 },
+      { "label": "research_parallel", "status": "completed", "duration_seconds": 96 },
+      { "label": "kg_collect", "status": "completed", "duration_seconds": 13 },
+      { "label": "kg_filter", "status": "completed", "duration_seconds": 4 },
+      { "label": "kg_re", "status": "running", "duration_seconds": 38 },
+      { "label": "entity_resolution", "status": "pending", "duration_seconds": 0 },
+      { "label": "outline", "status": "pending", "duration_seconds": 0 },
+      { "label": "write", "status": "pending", "duration_seconds": 0 }
+    ],
+    "angles": [
+      {
+        "angle_id": "angle_1",
+        "topic": "source retention failures",
+        "stage": "decide",
+        "iteration": 2,
+        "queries_total": 6,
+        "context_ids_total": 9,
+        "status": "completed"
+      },
+      {
+        "angle_id": "angle_2",
+        "topic": "chunk explosion during KG extraction",
+        "stage": "retrieve",
+        "iteration": 2,
+        "queries_total": 5,
+        "context_ids_total": 7,
+        "status": "running"
+      },
+      {
+        "angle_id": "angle_3",
+        "topic": "model fallback impact on run latency",
+        "stage": "think",
+        "iteration": 1,
+        "queries_total": 3,
+        "context_ids_total": 4,
+        "status": "running"
+      }
+    ],
+    "metrics": [
+      { "label": "retained_sources", "value": "42" },
+      { "label": "selected_chunks", "value": "118" },
+      { "label": "kg_entities", "value": "263" },
+      { "label": "relationships", "value": "417" }
+    ]
+  },
+  "recent_events": [
+    {
+      "ts": "15:00:19",
+      "component": "orchestrator",
+      "message": "Parallel research stage completed.",
+      "stage": "research_parallel",
+      "level": "info"
+    },
+    {
+      "ts": "15:00:24",
+      "component": "research_subagent",
+      "message": "Completed synthesis for current iteration.",
+      "stage": "think",
+      "level": "info"
+    },
+    {
+      "ts": "15:00:31",
+      "component": "orchestrator",
+      "message": "KG relationship extraction completed.",
+      "stage": "kg_re",
+      "level": "warning"
+    }
+  ],
+  "direct_query_draft": "Investigate why angle 2 is stalled in retrieve and whether URL caching is masking low-value sources.",
+  "batch_json_draft": "[\n  {\n    \"id\": \"b1\",\n    \"prompt\": \"Summarize runtime queue health\"\n  },\n  {\n    \"id\": \"b2\",\n    \"prompt\": \"Inspect angle-level query efficiency\"\n  }\n]\n"
+}
