@@ -14,9 +14,11 @@
 </div>
 
 ## Overview
-Ming DeepResearch (明 — "clarity") is a multi-agent deep research system that leverages knowledge graphs to structure and manage greater volume of web-sourced content at competitive precision. Designed for cost-effectiveness, Ming delivers high-quality deep research reports at feasible cost. For reference, a standard 13,000~15,000 word report costs Ming DeepResearch only $0.82~ (including web search credits) with Ming DeepResearch while matching robust proprietary services. Furthermore, Ming can be configured for more flexible deployment through varied configurations, such as increased search budget for each subagent. 
+Ming DeepResearch (明 — "clarity") is a multi-agent deep research system that leverages knowledge graphs to structure and manage greater volume of web-sourced content at competitive precision. Designed for cost-effectiveness, Ming delivers high-quality deep research reports at feasible cost. For reference, a standard 13,000\~15,000 word report costs Ming DeepResearch only $0.82\~ (including web search credits) with Ming DeepResearch while matching robust proprietary services. Furthermore, Ming can be configured for more flexible deployment through varied configurations, such as increased search budget for each subagent. 
 
 We use the following models to support Ming DeepResearch: 
+
+<div align="center">
 
 | Purpose               | Model                         |
 |-----------------------|-------------------------------|
@@ -26,11 +28,13 @@ We use the following models to support Ming DeepResearch:
 | Outline               | qwen/qwen3.5-plus-02-15       |
 | Writing               | qwen/qwen3.5-plus-02-15       | 
 
+</div>
 
 ## Results
 Below are our results on [DeepResearch Bench](https://muset-ai-deepresearch-bench-leaderboard.hf.space/#):
 
 Total evaluation cost for Ming-10 (including reruning specific tasks): $76.32
+
 Total evaluation cost for Ming-20 (including reruning specific tasks): $132.7
 
 ## Installation
