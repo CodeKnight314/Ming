@@ -605,11 +605,26 @@ class ResearchSubagent:
         if not queries:
             return {"history": state["history"] + ["No queries generated."]}
 
+        # Retry search up to 3 times when ALL queries return zero results
+        # (likely a transient DNS/network failure, not "nothing exists").
+        import time as _time
+        _MAX_SEARCH_RETRIES = 3
         web_results: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=max(1, len(queries))) as executor:
-            futures = [executor.submit(self._search_web, q) for q in queries]
-            for future in as_completed(futures):
-                web_results.extend(future.result())
+        for attempt in range(1, _MAX_SEARCH_RETRIES + 1):
+            web_results = []
+            with ThreadPoolExecutor(max_workers=max(1, len(queries))) as executor:
+                futures = [executor.submit(self._search_web, q) for q in queries]
+                for future in as_completed(futures):
+                    web_results.extend(future.result())
+            if web_results or attempt >= _MAX_SEARCH_RETRIES:
+                break
+            delay = 2.0 * attempt
+            logger.warning(
+                "All %d search queries returned 0 results (attempt %d/%d); "
+                "retrying in %.0fs (likely transient network issue)",
+                len(queries), attempt, _MAX_SEARCH_RETRIES, delay,
+            )
+            _time.sleep(delay)
 
         self.statistics["total_searches"] += len(queries)
         self.statistics["total_queries"] += len(queries)

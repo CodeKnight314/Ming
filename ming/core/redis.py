@@ -15,10 +15,11 @@ class RedisDatabaseConfig:
     hostname: str
     port: int
     db: int = 0
+    key_prefix: str = ""
 
 
 class RedisDatabase:
-    def __init__(self, config: RedisDatabaseConfig):
+    def __init__(self, config: RedisDatabaseConfig, key_prefix: str = ""):
         self.client = redis.Redis(
             host=config.hostname,
             port=config.port,
@@ -26,20 +27,21 @@ class RedisDatabase:
             decode_responses=True,
         )
         self.config = config
+        self._pfx = key_prefix or config.key_prefix
 
     def create_entry(self, entry: dict[str, Any]) -> str:
         uuid = str(uuid4())
-        self.client.hset(uuid, mapping=self._serialize_entry(entry))
+        self.client.hset(self._pfx + uuid, mapping=self._serialize_entry(entry))
         return uuid
 
     def get_entry(self, uuid: str) -> dict[str, Any]:
-        return self.client.hgetall(uuid)
+        return self.client.hgetall(self._pfx + uuid)
 
     def delete_entry(self, uuid: str):
-        self.client.delete(uuid)
+        self.client.delete(self._pfx + uuid)
 
     def update_entry(self, uuid: str, entry: dict[str, Any]):
-        self.client.hset(uuid, mapping=self._serialize_entry(entry))
+        self.client.hset(self._pfx + uuid, mapping=self._serialize_entry(entry))
 
     @staticmethod
     def _serialize_value(value: Any) -> Any:
@@ -63,23 +65,23 @@ class RedisDatabase:
 
     def get_context_id_by_url(self, url: str) -> Optional[str]:
         """Return the context ID (UUID) for a cached URL, or None if not cached."""
-        return self.client.get(_URL_INDEX_PREFIX + url)
+        return self.client.get(self._pfx + _URL_INDEX_PREFIX + url)
 
     def set_url_index(self, url: str, context_id: str) -> None:
         """Associate a URL with its context ID in the cache index."""
-        self.client.set(_URL_INDEX_PREFIX + url, context_id)
+        self.client.set(self._pfx + _URL_INDEX_PREFIX + url, context_id)
 
     def try_acquire_url_fetch_lock(self, url: str, ttl: int = _URL_LOCK_TTL) -> bool:
         """Acquire an exclusive lock for fetching this URL. Returns True if acquired."""
-        return bool(self.client.set(_URL_LOCK_PREFIX + url, "1", nx=True, ex=ttl))
+        return bool(self.client.set(self._pfx + _URL_LOCK_PREFIX + url, "1", nx=True, ex=ttl))
 
     def is_url_fetch_locked(self, url: str) -> bool:
         """Return whether a fetch lock currently exists for the URL."""
-        return bool(self.client.exists(_URL_LOCK_PREFIX + url))
+        return bool(self.client.exists(self._pfx + _URL_LOCK_PREFIX + url))
 
     def release_url_fetch_lock(self, url: str) -> None:
         """Release the fetch lock for a URL."""
-        self.client.delete(_URL_LOCK_PREFIX + url)
+        self.client.delete(self._pfx + _URL_LOCK_PREFIX + url)
 
     def close(self):
         self.client.close()
@@ -91,12 +93,13 @@ class QueryStoreConfig:
     hostname: str
     port: int
     db: int = 1
+    key_prefix: str = ""
 
 
 class QueryStore:
     """Stores search queries per topic. Used to avoid repeating queries and to provide context for generation."""
 
-    def __init__(self, config: QueryStoreConfig):
+    def __init__(self, config: QueryStoreConfig, key_prefix: str = ""):
         self.client = redis.Redis(
             host=config.hostname,
             port=config.port,
@@ -104,9 +107,10 @@ class QueryStore:
             decode_responses=True,
         )
         self.config = config
+        self._pfx = key_prefix or config.key_prefix
 
     def _key(self, topic: str) -> str:
-        return _QUERIES_PREFIX + topic.strip().lower()
+        return self._pfx + _QUERIES_PREFIX + topic.strip().lower()
 
     def add_queries(self, topic: str, queries: List[str]) -> None:
         """Add queries to the store for a topic. Deduplicates automatically."""

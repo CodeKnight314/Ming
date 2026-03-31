@@ -162,6 +162,7 @@ class OpenRouterModel(BaseModel):
     def __init__(self, config: Optional[OpenRouterModelConfig] = None):
         self.config = config or OpenRouterModelConfig()
         self.prompt = ""
+        self.token_tracker: Any = None  # Optional TokenTracker instance
 
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
@@ -216,8 +217,25 @@ class OpenRouterModel(BaseModel):
         images: Optional[List[str]] = None,
         **generation_kwargs: Any,
     ) -> str:
-        response_text, _ = self.generate_with_metadata(prompt, images, **generation_kwargs)
+        response_text, metadata = self.generate_with_metadata(prompt, images, **generation_kwargs)
+        self._report_usage(metadata)
         return response_text
+
+    def _report_usage(self, metadata: dict[str, Any]) -> None:
+        tracker = self.token_tracker
+        if tracker is None:
+            return
+        usage = metadata.get("usage_metadata")
+        if usage is None:
+            return
+        if isinstance(usage, dict):
+            inp = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+            out = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        else:
+            inp = getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0
+            out = getattr(usage, "output_tokens", 0) or getattr(usage, "completion_tokens", 0) or 0
+        if inp or out:
+            tracker.record_llm_usage(self.config.model_name, input_tokens=inp, output_tokens=out)
 
     def generate_with_metadata(
         self,

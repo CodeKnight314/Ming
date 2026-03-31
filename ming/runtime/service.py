@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -97,6 +98,63 @@ def close_orchestrator(orchestrator: Any) -> None:
             close_fn()
 
 
+@dataclass
+class WorkerSlot:
+    """Tracks a concurrent batch worker slot."""
+    slot_id: int
+    key_prefix: str  # e.g. "w0:", "w1:"
+    active_job_id: str | None = None
+    thread: threading.Thread | None = None
+
+
+def prefixed_job_executor_factory(
+    config_path: str | Path,
+    key_prefix: str,
+    *,
+    runtime_namespace: str = DEFAULT_RUNTIME_NAMESPACE,
+) -> JobExecutor:
+    """Build an executor whose Redis keys are isolated under *key_prefix*."""
+
+    def _executor(job: RuntimeJob) -> dict[str, Any]:
+        from ming.core.config import create_ming_deep_research_config, load_config
+        from ming.core.redis_flush import flush_research_redis_for_new_run
+        from ming.orchestrator import MingDeepResearch
+
+        prompt = str(job.payload.get("prompt", "")).strip()
+        if not prompt:
+            raise RuntimeValidationError("Job payload.prompt must be non-empty")
+
+        config_dict = load_config(config_path)
+        config_dict["key_prefix"] = key_prefix
+        flush_research_redis_for_new_run(
+            config_dict, runtime_namespace=runtime_namespace, key_prefix=key_prefix,
+        )
+        config = create_ming_deep_research_config(config_dict)
+
+        prompt_id = job.payload.get("prompt_id") or job.payload.get("metadata", {}).get("prompt_id")
+        if prompt_id is not None:
+            draft_name = f"id_{prompt_id}.md"
+        else:
+            draft_name = f"runtime_{job.job_id}.md"
+        config.draft_output_path = str(Path("reports") / draft_name)
+
+        orchestrator = MingDeepResearch(config)
+        observer = job.runtime_observer
+        if observer is not None:
+            orchestrator.runtime_observer = observer
+        try:
+            report_markdown = orchestrator.run(prompt)
+        finally:
+            close_orchestrator(orchestrator)
+
+        return {
+            "report_markdown": report_markdown,
+            "report_length": len(report_markdown or ""),
+        }
+
+    return _executor
+
+
 def default_job_executor_factory(
     config_path: str | Path,
     *,
@@ -171,12 +229,18 @@ class RuntimeService:
         self.id_factory = id_factory or (lambda prefix: f"{prefix}_{uuid4().hex}")
         self.now_fn = now_fn
 
-        self._queue: Deque[str] = deque()
+        self._queue: Deque[str] = deque()          # single-run jobs
+        self._batch_queue: Deque[str] = deque()    # concurrent batch child jobs
         self._jobs: dict[str, RuntimeJob] = {}
         self._command_to_jobs: dict[str, list[str]] = {}
         self._command_snapshots: dict[str, CommandSnapshot] = {}
-        self._active_job_id: str | None = None
+        self._active_job_id: str | None = None     # single-run active job
         self._last_command_stream_id = "$" if config.start_from_latest else "0-0"
+
+        # Concurrent batch worker state
+        self._lock = threading.Lock()
+        self._worker_slots: list[WorkerSlot] = []
+        self._batch_max_concurrent: int = 1
 
         self._write_queue_snapshot()
 
@@ -189,8 +253,11 @@ class RuntimeService:
         try:
             while True:
                 self.poll_once()
-                self.run_next_job()
+                self._run_next_single_job()
+                self._dispatch_batch_workers()
+                self._reap_completed_workers()
         finally:
+            self._join_all_workers()
             self.close()
 
     def poll_once(self) -> int:
@@ -207,8 +274,14 @@ class RuntimeService:
                 processed += 1
         return processed
 
-    def run_next_job(self) -> bool:
+    def _any_batch_workers_active(self) -> bool:
+        return any(s.active_job_id is not None for s in self._worker_slots)
+
+    def _run_next_single_job(self) -> bool:
+        """Run next single-run job. Skips if any batch worker or single-run is active."""
         if self._active_job_id is not None or not self._queue:
+            return False
+        if self._any_batch_workers_active():
             return False
 
         job_id = self._queue.popleft()
@@ -374,6 +447,197 @@ class RuntimeService:
             self._write_queue_snapshot()
         return True
 
+    def run_next_job(self) -> bool:
+        """Backward-compatible alias."""
+        return self._run_next_single_job()
+
+    # ── Concurrent batch dispatch ─────────────────────────────────────
+
+    def _dispatch_batch_workers(self) -> None:
+        """Fill idle worker slots from `_batch_queue`."""
+        if not self._batch_queue:
+            return
+        if self._active_job_id is not None:
+            return  # single-run active — don't mix
+
+        # Ensure we have enough slots.
+        while len(self._worker_slots) < self._batch_max_concurrent:
+            sid = len(self._worker_slots)
+            self._worker_slots.append(WorkerSlot(slot_id=sid, key_prefix=f"w{sid}:"))
+
+        for slot in self._worker_slots:
+            if not self._batch_queue:
+                break
+            if slot.active_job_id is not None:
+                continue
+            job_id = self._batch_queue.popleft()
+            job = self._jobs[job_id]
+            slot.active_job_id = job_id
+
+            # Prepare the job (observer, status, etc.) on the main thread.
+            job.status = RuntimeStatus.RUNNING
+            job.started_at = self.now_fn()
+            run_id = self.id_factory("run")
+            job.run_id = run_id
+            observer = RuntimeObserver(
+                self.emitter,
+                command_id=job.command_id,
+                job_id=job.job_id,
+                run_id=run_id,
+                prompt=str(job.payload.get("prompt", "")),
+                prompt_id=str(job.payload.get("prompt_id")) if job.payload.get("prompt_id") is not None else None,
+            )
+            job.runtime_observer = observer
+            self.emitter.write_job_snapshot(job.to_snapshot())
+            self._emit_job_event(
+                job,
+                kind=RuntimeEventKind.JOB_STARTED,
+                status=RuntimeStatus.RUNNING.value,
+                message=f"Job started on worker slot {slot.slot_id}.",
+            )
+            self.emitter.write_run_snapshot(RunSnapshot(
+                run_id=run_id,
+                job_id=job.job_id,
+                command_id=job.command_id,
+                status=RuntimeStatus.RUNNING.value,
+                started_at=job.started_at,
+                prompt=str(job.payload.get("prompt", "")),
+                prompt_id=str(job.payload.get("prompt_id")) if job.payload.get("prompt_id") is not None else None,
+                stage="runtime_execute",
+                stage_status=RuntimeStatus.RUNNING.value,
+            ))
+            self.emitter.emit_event(RuntimeEvent(
+                event_id=self.id_factory("evt"),
+                ts=self.now_fn(),
+                seq=self._next_seq(),
+                kind=RuntimeEventKind.RUN_STARTED,
+                component="runtime_service",
+                status=RuntimeStatus.RUNNING.value,
+                message=f"Run started (slot {slot.slot_id}).",
+                command_id=job.command_id,
+                job_id=job.job_id,
+                run_id=run_id,
+                stage="runtime_execute",
+            ))
+
+            executor = prefixed_job_executor_factory(
+                self.config.config_path,
+                slot.key_prefix,
+                runtime_namespace=self.config.namespace,
+            )
+            t = threading.Thread(
+                target=self._execute_worker_job,
+                args=(slot, job, executor),
+                daemon=True,
+                name=f"batch-worker-{slot.slot_id}",
+            )
+            slot.thread = t
+            t.start()
+
+        self._write_queue_snapshot()
+
+    def _execute_worker_job(
+        self,
+        slot: WorkerSlot,
+        job: RuntimeJob,
+        executor: JobExecutor,
+    ) -> None:
+        """Runs in a spawned thread for a concurrent batch worker."""
+        observer = job.runtime_observer
+        run_id = job.run_id
+        try:
+            result = executor(job) or {}
+            report_markdown = str(result.get("report_markdown", "") or "")
+            if not report_markdown.strip():
+                raise RuntimeError("Executor returned an empty markdown report")
+
+            with self._lock:
+                job.status = RuntimeStatus.COMPLETED
+                job.finished_at = self.now_fn()
+                self.emitter.write_job_snapshot(job.to_snapshot())
+                self._emit_job_event(
+                    job,
+                    kind=RuntimeEventKind.JOB_COMPLETED,
+                    status=RuntimeStatus.COMPLETED.value,
+                    message="Job completed successfully.",
+                    metrics={"report_length": len(report_markdown)},
+                )
+                if observer:
+                    self.emitter.write_run_snapshot(
+                        observer.snapshot_terminated(
+                            status=RuntimeStatus.COMPLETED.value,
+                            finished_at=job.finished_at or self.now_fn(),
+                            extra_metrics={"report_length": len(report_markdown)},
+                        )
+                    )
+                self.emitter.emit_event(RuntimeEvent(
+                    event_id=self.id_factory("evt"),
+                    ts=self.now_fn(),
+                    seq=self._next_seq(),
+                    kind=RuntimeEventKind.RUN_COMPLETED,
+                    component="runtime_service",
+                    status=RuntimeStatus.COMPLETED.value,
+                    message=f"Run completed (slot {slot.slot_id}).",
+                    command_id=job.command_id,
+                    job_id=job.job_id,
+                    run_id=run_id,
+                    stage="runtime_execute",
+                    metrics={"report_length": len(report_markdown)},
+                ))
+        except Exception as exc:
+            logger.exception("Batch worker slot %d job %s failed", slot.slot_id, job.job_id)
+            with self._lock:
+                job.status = RuntimeStatus.FAILED
+                job.finished_at = self.now_fn()
+                job.error = f"{type(exc).__name__}: {exc}"
+                self.emitter.write_job_snapshot(job.to_snapshot())
+                self._emit_job_event(
+                    job,
+                    kind=RuntimeEventKind.JOB_FAILED,
+                    status=RuntimeStatus.FAILED.value,
+                    message=f"Job failed: {job.error}",
+                )
+                if observer:
+                    self.emitter.write_run_snapshot(
+                        observer.snapshot_terminated(
+                            status=RuntimeStatus.FAILED.value,
+                            finished_at=job.finished_at or self.now_fn(),
+                            error=job.error,
+                        )
+                    )
+                self.emitter.emit_event(RuntimeEvent(
+                    event_id=self.id_factory("evt"),
+                    ts=self.now_fn(),
+                    seq=self._next_seq(),
+                    kind=RuntimeEventKind.RUN_FAILED,
+                    component="runtime_service",
+                    status=RuntimeStatus.FAILED.value,
+                    message=f"Run failed (slot {slot.slot_id}): {job.error}",
+                    command_id=job.command_id,
+                    job_id=job.job_id,
+                    run_id=run_id,
+                    stage="runtime_execute",
+                ))
+        finally:
+            with self._lock:
+                slot.active_job_id = None
+                self._refresh_command_terminal_state(job.command_id)
+                self._write_queue_snapshot()
+
+    def _reap_completed_workers(self) -> None:
+        """Join any finished worker threads."""
+        for slot in self._worker_slots:
+            if slot.thread is not None and not slot.thread.is_alive():
+                slot.thread.join(timeout=1)
+                slot.thread = None
+
+    def _join_all_workers(self, timeout: float = 300) -> None:
+        """Wait for all active worker threads (used on shutdown)."""
+        for slot in self._worker_slots:
+            if slot.thread is not None:
+                slot.thread.join(timeout=timeout)
+                slot.thread = None
+
     def _handle_stream_entry(self, entry_id: str, fields: Mapping[str, Any]) -> None:
         raw_payload = fields.get("payload")
         if raw_payload is None:
@@ -400,7 +664,8 @@ class RuntimeService:
 
     def _accept_command(self, command: RuntimeCommand) -> None:
         logger.info("Accepting command %s (type: %s)", command.command_id, command.type.value)
-        queued_depth = len(self._queue) + (1 if self._active_job_id else 0)
+        active_batch_count = sum(1 for s in self._worker_slots if s.active_job_id is not None)
+        queued_depth = len(self._queue) + len(self._batch_queue) + (1 if self._active_job_id else 0) + active_batch_count
         planned_job_count = 1
         if command.type.value == "run_batch":
             planned_job_count = len(command.payload.items) + 1
@@ -456,26 +721,50 @@ class RuntimeService:
             )
             return
 
+        is_concurrent = getattr(command.payload, "mode", "") == "concurrent"
+        max_concurrent = getattr(command.payload, "max_concurrent", 1)
+
+        # For concurrent mode, don't queue the BATCH_PARENT to self._queue.
+        # It completes instantly and would cause a brief "idle" state before
+        # the real workers start. Instead, mark it completed immediately.
         parent_job_id = self._enqueue_job(
             command_id=command.command_id,
             job_type=JobType.BATCH_PARENT,
             payload={
                 "mode": command.payload.mode,
                 "item_count": len(command.payload.items),
+                "max_concurrent": max_concurrent,
             },
             parent_job_id=None,
             position=None,
-            queue_job=True,
+            queue_job=not is_concurrent,
         )
 
+        if is_concurrent:
+            # Immediately mark parent as completed so it doesn't flow through
+            # _run_next_single_job and cause an idle flash.
+            parent_job = self._jobs[parent_job_id]
+            parent_job.status = RuntimeStatus.COMPLETED
+            parent_job.finished_at = self.now_fn()
+            self.emitter.write_job_snapshot(parent_job.to_snapshot())
+
         for index, item in enumerate(command.payload.items, start=1):
-            self._enqueue_job(
+            child_job_id = self._enqueue_job(
                 command_id=command.command_id,
                 job_type=JobType.BATCH_CHILD_RUN,
                 payload={"prompt_id": item.id, "prompt": item.prompt},
                 parent_job_id=parent_job_id,
                 position=index,
+                queue_job=not is_concurrent,
             )
+            if is_concurrent:
+                self._batch_queue.append(child_job_id)
+
+        if is_concurrent:
+            self._batch_max_concurrent = max_concurrent
+            # Immediately dispatch workers so the TUI sees active runs
+            # on the very next refresh, not after the next poll_once cycle.
+            self._dispatch_batch_workers()
 
         self._update_command_snapshot(
             command.command_id,
@@ -704,10 +993,20 @@ class RuntimeService:
         failed_job_ids = [
             job_id for job_id, job in self._jobs.items() if job.status is RuntimeStatus.FAILED
         ]
+        # Gather all active job IDs (single-run + batch workers).
+        all_active: list[str] = []
+        if self._active_job_id is not None:
+            all_active.append(self._active_job_id)
+        for slot in self._worker_slots:
+            if slot.active_job_id is not None:
+                all_active.append(slot.active_job_id)
+        # Combine single-run queue and batch queue for queued IDs.
+        all_queued = list(self._queue) + list(self._batch_queue)
         snapshot = QueueSnapshot(
             updated_at=self.now_fn(),
-            queued_job_ids=list(self._queue),
-            active_job_id=self._active_job_id,
+            queued_job_ids=all_queued,
+            active_job_id=all_active[0] if all_active else None,
+            active_job_ids=all_active,
             completed_job_ids=completed_job_ids,
             failed_job_ids=failed_job_ids,
         )

@@ -1,4 +1,3 @@
-# Ming dependencies - minimal set for migrated tools
 httpx
 json-repair
 langchain-core

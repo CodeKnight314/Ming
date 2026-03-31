@@ -6,6 +6,15 @@ use anyhow::Result;
 use crate::models::*;
 use crate::data::{DataSource, load_batch_items_from_path};
 
+// ── Command registry (sorted for display) ────────────────────────────
+pub const COMMANDS: &[&str] = &[
+    "/batch",
+    "/exit",
+    "/set-openrouter-key",
+    "/set-tavily-key",
+    "/workers",
+];
+
 /// TUI-side state for a running batch. Items are submitted to the backend one
 /// at a time; the next item is only sent once the current run reaches a
 /// terminal state, with a Redis flush in between.
@@ -19,6 +28,13 @@ pub struct BatchState {
     /// True immediately after submission until we observe a new run_id,
     /// preventing the old completed run from triggering the next advance.
     pub waiting_for_new_run: bool,
+}
+
+/// Passive progress tracker for concurrent batch (service-managed execution).
+pub struct BatchProgress {
+    pub total: usize,
+    pub completed: usize,
+    pub failed: usize,
 }
 
 pub struct App {
@@ -38,6 +54,27 @@ pub struct App {
     pub batch_state: Option<BatchState>,
     pub ui_tick: u32,
     pub exit_requested: bool,
+
+    // ── Multi-run worker selection ───────────────────────────────────
+    /// Index into `dashboard.active_runs` for the detail view.
+    pub selected_worker: usize,
+    /// Passive batch progress tracker (for concurrent batch mode).
+    pub batch_progress: Option<BatchProgress>,
+
+    // ── Auto-completion state ────────────────────────────────────────
+    /// Filtered commands matching the current `/` prefix.
+    pub completion_matches: Vec<&'static str>,
+    /// Index into `completion_matches` for Tab cycling (`None` = no selection).
+    pub completion_selected: Option<usize>,
+
+    // ── Concurrency ──────────────────────────────────────────────────
+    /// Number of concurrent workers for batch processing (1–5).
+    pub max_concurrent_workers: usize,
+
+    // ── Async key validation ─────────────────────────────────────────
+    /// Receiver for a pending API-key validation result.
+    /// Tuple: (env_var_name, Ok(key_value) | Err(error_message)).
+    pub pending_key_validation: Option<std::sync::mpsc::Receiver<(String, Result<String, String>)>>,
 }
 
 impl App {
@@ -69,6 +106,12 @@ impl App {
             batch_state: None,
             ui_tick: 0,
             exit_requested: false,
+            selected_worker: 0,
+            batch_progress: None,
+            completion_matches: Vec::new(),
+            completion_selected: None,
+            max_concurrent_workers: 1,
+            pending_key_validation: None,
         }
     }
 
@@ -90,9 +133,40 @@ impl App {
                     }
                     self.last_run_id = Some(new_id.clone());
                 }
-                self.dashboard = dashboard;
+
+                // If we're waiting for a batch to start (sequential or concurrent),
+                // don't overwrite the "queued" placeholder with "idle" from Redis.
+                let waiting_for_start = self.batch_state.as_ref().map_or(false, |b| b.waiting_for_new_run)
+                    || self.batch_progress.is_some();
+                let backend_idle = dashboard.active_run.run_id == "none"
+                    || dashboard.active_run.status == "idle";
+                if waiting_for_start && backend_idle && dashboard.active_runs.is_empty() {
+                    // Keep the old dashboard (shows "queued"), only update queue/events.
+                    self.dashboard.queue = dashboard.queue;
+                    self.dashboard.recent_events = dashboard.recent_events;
+                } else {
+                    self.dashboard = dashboard;
+                }
                 let _ = (direct_draft, batch_draft);
                 self.last_refresh = Some(Instant::now());
+                // Clamp worker selection.
+                if !self.dashboard.active_runs.is_empty() {
+                    if self.selected_worker >= self.dashboard.active_runs.len() {
+                        self.selected_worker = 0;
+                    }
+                }
+                // Update concurrent batch progress from queue state.
+                if let Some(ref mut bp) = self.batch_progress {
+                    bp.completed = self.dashboard.queue.all_completed_count;
+                    bp.failed = self.dashboard.queue.all_failed_count;
+                    if bp.completed + bp.failed >= bp.total && self.dashboard.active_runs.is_empty() {
+                        self.last_status = format!(
+                            "Batch complete: {} done, {} failed of {} total.",
+                            bp.completed, bp.failed, bp.total
+                        );
+                        self.batch_progress = None;
+                    }
+                }
             }
             Err(err) => {
                 self.last_status = format!("Refresh failed: {err}");
@@ -235,6 +309,49 @@ impl App {
         Ok(format!("Batch started ({total} items{skip_note}): {msg}"))
     }
 
+    /// Submit an entire batch as a single RUN_BATCH command for concurrent
+    /// server-side execution. The TUI becomes a passive observer.
+    pub fn finish_concurrent_batch_submit(&mut self, path: PathBuf) -> Result<String> {
+        let all_items = load_batch_items_from_path(&path)?;
+        let total_loaded = all_items.len();
+
+        let pending_items: Vec<(String, String)> = all_items
+            .into_iter()
+            .filter(|(id, _)| {
+                let report = PathBuf::from("reports").join(format!("id_{id}.md"));
+                !report.exists()
+            })
+            .collect();
+
+        let skipped = total_loaded - pending_items.len();
+        if pending_items.is_empty() {
+            return Ok(format!(
+                "All {total_loaded} items already have reports; nothing to do."
+            ));
+        }
+
+        let total = pending_items.len();
+        let workers = self.max_concurrent_workers;
+        let msg = self.data_source.submit_run_batch(&pending_items, workers)?;
+
+        self.batch_state = None; // Not using client-side batch state.
+        self.batch_progress = Some(BatchProgress {
+            total,
+            completed: 0,
+            failed: 0,
+        });
+        self.reset_dashboard_for_new_command();
+        self.direct_query_draft.clear();
+        let skip_note = if skipped > 0 {
+            format!(", {skipped} skipped")
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "Concurrent batch started ({total} items, {workers} workers{skip_note}): {msg}"
+        ))
+    }
+
     pub fn handle_slash_command(&mut self, line: &str) {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.is_empty() {
@@ -254,14 +371,61 @@ impl App {
                             .to_string();
                     return;
                 }
-                match self.finish_batch_submit(PathBuf::from(path)) {
-                    Ok(m) => self.last_status = m,
-                    Err(e) => self.last_status = format!("{e:#}"),
+                if self.max_concurrent_workers > 1 {
+                    match self.finish_concurrent_batch_submit(PathBuf::from(path)) {
+                        Ok(m) => self.last_status = m,
+                        Err(e) => self.last_status = format!("{e:#}"),
+                    }
+                } else {
+                    match self.finish_batch_submit(PathBuf::from(path)) {
+                        Ok(m) => self.last_status = m,
+                        Err(e) => self.last_status = format!("{e:#}"),
+                    }
+                }
+            }
+            "/set-tavily-key" => {
+                let key = parts[1..].join(" ");
+                if key.is_empty() {
+                    self.last_status = "Usage: /set-tavily-key <key>".to_string();
+                    return;
+                }
+                self.validate_and_set_key(
+                    "TAVILY_API_KEY",
+                    "https://api.tavily.com/usage",
+                    key,
+                );
+            }
+            "/set-openrouter-key" => {
+                let key = parts[1..].join(" ");
+                if key.is_empty() {
+                    self.last_status = "Usage: /set-openrouter-key <key>".to_string();
+                    return;
+                }
+                self.validate_and_set_key(
+                    "OPENROUTER_API_KEY",
+                    "https://openrouter.ai/api/v1/auth/key",
+                    key,
+                );
+            }
+            "/workers" => {
+                match parts.get(1).and_then(|s| s.parse::<usize>().ok()) {
+                    Some(n) if (1..=5).contains(&n) => {
+                        self.max_concurrent_workers = n;
+                        self.last_status = format!("Concurrent workers set to {n}.");
+                    }
+                    None if parts.len() == 1 => {
+                        self.last_status =
+                            format!("Workers: {} (use /workers N to change, 1-5)", self.max_concurrent_workers);
+                    }
+                    _ => {
+                        self.last_status = "Usage: /workers N  (1-5)".to_string();
+                    }
                 }
             }
             _ => {
                 self.last_status =
-                    "Unknown command — use /batch <path> or /exit.".to_string();
+                    "Unknown command. Available: /batch /exit /set-tavily-key /set-openrouter-key /workers"
+                        .to_string();
             }
         }
     }
@@ -285,11 +449,31 @@ impl App {
     }
 
     pub fn next_focus(&mut self) {
-        self.focus = Focus::Input;
+        self.focus = match self.focus {
+            Focus::Input if self.dashboard.active_runs.len() > 1 => Focus::WorkerList,
+            _ => Focus::Input,
+        };
     }
 
     pub fn prev_focus(&mut self) {
-        self.focus = Focus::Input;
+        self.focus = match self.focus {
+            Focus::WorkerList => Focus::Input,
+            _ => Focus::Input,
+        };
+    }
+
+    pub fn select_worker_next(&mut self) {
+        let len = self.dashboard.active_runs.len();
+        if len > 0 {
+            self.selected_worker = (self.selected_worker + 1) % len;
+        }
+    }
+
+    pub fn select_worker_prev(&mut self) {
+        let len = self.dashboard.active_runs.len();
+        if len > 0 {
+            self.selected_worker = if self.selected_worker == 0 { len - 1 } else { self.selected_worker - 1 };
+        }
     }
 
     pub fn active_input_text(&self) -> &str {
@@ -301,6 +485,7 @@ impl App {
             return;
         }
         self.direct_query_draft.push(ch);
+        self.update_completions();
     }
 
     pub fn backspace(&mut self) {
@@ -308,5 +493,99 @@ impl App {
             return;
         }
         self.direct_query_draft.pop();
+        self.update_completions();
+    }
+
+    // ── Auto-completion ──────────────────────────────────────────────
+
+    /// Recompute `completion_matches` from the current draft.
+    pub fn update_completions(&mut self) {
+        let draft = self.direct_query_draft.trim_start();
+        if draft.starts_with('/') && !draft.contains(' ') {
+            let lower = draft.to_ascii_lowercase();
+            self.completion_matches = COMMANDS
+                .iter()
+                .copied()
+                .filter(|cmd| cmd.starts_with(&lower))
+                .collect();
+            // Reset selection if the previous selection is out of bounds.
+            if let Some(idx) = self.completion_selected {
+                if idx >= self.completion_matches.len() {
+                    self.completion_selected = None;
+                }
+            }
+        } else {
+            self.completion_matches.clear();
+            self.completion_selected = None;
+        }
+    }
+
+    /// Cycle through completion matches (called on Tab).
+    pub fn cycle_completion(&mut self) {
+        if self.completion_matches.is_empty() {
+            return;
+        }
+        let next = match self.completion_selected {
+            None => 0,
+            Some(i) => (i + 1) % self.completion_matches.len(),
+        };
+        self.completion_selected = Some(next);
+        self.direct_query_draft = self.completion_matches[next].to_string();
+    }
+
+    // ── API key validation ───────────────────────────────────────────
+
+    fn validate_and_set_key(&mut self, env_key: &str, api_url: &str, key: String) {
+        self.last_status = format!("Validating {env_key}...");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let env_key_owned = env_key.to_string();
+        let url = api_url.to_string();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .map_err(|e| format!("HTTP client error: {e}"))?;
+                let resp = client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {key}"))
+                    .send()
+                    .map_err(|e| format!("Request failed: {e}"))?;
+                if resp.status().is_success() {
+                    Ok(key)
+                } else {
+                    Err(format!("Validation failed (HTTP {})", resp.status()))
+                }
+            })();
+            let _ = tx.send((env_key_owned, result));
+        });
+        self.pending_key_validation = Some(rx);
+    }
+
+    /// Poll the pending validation receiver. Called from the main event loop.
+    pub fn poll_key_validation(&mut self) {
+        let rx = match self.pending_key_validation.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+        match rx.try_recv() {
+            Ok((env_key, result)) => {
+                match result {
+                    Ok(value) => {
+                        match crate::utils::write_env_key(&env_key, &value) {
+                            Ok(_) => self.last_status = format!("{env_key} validated and saved."),
+                            Err(e) => self.last_status = format!("Key valid but .env write failed: {e}"),
+                        }
+                    }
+                    Err(msg) => self.last_status = msg,
+                }
+                self.pending_key_validation = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {} // still pending
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.last_status = "Validation thread disconnected.".to_string();
+                self.pending_key_validation = None;
+            }
+        }
     }
 }

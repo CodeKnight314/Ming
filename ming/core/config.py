@@ -222,6 +222,32 @@ def create_ming_deep_research_config(
     else:
         kg_redis_config = None
 
+    writer_critique_model_cfg = config.get("writer_critique_model")
+    if writer_critique_model_cfg:
+        writer_critique_model = OpenRouterModelConfig(
+            model_name=writer_critique_model_cfg.get("model_name", "qwen/qwen3.5-flash-02-23"),
+            temperature=float(writer_critique_model_cfg.get("temperature", 0.1)),
+            max_new_tokens=_config_max_new_tokens(writer_critique_model_cfg, 2048),
+            site_url=writer_critique_model_cfg.get("site_url"),
+            site_name=writer_critique_model_cfg.get("site_name"),
+            model_kwargs=writer_critique_model_cfg.get("model_kwargs"),
+        )
+    else:
+        writer_critique_model = None
+
+    writer_polish_model_cfg = config.get("writer_polish_model")
+    if writer_polish_model_cfg:
+        writer_polish_model = OpenRouterModelConfig(
+            model_name=writer_polish_model_cfg.get("model_name", "qwen/qwen3.5-flash-02-23"),
+            temperature=float(writer_polish_model_cfg.get("temperature", 0.2)),
+            max_new_tokens=_config_max_new_tokens(writer_polish_model_cfg, 32000),
+            site_url=writer_polish_model_cfg.get("site_url"),
+            site_name=writer_polish_model_cfg.get("site_name"),
+            model_kwargs=writer_polish_model_cfg.get("model_kwargs"),
+        )
+    else:
+        writer_polish_model = None
+
     return MingDeepResearchConfig(
         redis_config=redis_config,
         scout_config=config.get("scout", {}),
@@ -230,6 +256,8 @@ def create_ming_deep_research_config(
         kg_redis_config=kg_redis_config,
         writer_model=writer_model,
         writer_fallback_model=writer_fallback_model,
+        writer_polish_model=writer_polish_model,
+        writer_critique_model=writer_critique_model,
         outline_model=outline_model,
         outline_fallback_model=outline_fallback_model,
         draft_output_path=config.get("draft_output_path"),
@@ -245,7 +273,9 @@ def create_ming_deep_research_config(
         max_chunks_per_source=int(config.get("max_chunks_per_source", 8)),
         source_score_cutoff=float(config.get("source_score_cutoff", 4.5)),
         writer_num_parallel_sections=int(config.get("writer_num_parallel_sections", 8)),
+        writer_max_critique_iterations=int(config.get("writer_max_critique_iterations", 3)),
         writer_enable_stitch_pass=bool(config.get("writer_enable_stitch_pass", True)),
+        key_prefix=str(config.get("key_prefix", "")),
     )
 
 
