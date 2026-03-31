@@ -90,6 +90,7 @@ fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
         }
 
         app.ui_tick = app.ui_tick.wrapping_add(1);
+        app.poll_key_validation();
         terminal.draw(|frame| render(frame, &app))?;
 
         if !event::poll(Duration::from_millis(150))? {
@@ -102,7 +103,13 @@ fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
             }
 
             match key.code {
-                KeyCode::Tab => app.next_focus(),
+                KeyCode::Tab => {
+                    if !app.completion_matches.is_empty() {
+                        app.cycle_completion();
+                    } else {
+                        app.next_focus();
+                    }
+                }
                 KeyCode::BackTab => app.prev_focus(),
                 KeyCode::F(1) => app.show_help = !app.show_help,
                 KeyCode::Esc => {
@@ -118,6 +125,16 @@ fn run_app(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
                             return Ok(());
                         }
                     }
+                }
+                KeyCode::Up | KeyCode::Char('k')
+                    if app.focus == crate::models::Focus::WorkerList =>
+                {
+                    app.select_worker_prev();
+                }
+                KeyCode::Down | KeyCode::Char('j')
+                    if app.focus == crate::models::Focus::WorkerList =>
+                {
+                    app.select_worker_next();
                 }
                 KeyCode::Char(ch) => app.handle_char(ch),
                 _ => {}

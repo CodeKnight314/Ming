@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 
 from ming.core.config import create_queries_store_from_config, create_redis_from_config
 from ming.core.outline_parser import SectionPlan, extract_outline_block, outline_to_sections
-from ming.core.redis import QueryStoreConfig, RedisDatabaseConfig
+from ming.core.redis import QueryStore, QueryStoreConfig, RedisDatabase, RedisDatabaseConfig
 from ming.scout import ScoutSubagent
 from ming.subagent import ResearchSubagent
 from ming.extraction.kg_module import KGRedisStore, ERConfig
@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_RESEARCH_PRIMARY = "nvidia/nemotron-3-super-120b-a12b"
+_DEFAULT_RESEARCH_PRIMARY = "xiaomi/mimo-v2-flash"
 _DEFAULT_FLASH_FALLBACK = "qwen/qwen3.5-flash-02-23"
 _DEFAULT_WRITER_PRIMARY = "qwen/qwen3.5-plus-02-15"
 
@@ -53,14 +53,20 @@ class MingDeepResearchConfig:
     source_score_cutoff: float = 4.5
     writer_num_parallel_sections: int = 8
     writer_enable_stitch_pass: bool = True
+    writer_critique_model: OpenRouterModelConfig | None = None
+    writer_max_critique_iterations: int = 3
+    key_prefix: str = ""
 
 
 class MingDeepResearch:
     _CHARS_PER_TOKEN_ESTIMATE = 4
 
     def __init__(self, config: MingDeepResearchConfig, runtime_observer: Any | None = None):
+        from ming.core.token_tracker import TokenTracker
         self.config = config
         self.runtime_observer = runtime_observer
+        self.token_tracker = TokenTracker()
+        pfx = config.key_prefix
         redis_cfg = {
             "redis": {
                 "hostname": config.redis_config.hostname,
@@ -68,7 +74,7 @@ class MingDeepResearch:
                 "db": config.redis_config.db,
             }
         }
-        self.context_redis = create_redis_from_config(redis_cfg)
+        self.context_redis = RedisDatabase(config.redis_config, key_prefix=pfx)
         queries_cfg = {
             "redis": redis_cfg["redis"],
             "queries_redis": (
@@ -81,10 +87,16 @@ class MingDeepResearch:
                 else config.queries_redis_config
             ),
         }
-        self.queries_redis = create_queries_store_from_config(queries_cfg)
-        
-        kg_cfg = config.kg_redis_config if hasattr(config, "kg_redis_config") and config.kg_redis_config else redis_cfg
-        self.kg_redis = create_redis_from_config(kg_cfg)
+        if isinstance(config.queries_redis_config, QueryStoreConfig):
+            self.queries_redis = QueryStore(config.queries_redis_config, key_prefix=pfx)
+        else:
+            self.queries_redis = create_queries_store_from_config(queries_cfg)
+
+        kg_cfg = config.kg_redis_config if hasattr(config, "kg_redis_config") and config.kg_redis_config else None
+        if isinstance(kg_cfg, RedisDatabaseConfig):
+            self.kg_redis = RedisDatabase(kg_cfg, key_prefix=pfx)
+        else:
+            self.kg_redis = RedisDatabase(config.redis_config, key_prefix=pfx)
 
         self.kg_store = KGRedisStore(self.kg_redis, ERConfig(threshold=0.5, num_perm=128))
         self.kg_query_tool = KGQueryTool(self.kg_store)
@@ -171,13 +183,38 @@ class MingDeepResearch:
             WriterAgentConfig(
                 model=writer_primary_cfg,
                 fallback_model=writer_fallback_cfg,
-                polish_model=None,
+                polish_model=config.writer_polish_model,
                 kg_query_tool=self.kg_query_tool,
                 draft_output_path=config.draft_output_path,
+                critique_model=config.writer_critique_model,
                 num_parallel_sections=config.writer_num_parallel_sections,
+                max_critique_iterations=config.writer_max_critique_iterations,
                 enable_stitch_pass=config.writer_enable_stitch_pass,
             )
         )
+
+        self._attach_token_tracker()
+
+    def _attach_token_tracker(self) -> None:
+        tracker = self.token_tracker
+        for model in [self.planning_model, self.outline_model, self.outline_fallback_model]:
+            model.token_tracker = tracker
+        for sa in self.research_subagents:
+            if hasattr(sa, "model") and hasattr(sa.model, "token_tracker"):
+                sa.model.token_tracker = tracker
+            if hasattr(sa, "fallback_model") and sa.fallback_model and hasattr(sa.fallback_model, "token_tracker"):
+                sa.fallback_model.token_tracker = tracker
+        if hasattr(self.scout, "model") and hasattr(self.scout.model, "token_tracker"):
+            self.scout.model.token_tracker = tracker
+        if hasattr(self.scout, "fallback_model") and self.scout.fallback_model and hasattr(self.scout.fallback_model, "token_tracker"):
+            self.scout.fallback_model.token_tracker = tracker
+        wa = self.writer_agent
+        for model in [wa._stitch_llm, wa.polish_model, wa._critique_llm]:
+            if model is not None and hasattr(model, "token_tracker"):
+                model.token_tracker = tracker
+        if hasattr(self.nerre_pipeline, "_re_model") and hasattr(self.nerre_pipeline._re_model, "token_tracker"):
+            self.nerre_pipeline._re_model.token_tracker = tracker
+        wa._token_tracker = tracker
 
     def _stage_started(
         self,
@@ -200,6 +237,16 @@ class MingDeepResearch:
             completed_angle_count=completed_angle_count,
         )
 
+    def _emit_token_stats(self) -> None:
+        """Push the current token tracker snapshot to the runtime observer."""
+        if self.runtime_observer is None:
+            return
+        import json as _json
+        snapshot = self.token_tracker.snapshot()
+        self.runtime_observer.update_run(
+            metrics={"token_stats_json": _json.dumps(snapshot, ensure_ascii=False)},
+        )
+
     def _stage_completed(
         self,
         stage: str,
@@ -220,6 +267,7 @@ class MingDeepResearch:
             active_angle_count=active_angle_count,
             completed_angle_count=completed_angle_count,
         )
+        self._emit_token_stats()
 
     def _stage_progress(
         self,
@@ -534,6 +582,9 @@ class MingDeepResearch:
         scout_result = self.scout.run(query, observer=self.runtime_observer, query_store=self.queries_redis)
         end_time = time.time()
         logger.info(f"Scouting landscape for: {query} took {round(end_time - start_time, 2)} seconds")
+        scout_queries = len(scout_result.get("queries", []))
+        if scout_queries:
+            self.token_tracker.record_web_queries(scout_queries)
         self._stage_completed(
             "scout",
             "Scout stage completed.",
@@ -615,6 +666,10 @@ class MingDeepResearch:
                     res["_success_criteria"] = angle["success_criteria"]
                     results.append(res)
                     logger.info(f"Completed research for angle: {angle['topic']}")
+                    stats = res.get("statistics") or {}
+                    web_queries = stats.get("total_searches", 0)
+                    if web_queries:
+                        self.token_tracker.record_web_queries(web_queries)
                     if self.runtime_observer is not None:
                         self.runtime_observer.update_angle(
                             angle["_angle_id"],
@@ -911,327 +966,3 @@ class MingDeepResearch:
         )
 
         return report_markdown
-
-
-def _docker_redis_container_name(worker_id: int, role: str) -> str:
-    return f"ming-worker-{worker_id}-{role}"
-
-
-def _worker_redis_ports(worker_id: int, base_port: int = 6390) -> Dict[str, int]:
-    """Return (context_port, queries_port, kg_port) for a worker."""
-    offset = worker_id * 3
-    return {
-        "context": base_port + offset,
-        "queries": base_port + offset + 1,
-        "kg": base_port + offset + 2,
-    }
-
-
-def _start_worker_redis(worker_id: int, base_port: int = 6390) -> Dict[str, int]:
-    """Spin up 3 isolated Redis containers for a single worker. Returns port dict."""
-    import subprocess
-
-    ports = _worker_redis_ports(worker_id, base_port)
-    for role, port in ports.items():
-        name = _docker_redis_container_name(worker_id, role)
-        # Remove if leftover from a previous run
-        subprocess.run(
-            ["docker", "rm", "-f", name],
-            capture_output=True,
-        )
-        subprocess.run(
-            ["docker", "run", "-d", "-p", f"{port}:6379", "--name", name, "redis:latest"],
-            capture_output=True,
-            check=True,
-        )
-    return ports
-
-
-def _stop_worker_redis(worker_id: int) -> None:
-    """Tear down all Redis containers for a worker."""
-    import subprocess
-
-    for role in ("context", "queries", "kg"):
-        name = _docker_redis_container_name(worker_id, role)
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-
-
-def _build_worker_config(
-    raw_config: Dict[str, Any],
-    ports: Dict[str, int],
-) -> "MingDeepResearchConfig":
-    """Clone the base config but point Redis at the worker's isolated ports."""
-    from copy import deepcopy
-    worker_cfg = deepcopy(raw_config)
-
-    worker_cfg["redis"] = {
-        "hostname": "localhost",
-        "port": ports["context"],
-        "db": 0,
-    }
-    worker_cfg["queries_redis"] = {
-        "hostname": "localhost",
-        "port": ports["queries"],
-        "db": 0,
-    }
-    worker_cfg["kg_redis"] = {
-        "hostname": "localhost",
-        "port": ports["kg"],
-        "db": 0,
-    }
-    return worker_cfg
-
-
-def _flush_worker_redis(worker_cfg: Dict[str, Any]) -> None:
-    """FLUSHDB on all three worker Redis instances."""
-    import redis as _redis
-
-    for key in ("redis", "queries_redis", "kg_redis"):
-        cfg = worker_cfg.get(key)
-        if not cfg:
-            continue
-        cl = _redis.Redis(
-            host=str(cfg.get("hostname", "localhost")),
-            port=int(cfg.get("port", 6379)),
-            db=int(cfg.get("db", 0)),
-            decode_responses=True,
-        )
-        try:
-            cl.flushdb()
-        finally:
-            cl.close()
-
-
-def _worker_loop(
-    worker_id: int,
-    work_queue: "queue.Queue[Dict[str, Any] | None]",
-    submission_dir: "Path",
-    raw_config: Dict[str, Any],
-    base_port: int,
-    counters: Dict[str, Any],
-    counter_lock: "threading.Lock",
-) -> None:
-    """Long-running worker: own Redis triplet, pulls jobs from shared queue."""
-    import time as _time
-    from ming.core.config import create_ming_deep_research_config
-
-    ports = _start_worker_redis(worker_id, base_port)
-    worker_cfg = _build_worker_config(raw_config, ports)
-    ming_config = create_ming_deep_research_config(worker_cfg)
-    orchestrator = MingDeepResearch(ming_config)
-
-    try:
-        while True:
-            row = work_queue.get()
-            if row is None:
-                break  # Poison pill
-
-            qid = row["id"]
-            prompt = str(row["prompt"])
-            out_path = submission_dir / f"id_{qid}.md"
-
-            if out_path.exists():
-                with counter_lock:
-                    counters["skipped"] += 1
-                tqdm.write(f"[worker {worker_id}] Skip id={qid} (exists)")
-                continue
-
-            _flush_worker_redis(worker_cfg)
-            start = _time.time()
-            try:
-                result = orchestrator.run(
-                    prompt, draft_output_path=str(out_path.resolve())
-                )
-            except Exception as exc:
-                with counter_lock:
-                    counters["failed"] += 1
-                tqdm.write(f"[worker {worker_id}] FAILED id={qid}: {exc}")
-                continue
-
-            elapsed_min = round(_time.time() - start, 2) / 60
-
-            # Point draft_output_path at out_path so WriterAgent persists here (not only
-            # config's reports/draft.md). Sync return value when non-empty.
-            if result:
-                out_path.write_text(result, encoding="utf-8")
-            if out_path.exists():
-                with counter_lock:
-                    counters["written"] += 1
-                tqdm.write(
-                    f"[worker {worker_id}] Wrote id={qid} -> {out_path} ({elapsed_min:.2f} min)"
-                )
-            else:
-                with counter_lock:
-                    counters["failed"] += 1
-                tqdm.write(
-                    f"[worker {worker_id}] Empty report for id={qid} ({elapsed_min:.2f} min)"
-                )
-    finally:
-        _stop_worker_redis(worker_id)
-
-
-if __name__ == "__main__":
-    import argparse
-    import queue
-    import threading
-    import time
-    from pathlib import Path
-
-    from ming.core.config import create_ming_deep_research_config, load_config
-    from ming.core.redis_flush import flush_research_redis_for_new_run
-
-    parser = argparse.ArgumentParser(description="Ming deep research CLI.")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--jsonl",
-        type=str,
-        help="Path to query JSONL (fields: id, prompt, ...). Writes id_<id>.md per row.",
-    )
-    group.add_argument("--query", type=str, help="Run a single query (stdout timing only).")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config.json",
-        help="Config JSON path (used for Redis flush targets).",
-    )
-    parser.add_argument(
-        "--submission-dir",
-        type=str,
-        default="deepresearch-bench/submission/",
-        help="Output directory for id_<id>.md with --jsonl (default: <jsonl>/../submission).",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Number of parallel workers for --jsonl batch mode (default: 1, sequential).",
-    )
-    parser.add_argument(
-        "--base-port",
-        type=int,
-        default=6390,
-        help="Starting port for parallel worker Redis containers (default: 6390).",
-    )
-    args = parser.parse_args()
-
-    logging.basicConfig(level=logging.INFO)
-    raw_config = load_config(args.config)
-
-    if args.query:
-        config = create_ming_deep_research_config(raw_config)
-        orchestrator = MingDeepResearch(config)
-        flush_research_redis_for_new_run(raw_config)
-        start_time = time.time()
-        orchestrator.run(args.query)
-        print(f"\n\nTime taken: {round(time.time() - start_time, 2) / 60} minutes")
-    else:
-        jsonl_path = Path(args.jsonl).expanduser().resolve()
-        submission_dir = (
-            Path(args.submission_dir).expanduser().resolve()
-            if args.submission_dir
-            else jsonl_path.parent.parent / "submission"
-        )
-        submission_dir.mkdir(parents=True, exist_ok=True)
-
-        entries: list[dict[str, Any]] = []
-        with open(jsonl_path, encoding="utf-8") as f:
-            for line_no, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as e:
-                    tqdm.write(f"Skipping line {line_no}: invalid JSON ({e})")
-                    continue
-                if "id" not in row or "prompt" not in row:
-                    tqdm.write(f"Skipping line {line_no}: missing id or prompt")
-                    continue
-                entries.append(row)
-
-        num_workers = max(1, args.workers)
-
-        if num_workers == 1:
-            # Sequential mode: use the original Redis from config (no extra containers)
-            config = create_ming_deep_research_config(raw_config)
-            orchestrator = MingDeepResearch(config)
-
-            n_skipped = n_written = n_failed = 0
-            pbar = tqdm(entries, desc="JSONL queries", unit="query", dynamic_ncols=True)
-            for row in pbar:
-                qid = row["id"]
-                prompt = str(row["prompt"])
-                out_path = submission_dir / f"id_{qid}.md"
-                pbar.set_postfix(
-                    skipped=n_skipped, written=n_written, failed=n_failed, id=qid, refresh=False
-                )
-                if out_path.exists():
-                    n_skipped += 1
-                    pbar.set_postfix(
-                        skipped=n_skipped, written=n_written, failed=n_failed, id=qid
-                    )
-                    tqdm.write(f"Skip id={qid} (exists: {out_path})")
-                    continue
-
-                flush_research_redis_for_new_run(raw_config)
-                start_time = time.time()
-                result = orchestrator.run(
-                    prompt, draft_output_path=str(out_path.resolve())
-                )
-                elapsed_min = round(time.time() - start_time, 2) / 60
-
-                if result:
-                    out_path.write_text(result, encoding="utf-8")
-                if out_path.exists():
-                    n_written += 1
-                    pbar.set_postfix(
-                        skipped=n_skipped, written=n_written, failed=n_failed, id=qid
-                    )
-                    tqdm.write(f"Wrote id={qid} -> {out_path} ({elapsed_min:.2f} min)")
-                else:
-                    n_failed += 1
-                    pbar.set_postfix(
-                        skipped=n_skipped, written=n_written, failed=n_failed, id=qid
-                    )
-                    tqdm.write(
-                        f"Empty report for id={qid}; not writing {out_path} ({elapsed_min:.2f} min)"
-                    )
-        else:
-            # Parallel mode: each worker gets its own Redis container triplet
-            print(f"Starting {num_workers} parallel workers (base port {args.base_port})...")
-
-            work_q: queue.Queue[Dict[str, Any] | None] = queue.Queue()
-            for entry in entries:
-                work_q.put(entry)
-            # Poison pills to signal workers to exit
-            for _ in range(num_workers):
-                work_q.put(None)
-
-            counters: Dict[str, int] = {"skipped": 0, "written": 0, "failed": 0}
-            counter_lock = threading.Lock()
-
-            threads: List[threading.Thread] = []
-            for wid in range(num_workers):
-                t = threading.Thread(
-                    target=_worker_loop,
-                    args=(
-                        wid,
-                        work_q,
-                        submission_dir,
-                        raw_config,
-                        args.base_port,
-                        counters,
-                        counter_lock,
-                    ),
-                    daemon=True,
-                )
-                t.start()
-                threads.append(t)
-
-            for t in threads:
-                t.join()
-
-            print(
-                f"\nDone. written={counters['written']}  "
-                f"skipped={counters['skipped']}  failed={counters['failed']}"
-            )

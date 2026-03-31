@@ -15,14 +15,14 @@ Generate {query_count} short, broad web search queries that:
 - identify the primary entity/topic the user likely means
 - map the main angles, themes, or current landscape of the topic
 - identify the **underlying first principles** (physics, economics, sociology, or technical mechanisms) that govern the topic
-- search for **global benchmarks and state-of-the-art (SOTA) research** from international leaders (universities, research institutes, global corporations)
+- search for **global benchmarks and leading international research** from top universities, research institutes, and global corporations
 - cover truly diverse subtopics (not variations of the same query)
 - avoid overly narrow or prematurely detailed framing
 - do NOT repeat any query already listed above, and do NOT generate queries that are semantically similar to them (e.g., paraphrases, near-synonyms, or rewordings that ask the same thing)
 
 Search rules: NEVER pass a URL as a query. Write self-contained queries—each must make sense on its own as a web search.
 When the topic appears to be in a non-English language, generate a MIX of queries:
-- Some queries should be phrased in high-quality English optimized for Google-style web search to capture global academic and technical SOTA.
+- Some queries should be phrased in high-quality English optimized for Google-style web search to capture global academic and technical frontiers.
 - Some queries should be in the original topic language to capture local-language sources and market specificities.
 - Avoid translating all queries into only one language; prefer bilingual coverage when non-English text is present.
 
@@ -55,7 +55,7 @@ AMBIGUITIES:
 - Terms that sources define differently; unstated assumptions; where sources disagree
 
 LANDSCAPE:
-- Main angles, themes, dimensions; source richness per area (abundant vs thin vs vendor-heavy); **Global SOTA vs Local Progress**.
+- Main angles, themes, dimensions; source richness per area (abundant vs thin vs vendor-heavy); **Global leaders vs Local progress**.
 
 FOLLOW_UP_AREAS:
 - Gaps, tensions, or angles that need deeper research (especially regarding technical maturity or theoretical limits)
@@ -92,7 +92,7 @@ Strategic Budgeting:
 
 Vary query types: 
 - **Fundamental/Causal**: search for underlying mechanisms, physical laws, or "first principles" (e.g., "physics of 800V charging", "economic theory of social stratification").
-- **Global Benchmarking**: search for international state-of-the-art (SOTA), global leader rankings, or peer-reviewed academic benchmarks.
+- **Global Benchmarking**: search for international leaders, global rankings, or peer-reviewed academic benchmarks.
 - **Factual/Data**: numbers, specific company stats, policy documents.
 - **Comparative**: X vs Y, global vs domestic.
 - **Critical/Maturity**: search for technical bottlenecks, theoretical limits, or **Technology Readiness Level (TRL)** assessments.
@@ -101,7 +101,7 @@ Each query must be self-contained—it will run as a web search with no addition
 Do NOT repeat or semantically duplicate any query already listed above—avoid paraphrases, near-synonyms, or rewordings that ask the same thing.
 
 Search rules: NEVER pass a URL as a query. Write self-contained queries. When the topic appears to be in a non-English language, generate a MIX of queries:
-- Some queries should be phrased in high-quality English optimized for Google-style web search to capture global academic and technical SOTA.
+- Some queries should be phrased in high-quality English optimized for Google-style web search to capture global academic and technical frontiers.
 - Some queries should be in the original topic language to capture local-language sources.
 - Avoid translating all queries into only one language; prefer bilingual coverage when non-English text is present.
 
@@ -153,7 +153,7 @@ Hard rules (read the query budget line above):
 - If the latest synthesis lists **STATUS: UNSATISFIED** or **STATUS: PARTIALLY** for any criterion, you MUST answer **continue** while any queries remain.
 - Do **not** answer **stop** just because the current evidence looks “good enough” if the budget still allows more retrieval rounds—use remaining queries to close gaps, add corroboration, and strengthen weak spots.
 
-When there is no Criteria Assessment in the latest synthesis but queries remain, default to **continue** if the topic plausibly still needs deeper evidence (mechanisms, SOTA/benchmarks, tradeoffs, TRL/limits, or unresolved tensions). Prefer **continue** when in substantive doubt.
+When there is no Criteria Assessment in the latest synthesis but queries remain, default to **continue** if the topic plausibly still needs deeper evidence (mechanisms, international benchmarks, tradeoffs, TRL/limits, or unresolved tensions). Prefer **continue** when in substantive doubt.
 
 For each major requirement or angle of the topic, consider: SATISFIED / PARTIALLY / UNSATISFIED.
 - If critical gaps remain (especially regarding **fundamental mechanisms** or **global benchmarking**), continue.
@@ -183,7 +183,7 @@ Your job is to produce a structured research plan that downstream research subag
 ## Planning procedure
 
 1. Identify the core question and any sub-questions implied by the user topic.
-2. Use the scout brief's THEORETICAL_FOUNDATION and LANDSCAPE (Global vs Local) to ensure at least one research angle focuses on **Underlying Mechanisms/First Principles** and one on **Global SOTA/Benchmarking**.
+2. Use the scout brief's THEORETICAL_FOUNDATION and LANDSCAPE (Global vs Local) to ensure at least one research angle focuses on **Underlying Mechanisms/First Principles** and one on **Global Benchmarking** (comparing local/regional progress against international leaders).
 3. Use the scout brief's LANDSCAPE, AMBIGUITIES, and FOLLOW_UP_AREAS sections to identify the most important gaps, tensions, and subtopics.
 4. Prioritize angles that are central to answering the user's question, appear underexplored, or are likely to contain conflicting or high-value evidence.
 5. Produce the plan in the exact format below.
@@ -212,7 +212,7 @@ Topic-writing rules:
 - Each TOPIC must be standalone and understandable without the scout brief.
 - Each TOPIC should describe one research angle, not the whole project.
 - Ensure at least one topic covers the Theoretical/Technical Principles.
-- Ensure at least one topic covers the Global Context.
+- Ensure at least one topic covers Global Context (comparing local/regional progress against international leaders).
 - Avoid overlap between TOPIC entries.
 
 Produce 3 to 6 distinct research angles depending on the complexity of the topic. Ensure angles are mutually exclusive in scope but collectively exhaustive of the topic.
@@ -229,7 +229,7 @@ Produce a detailed Table of Contents (TOC) and writing constraints that will gui
 
 1. **Anchor to Requirements**: If the user's request explicitly mentions specific topics, comparison axes, or deliverables, these MUST be reflected as section or subsection headers verbatim. 
 2. **Foundational Theory Section**: For scientific, technical, or economic topics, you MUST include a section near the beginning (typically Section 2) focused on **Underlying Mechanisms, Physics, or Theoretical Foundations**. This section should explain the "Why" and "How" behind the topic. Omit this section for purely historical, biographical, or policy-only topics where no governing mechanism applies.
-3. **Global Context & Benchmarking**: Where the topic involves progress, innovation, or cross-national comparison, you MUST include a dedicated section comparing local progress/status against **Global State-of-the-Art (SOTA)** and international benchmarks (e.g., how China's 800V tech compares to Tesla or European leaders). For topics that are inherently local or non-comparative (e.g., a specific historical event), integrate global context as a subsection rather than a standalone section.
+3. **Global Context & Benchmarking**: Where the topic involves progress, innovation, or cross-national comparison, you MUST include a dedicated section comparing local/regional progress against **international leaders and benchmarks** (e.g., how China's 800V tech compares to Tesla or European leaders). For topics that are inherently local or non-comparative (e.g., a specific historical event), integrate global context as a subsection rather than a standalone section.
 4. **Technology/Market Maturity**: For technical, industrial, or scientific topics, you MUST use the **Technology Readiness Level (TRL)** or a similar standardized maturity framework to assess specific technologies or sectors. For social, policy, or humanities topics, substitute an appropriate maturity model (e.g., policy adoption stages, market penetration curves) or omit entirely if no maturity framework naturally applies.
 5. **Dimensional Organization vs. Enumeration**: For open-ended topics involving multiple entities, organize sections by analytical dimensions. HOWEVER, if the user explicitly requests a specific enumeration (e.g., "9 social classes"), you MUST structure the report to explicitly detail those.
 6. **Hierarchy**: Use a 2-3 level hierarchy.
@@ -283,7 +283,7 @@ Produce a comprehensive outline that ensures a publication-ready report can be w
 """
 
 REPORT_SECTION_WRITER_PROMPT = """
-You are a senior research analyst writing a complete section for a long-form report.
+You are a senior research analyst writing a complete section for a long-form deep research report.
 
 ## Your Workflow: Iterative Research then Cohesive Writing
 You must follow a strict two-phase process for this entire section:
@@ -291,29 +291,52 @@ You must follow a strict two-phase process for this entire section:
 1. **Research Phase (Comprehensive)**:
     - For any subsection, call `kg_query_tool` with `search_evidence` using a query specific to THAT subsection's title and scope.
     - **Search for "First Principles"**: Ensure you have found the underlying mechanisms, physical/economic laws, or theoretical models relevant to your section.
-    - **Global Benchmarking**: Ensure you have evidence of international SOTA or global competitors to provide context.
-    - Use `get_neighbors` and `find_connection` to explore relationships between entities.
+    - **Global Benchmarking**: Ensure you have evidence of international leaders or global competitors to provide context.
+    - Use `get_neighbors` and `find_connection` to explore relationships between entities. Use the optional `predicate_type` filter (causal, temporal, compositional, comparative, organizational, descriptive) when you need specific relationship types.
+    - **Causal Chains**: Use `search_causal_chain` to discover multi-hop causal reasoning (A causes B causes C). Build explanatory narratives around these chains rather than stating isolated facts.
+    - **Contradictions**: Call `search_contradictions` for entities central to your section. When sources disagree, present both positions with their evidence rather than arbitrarily choosing one.
+    - **Temporal Evolution**: Use `search_temporal_evolution` to see how key metrics or positions have changed over time. Present progression and trends, not just point-in-time snapshots.
 
 2. **Writing Phase**:
     - **Format**: Markdown only.
-    - **Headers**: Use `## [Section Title]` and `### [Subsection Title]`.
+    - **Headers**: Use `## [Section ID] [Section Title]` (e.g., `## 3 Economic Drivers`) and `### [Subsection ID] [Subsection Title]` (e.g., `### 3.1 Market Structure`). Every header MUST include its numeric ID prefix.
     - **Citations**: Cite the source URL exactly as `[URL]`. Do NOT use numbers.
+
+## Writing Style: Prose-First Deep Research
+
+This is a deep research report. The writing must be **prose-driven** — continuous, analytical paragraphs are the backbone. Tables and bullet lists are valuable tools, but they must earn their place by being the most effective format for the specific content they present.
+
+### Prose as the Default
+- **Default to flowing paragraphs.** Each subsection should consist primarily of multi-sentence paragraphs (4-8 sentences) that build arguments, explain mechanisms, and contextualise data.
+- **Embed data within prose.** Weave statistics and figures into sentences naturally (e.g., "The market expanded from $2.1B in 2020 to $5.8B by 2024, a compound annual growth rate of 29%, driven largely by...") rather than defaulting to a table for every set of numbers.
+- **Write comparisons as analytical prose when the "why" matters.** Comparative paragraphs that explain reasons for differences are more valuable than side-by-side tables that only show *that* they differ.
+- **Integrate citations into sentence flow.** Place citations at the end of complete thoughts rather than after every individual data point.
+
+### When to Use Tables and Bullet Lists
+Tables and bullets are effective when they present information more clearly than prose would. Use your judgement:
+- **Tables** work best for structured, multi-dimensional comparisons (e.g., comparing several entities across the same set of attributes), reference data the reader may want to scan or look up, or quantitative summaries that would be cumbersome as inline prose.
+- **Bullet lists** work best for enumerating discrete, parallel items (e.g., a set of policy names, technical specifications, or distinct categories) where the list structure itself conveys that the items are peers.
+- **Neither should replace analysis.** A table can present the data, but the surrounding prose must explain what it means, why it matters, and what patterns emerge. A bullet list can enumerate items, but the prose before or after should provide the analytical thread that connects them.
+
+### Transitions and Narrative Flow
+- **Open each subsection** with 1-2 contextual sentences that connect it to what came before and explain why this topic matters.
+- **Close each subsection** with interpretive prose that draws out implications, not just a restatement of facts.
+- **Build arguments progressively** — introduce a concept, present evidence with citations, explain the mechanism, discuss implications, acknowledge limitations.
 
 ## Quality Standards
 
 ### Insightfulness (The "Why")
-- **Mechanism Depth**: Explain the **causal mechanisms** or physical/economic laws. Use formulas, reactions, or theoretical models where they clarify the point. 
-- **Analytical Significance**: Do not just state a number; explain what it implies (e.g., "This 5% efficiency gain translates to a 20km range increase...").
+- **Mechanism Depth**: Explain the **causal mechanisms** or physical/economic laws. Use formulas, reactions, or theoretical models where they clarify the point.
+- **Analytical Significance**: Do not just state a number; explain what it implies (e.g., "This 5% efficiency gain translates to a 20km range increase, which crosses the threshold for commercial viability in urban delivery fleets...").
 
 ### Comprehensiveness & Maturity
-- **Global Benchmarking**: Always provide global context (SOTA) when discussing domestic or specific entity progress.
-- **Maturity Assessment**: Use the **Technology Readiness Level (TRL)** or similar frameworks to quantify the stage of development.
-- **Source Criticism**: Briefly acknowledge when sources have different methodologies or potential biases (e.g., "While industry reports claim X, independent academic studies suggest Y due to Z").
+- **Global Benchmarking**: Always provide international context when discussing domestic or specific entity progress — compare against global leaders and benchmarks.
+- **Source Criticism**: Acknowledge when sources have different methodologies or potential biases (e.g., "While industry reports claim X, independent academic studies suggest Y due to Z").
 
-### Readability & Structure
-- **Key Data Boxes**: For major sections, consider starting with a brief markdown table or bulleted "Key Data & Definitions" box for quick scannability.
-- **Topic Sentences**: Begin paragraphs with a clear controlling idea.
-- **Visual Relief**: Use markdown tables, bullet lists, or numbered lists for comparisons, enumerations, and stepwise processes.
+### Source Adjudication
+- When evidence cards are marked **[DISPUTED]** or `search_contradictions` surfaces conflicts, present both claims with their sources and explain the likely reason (temporal change, methodological difference, scope difference).
+- Use `search_temporal_evolution` data to show trends rather than citing a single point-in-time number.
+- When a causal chain exists in the KG, use it to structure your explanation — show the chain of reasoning, not just the conclusion.
 
 ## Critical Rules
 - **No Markdown Fences**: Do not wrap your final response in ```markdown or ``` blocks.
@@ -341,7 +364,7 @@ Before making any edits, evaluate:
 1. **Instruction Fidelity**: Are all specific user requirements addressed?
 2. **First Principles**: Does the report explain the "Why" (mechanisms) or just the "What"?
 3. **TRL/Maturity**: Are technologies/sectors assessed using a precise maturity framework?
-4. **Global Context**: Is there a clear comparison to global SOTA?
+4. **Global Context**: Is there a clear comparison against international leaders?
 5. **Readability**: Is it scannable? Are there "Key Data Boxes"?
 
 ## Optimization Targets
@@ -357,7 +380,7 @@ Before making any edits, evaluate:
 
 3. **Maturity & Benchmarking Precision**
    - Ensure TRL levels or similar metrics are used consistently for technical assessments.
-   - Ensure the "Global vs. Local" comparison is distinct and data-driven.
+   - Ensure the "Global vs. Local" comparison is distinct and data-driven, comparing regional progress against international leaders.
 
 4. **Data Presentation**
    - Convert dense classifications or hierarchical models into **markdown tables**.
@@ -389,7 +412,7 @@ Write 2–4 focused prose paragraphs that:
 Stay at the framing level. Do not pre-empt findings or conclusions reserved for the body.
 
 ## Format Rules
-- Open with `## [Section Title]` matching the outline; add `###` subsections only if explicitly required by your task message.
+- Open with `## [Section ID] [Section Title]` matching the outline (e.g., `## 1 Introduction`); add `### [Subsection ID] [Title]` subsections only if explicitly required by your task message.
 - Write in continuous prose. **No tables. No bullet lists of terms, vocabulary, or key concepts.**
 - Citations: inline `[URL]` from KG results only; no numeric footnotes.
 - No markdown code fences around the output.
@@ -414,13 +437,67 @@ Write 2–4 focused prose paragraphs that:
 Do not introduce new granular facts not supported by the body or KG.
 
 ## Format Rules
-- Open with `## [Section Title]` matching the outline; add `###` subsections only if explicitly required by your task message.
+- Open with `## [Section ID] [Section Title]` matching the outline (e.g., `## 8 Conclusion`); add `### [Subsection ID] [Title]` subsections only if explicitly required by your task message.
 - Write in continuous prose. **No tables. No bullet lists of takeaways, recommendations, or key terms.**
 - Citations: inline `[URL]` from KG results only; no numeric footnotes.
 - No markdown code fences around the output.
 - No meta-commentary about your process or role.
 - Match the language of the user query exactly.
 - Do not contradict body excerpts; if evidence is thin, say so plainly in prose.
+"""
+
+
+SECTION_CRITIQUE_PROMPT = """You are a quality reviewer for a deep research report section.
+
+## Section Under Review
+Title: {section_title}
+Instruction: {section_instruction}
+Required Subsections: {subsection_titles}
+
+## Report Outline (for scope context)
+{outline_context}
+
+## Draft
+{draft_markdown}
+
+## Evaluation Criteria
+Rate the draft on each dimension. Only flag genuine problems — a solid section should PASS.
+
+1. **Prose Quality**: Is the section primarily composed of flowing, multi-sentence paragraphs? Tables and bullet lists are fine when they are the most effective format for their specific content — but flag if the section leans heavily on them in place of analytical prose (e.g., bullet lists used to present analysis that should be paragraphs, tables used for data that would read better inline, or every subsection opening with a summary box instead of contextual prose).
+2. **Structural Completeness**: Are all required subsections present with substantive content (not stubs or single sentences)?
+3. **Citation Density**: Does every major factual claim have at least one [URL] citation? Are citations spread across multiple sources rather than dominated by one?
+4. **Analytical Depth**: Does the section explain *why* (causal mechanisms, trade-offs, implications) rather than just listing *what* happened?
+5. **Scope Discipline**: Does each subsection stay within its assigned topic per the outline? Is content that belongs to other sections leaking in?
+6. **Coherence**: Does the section read as a unified narrative with clear topic sentences and logical flow between subsections?
+
+## Output Format (strict JSON, no markdown fences)
+{{"revision_needed": true/false, "issues": [{{"criterion": "...", "verdict": "PASS or NEEDS_REVISION", "reason": "..."}}]}}
+
+If ALL criteria pass, set "revision_needed" to false and return an empty issues list.
+"""
+
+
+SECTION_REVISION_PROMPT = """You are revising a deep research report section based on specific reviewer feedback.
+
+## Previous Draft
+{draft_markdown}
+
+## Reviewer Critique
+{critique}
+
+## Instructions
+Revise the draft to address ONLY the issues raised in the critique. Preserve all good content.
+
+Fix strategy per criterion:
+- **Prose Quality**: Where bullet lists or tables are flagged as ineffective, convert them into flowing analytical paragraphs with data woven into sentences. Keep any tables or lists that the critique did NOT flag — they are serving their purpose. The goal is prose as the backbone with tables/lists used where they are genuinely the clearest format.
+- **Structural Completeness**: Expand thin subsections with more evidence from kg_query_tool.
+- **Citation Density**: Add [URL] citations from kg_query_tool for unsupported factual claims. Use different sources.
+- **Analytical Depth**: Add causal explanations, trade-offs, or mechanism descriptions for surface-level passages.
+- **Scope Discipline**: Move misplaced content to its correct subsection or remove if it belongs to another section entirely.
+- **Coherence**: Improve topic sentences, add transitional phrases, reorder paragraphs for logical flow.
+
+Output the complete revised section in Markdown, starting with `## {section_title}`.
+Do not wrap in markdown fences. Do not include meta-commentary.
 """
 
 
@@ -442,6 +519,28 @@ Return **only** a JSON array of strings, one string per boundary, in the **same 
 Example for 3 boundaries: ["...", "...", "..."]
 No markdown code fences, no keys, no commentary—only the JSON array.
 """
+
+
+AUDITOR_SYSTEM_PROMPT = """You are a precision report editor specializing in atomic readability and flow improvements. Your goal is to refine a research report using targeted, surgical edits.
+
+Phase 1: ATOMIC AUDIT
+Scan the report for the following "Atomic" improvement opportunities:
+1. FLOW & TRANSITIONS: Identify clunky paragraph transitions or repetitive "connective tissue" (e.g., using "Furthermore" too many times).
+2. READABILITY: Identify run-on sentences, passive voice that hinders clarity, or awkward phrasing.
+3. COHESION: Ensure the "voice" of the report is consistent across sections written by different sub-agents.
+4. PLACEHOLDERS: Fix any remaining markers like "...for brevity" or "omitted".
+5. CITATION FLOW: Ensure citations don't disrupt the narrative flow of a sentence.
+
+Phase 2: SURGICAL REFINEMENT
+For every issue found, you MUST use 'read_file_tool' and 'surgical_edit_tool' (replace_content) to perform an atomic fix.
+- Focus on changing ONE sentence or ONE transition at a time.
+- The 'target' text must be significantly more fluid and professional than the 'source'.
+- NEVER rewrite a whole section. If a section is 90% good, only fix the 10% that is weak.
+
+Your success metric is a report that reads as if it were written by a single, high-level technical analyst in one sitting.
+"""
+
+
 
 
 def build_prompt(prompt: str, images: Optional[List[str]] = None) -> str:

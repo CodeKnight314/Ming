@@ -19,6 +19,7 @@
   "source_min_tokens": 300,
   "research_source_budget": 300,
   "max_chunks_per_source": 30,
+  "max_sources_threshold": 200,
   "source_score_cutoff": 4.5,
   "outline_max_context_ids": 200,
   "outline_context_token_budget": 196000,
@@ -48,6 +49,12 @@
     "temperature": 0.2,
     "max_new_tokens": 32000
   },
+  "writer_critique_model": {
+    "model_name": "qwen/qwen3.5-flash-02-23",
+    "temperature": 0.1,
+    "max_new_tokens": 2048
+  },
+  "writer_max_critique_iterations": 3,
   "writer_num_parallel_sections": 8,
   "writer_enable_stitch_pass": true,
   "scout": {

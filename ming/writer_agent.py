@@ -11,11 +11,17 @@ from typing import Any, Dict, List, Tuple
 
 from tqdm import tqdm
 
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.state import CompiledStateGraph
+from typing_extensions import TypedDict
+
 from ming.core.prompts import (
     CONCLUSION_SECTION_WRITER_PROMPT,
     INTRO_SECTION_WRITER_PROMPT,
     READABILITY_POLISH_PROMPT,
     REPORT_SECTION_WRITER_PROMPT,
+    SECTION_CRITIQUE_PROMPT,
+    SECTION_REVISION_PROMPT,
     STITCH_TRANSITIONS_PROMPT,
 )
 from ming.core.reference_cleanup import canonicalize_url, normalize_markdown_references
@@ -36,10 +42,37 @@ class WriterAgentConfig:
     kg_query_tool: KGQueryTool
     fallback_model: OpenRouterModelConfig | None = None
     polish_model: OpenRouterModelConfig | None = None
+    critique_model: OpenRouterModelConfig | None = None
     draft_output_path: str | None = None
     max_iterations: int = 18
+    max_critique_iterations: int = 3
     num_parallel_sections: int = 8
     enable_stitch_pass: bool = True
+
+
+class SectionWriterState(TypedDict, total=False):
+    report_title: str
+    section_plan: Dict[str, Any]
+    constraints_paragraph: str
+    user_query: str
+    report_structure_context: str
+    additional_context: str
+    system_prompt: str
+    section_index: int
+
+    initial_evidence: Dict[str, Any]
+    initial_evidence_text: str
+    subsection_grouping: Dict[str, List[int]]
+    canonical_entities_context: str
+    surfaced_urls: List[str]
+
+    draft_markdown: str
+    draft_messages: List[Dict[str, str]]
+    all_urls: List[str]
+
+    critique: str
+    revision_needed: bool
+    iteration: int
 
 
 class WriterAgent:
@@ -50,8 +83,26 @@ class WriterAgent:
     def __init__(self, config: WriterAgentConfig):
         self.config = config
         self.polish_model = OpenRouterModel(config.polish_model) if config.polish_model is not None else None
-        # Lightweight single-shot calls (stitch pass) share the primary writer model config.
         self._stitch_llm = OpenRouterModel(config.model)
+
+        self._critique_llm: OpenRouterModel | None = (
+            OpenRouterModel(config.critique_model)
+            if config.critique_model is not None
+            else None
+        )
+        self._section_graph: CompiledStateGraph | None = (
+            self._build_section_graph() if self._critique_llm is not None else None
+        )
+
+        self._substage_callback: Any | None = None
+
+    def _emit_substage(self, state: SectionWriterState, substage: str) -> None:
+        """Notify the progress callback of a substage transition for this section."""
+        cb = self._substage_callback
+        if cb is not None:
+            idx = state.get("section_index", -1)
+            if idx >= 0:
+                cb(idx, substage)
 
     @staticmethod
     def _slugify_report_title(report_title: str) -> str:
@@ -105,7 +156,7 @@ class WriterAgent:
         )
         sp = system_prompt if system_prompt is not None else REPORT_SECTION_WRITER_PROMPT
 
-        return Agent(
+        agent = Agent(
             AgentConfig(
                 model=primary,
                 fallback_model=fallback_eff,
@@ -115,6 +166,13 @@ class WriterAgent:
                 max_tool_calls_per_turn=8,
             )
         )
+        tracker = getattr(self, "_token_tracker", None)
+        if tracker is not None:
+            if hasattr(agent.model, "token_tracker"):
+                agent.model.token_tracker = tracker
+            if agent.fallback_model and hasattr(agent.fallback_model, "token_tracker"):
+                agent.fallback_model.token_tracker = tracker
+        return agent
 
     def _run_writer_prompt_with_fallback(
         self,
@@ -229,7 +287,6 @@ class WriterAgent:
                     if 0 <= ci < len(cards):
                         lines.extend(_format_card(ci + 1, cards[ci]))
                         emitted.add(ci)
-            # Emit remaining cards under broad heading
             remaining = [i for i in range(len(cards)) if i not in emitted]
             if remaining:
                 lines.append("--- Broad evidence ---")
@@ -436,7 +493,6 @@ class WriterAgent:
                 if paragraphs:
                     break
             elif stripped.startswith("#"):
-                # Skip subsection headers; keep scanning for first prose block.
                 continue
             else:
                 buf.append(stripped)
@@ -490,7 +546,6 @@ class WriterAgent:
             )
             return result, None
 
-        # One broad query + one per subsection
         broad_limit = 10
         per_sub_limit = max(4, (self._INITIAL_EVIDENCE_LIMIT - broad_limit) // len(section.subsections))
 
@@ -510,13 +565,11 @@ class WriterAgent:
             )
             sub_results.append((sub.title, sub_result))
 
-        # Merge and deduplicate cards by fact string
         seen_facts: Dict[str, int] = {}  # fact -> index in merged list
         merged_cards: List[Dict[str, Any]] = []
         subsection_grouping: Dict[str, List[int]] = {}
         thin_pool_any = broad_result.get("thin_pool", False)
 
-        # Add subsection cards first (higher priority for grouping)
         for sub_title, sub_result in sub_results:
             thin_pool_any = thin_pool_any or sub_result.get("thin_pool", False)
             indices: List[int] = []
@@ -531,16 +584,13 @@ class WriterAgent:
                 indices.append(idx)
             subsection_grouping[sub_title] = indices
 
-        # Add broad cards that weren't already seen
         for card in broad_result.get("cards") or []:
             fact = card.get("fact", "")
             if fact not in seen_facts:
                 seen_facts[fact] = len(merged_cards)
                 merged_cards.append(card)
 
-        # Cap at budget
         merged_cards = merged_cards[: self._INITIAL_EVIDENCE_LIMIT]
-        # Prune grouping indices that exceeded the cap
         for sub_title in subsection_grouping:
             subsection_grouping[sub_title] = [
                 i for i in subsection_grouping[sub_title] if i < len(merged_cards)
@@ -591,6 +641,194 @@ class WriterAgent:
             unused_urls=unused_urls,
         )
 
+    def _build_section_graph(self) -> CompiledStateGraph:
+        workflow = StateGraph(SectionWriterState)
+        workflow.add_node("gather_evidence", self._node_gather_evidence)
+        workflow.add_node("draft_section", self._node_draft_section)
+        workflow.add_node("critique_section", self._node_critique_section)
+        workflow.add_node("revise_section", self._node_revise_section)
+
+        workflow.add_edge(START, "gather_evidence")
+        workflow.add_edge("gather_evidence", "draft_section")
+        workflow.add_edge("draft_section", "critique_section")
+        workflow.add_conditional_edges(
+            "critique_section",
+            self._route_after_critique,
+            {"revise": "revise_section", "finish": END},
+        )
+        workflow.add_edge("revise_section", "critique_section")
+
+        return workflow.compile()
+
+    def _route_after_critique(self, state: SectionWriterState) -> str:
+        if not state.get("revision_needed", False):
+            return "finish"
+        if state.get("iteration", 0) >= self.config.max_critique_iterations:
+            logger.info(
+                "Section '%s' hit max critique iterations (%d); finalising.",
+                state.get("section_plan", {}).get("title", "?"),
+                self.config.max_critique_iterations,
+            )
+            return "finish"
+        return "revise"
+
+    @staticmethod
+    def _section_plan_from_state(state: SectionWriterState) -> SectionPlan:
+        """Reconstruct a SectionPlan from the serialised dict in state."""
+        from ming.core.outline_parser import SubsectionPlan
+        d = state["section_plan"]
+        subs = [SubsectionPlan(**s) for s in d.get("subsections", [])]
+        return SectionPlan(
+            section_id=d["section_id"],
+            title=d["title"],
+            depth_target=d.get("depth_target", ""),
+            instruction=d.get("instruction", ""),
+            subsections=subs,
+        )
+
+    def _node_gather_evidence(self, state: SectionWriterState) -> Dict[str, Any]:
+        self._emit_substage(state, "gathering")
+        section = self._section_plan_from_state(state)
+        initial_evidence, subsection_grouping = self._search_initial_evidence(section)
+        initial_evidence_text = self._format_evidence_cards(
+            initial_evidence, grouped_by_subsection=subsection_grouping,
+        )
+        section_entity_names = self._extract_entity_names_from_cards(
+            initial_evidence.get("cards") or []
+        )
+        canonical_entities_context = self._canonical_entities_context(
+            section_entity_names=section_entity_names or None,
+        )
+        surfaced_urls = sorted(
+            {
+                canonicalize_url(url)
+                for card in (initial_evidence.get("cards") or [])
+                for url in (card.get("supporting_urls") or [])
+            }
+        )
+        return {
+            "initial_evidence": initial_evidence,
+            "initial_evidence_text": initial_evidence_text,
+            "subsection_grouping": subsection_grouping or {},
+            "canonical_entities_context": canonical_entities_context,
+            "surfaced_urls": surfaced_urls,
+        }
+
+    def _node_draft_section(self, state: SectionWriterState) -> Dict[str, Any]:
+        self._emit_substage(state, "drafting")
+        section = self._section_plan_from_state(state)
+        prompt = self._build_section_prompt(
+            report_title=state["report_title"],
+            constraints_paragraph=state.get("constraints_paragraph", ""),
+            section=section,
+            initial_evidence_text=state.get("initial_evidence_text", ""),
+            canonical_entities_context=state.get("canonical_entities_context", ""),
+            user_query=state.get("user_query", ""),
+            report_structure_context=state.get("report_structure_context", ""),
+            additional_context=state.get("additional_context", ""),
+        )
+        sys_prompt = state.get("system_prompt") or None
+        output, messages = self._run_writer_prompt_with_fallback(
+            prompt, system_prompt=sys_prompt,
+        )
+        surfaced_urls = state.get("surfaced_urls", [])
+        urls = sorted(set(surfaced_urls + self._extract_urls_from_tool_results(messages)))
+        markdown = self._clean_section_markdown(
+            report_title=state["report_title"],
+            section_title=section.title,
+            raw_text=output,
+        )
+        return {
+            "draft_markdown": markdown,
+            "draft_messages": messages,
+            "all_urls": urls,
+            "iteration": state.get("iteration", 0),
+        }
+
+    def _node_critique_section(self, state: SectionWriterState) -> Dict[str, Any]:
+        self._emit_substage(state, "critiquing")
+        assert self._critique_llm is not None
+        section = self._section_plan_from_state(state)
+        subsection_titles = ", ".join(sub.title for sub in section.subsections) or "(none)"
+
+        prompt = SECTION_CRITIQUE_PROMPT.format(
+            section_title=section.title,
+            section_instruction=section.instruction,
+            subsection_titles=subsection_titles,
+            outline_context=state.get("report_structure_context", ""),
+            draft_markdown=state.get("draft_markdown", ""),
+        )
+        try:
+            raw = self._critique_llm.generate(prompt)
+            raw = strip_markdown_fences(raw.strip())
+            verdict = json.loads(raw)
+            revision_needed = bool(verdict.get("revision_needed", False))
+            critique_text = raw
+        except Exception as exc:
+            logger.warning(
+                "Critique model failed or returned invalid JSON for section '%s': %s — skipping revision.",
+                section.title, exc,
+            )
+            revision_needed = False
+            critique_text = ""
+
+        if state.get("iteration", 0) >= self.config.max_critique_iterations:
+            revision_needed = False
+
+        if revision_needed:
+            logger.info(
+                "Section '%s' critique: NEEDS_REVISION (iteration %d).",
+                section.title, state.get("iteration", 0),
+            )
+        else:
+            logger.info(
+                "Section '%s' critique: PASS (iteration %d).",
+                section.title, state.get("iteration", 0),
+            )
+
+        return {
+            "critique": critique_text,
+            "revision_needed": revision_needed,
+        }
+
+    def _node_revise_section(self, state: SectionWriterState) -> Dict[str, Any]:
+        self._emit_substage(state, "revising")
+        section = self._section_plan_from_state(state)
+
+        revision_context = SECTION_REVISION_PROMPT.format(
+            draft_markdown=state.get("draft_markdown", ""),
+            critique=state.get("critique", ""),
+            section_title=section.title,
+        )
+
+        prompt = self._build_section_prompt(
+            report_title=state["report_title"],
+            constraints_paragraph=state.get("constraints_paragraph", ""),
+            section=section,
+            initial_evidence_text=state.get("initial_evidence_text", ""),
+            canonical_entities_context=state.get("canonical_entities_context", ""),
+            user_query=state.get("user_query", ""),
+            report_structure_context=state.get("report_structure_context", ""),
+            additional_context=revision_context,
+        )
+        sys_prompt = state.get("system_prompt") or None
+        output, messages = self._run_writer_prompt_with_fallback(
+            prompt, system_prompt=sys_prompt,
+        )
+        prev_urls = state.get("all_urls", [])
+        urls = sorted(set(prev_urls + self._extract_urls_from_tool_results(messages)))
+        markdown = self._clean_section_markdown(
+            report_title=state["report_title"],
+            section_title=section.title,
+            raw_text=output,
+        )
+        return {
+            "draft_markdown": markdown,
+            "draft_messages": messages,
+            "all_urls": urls,
+            "iteration": state.get("iteration", 0) + 1,
+        }
+
     def _write_section(
         self,
         report_title: str,
@@ -601,12 +839,121 @@ class WriterAgent:
         report_structure_context: str = "",
         additional_context: str = "",
         system_prompt: str | None = None,
+        section_index: int = -1,
     ) -> Tuple[str, str, List[str]]:
+        if self._section_graph is not None:
+            return self._write_section_with_graph(
+                report_title=report_title,
+                constraints_paragraph=constraints_paragraph,
+                section=section,
+                user_query=user_query,
+                report_structure_context=report_structure_context,
+                additional_context=additional_context,
+                system_prompt=system_prompt,
+                section_index=section_index,
+            )
+
+        return self._write_section_single_shot(
+            report_title=report_title,
+            constraints_paragraph=constraints_paragraph,
+            section=section,
+            user_query=user_query,
+            report_structure_context=report_structure_context,
+            additional_context=additional_context,
+            system_prompt=system_prompt,
+        )
+
+    def _write_section_with_graph(
+        self,
+        report_title: str,
+        constraints_paragraph: str,
+        section: SectionPlan,
+        user_query: str = "",
+        *,
+        report_structure_context: str = "",
+        additional_context: str = "",
+        system_prompt: str | None = None,
+        section_index: int = -1,
+    ) -> Tuple[str, str, List[str]]:
+        """Run the section through the gather → draft → critique → revise graph."""
+        from dataclasses import asdict
+        assert self._section_graph is not None
+
+        initial_state: SectionWriterState = {
+            "report_title": report_title,
+            "section_plan": asdict(section),
+            "constraints_paragraph": constraints_paragraph,
+            "user_query": user_query,
+            "report_structure_context": report_structure_context,
+            "additional_context": additional_context,
+            "system_prompt": system_prompt or "",
+            "section_index": section_index,
+            "initial_evidence": {},
+            "initial_evidence_text": "",
+            "subsection_grouping": {},
+            "canonical_entities_context": "",
+            "surfaced_urls": [],
+            "draft_markdown": "",
+            "draft_messages": [],
+            "all_urls": [],
+            "critique": "",
+            "revision_needed": False,
+            "iteration": 0,
+        }
+
+        result = self._section_graph.invoke(initial_state)
+
+        markdown = result.get("draft_markdown", "")
+        urls = result.get("all_urls", [])
+        surfaced_urls = result.get("surfaced_urls", [])
+        initial_evidence = result.get("initial_evidence", {})
+
+        needs_rerun, audit_feedback = self._needs_audit_rerun(
+            markdown,
+            surfaced_urls=surfaced_urls,
+            thin_pool=bool(initial_evidence.get("thin_pool", False)),
+        )
+        if needs_rerun and audit_feedback.strip():
+            rerun_prompt = self._build_section_prompt(
+                report_title=report_title,
+                constraints_paragraph=constraints_paragraph,
+                section=section,
+                initial_evidence_text=result.get("initial_evidence_text", ""),
+                canonical_entities_context=result.get("canonical_entities_context", ""),
+                audit_feedback=audit_feedback,
+                user_query=user_query,
+                report_structure_context=report_structure_context,
+                additional_context=additional_context,
+            )
+            rerun_output, rerun_messages = self._run_writer_prompt_with_fallback(
+                rerun_prompt,
+                system_prompt=system_prompt,
+            )
+            urls = sorted(set(urls + self._extract_urls_from_tool_results(rerun_messages)))
+            markdown = self._clean_section_markdown(
+                report_title=report_title,
+                section_title=section.title,
+                raw_text=rerun_output,
+            )
+
+        return section.section_id, markdown, urls
+
+    def _write_section_single_shot(
+        self,
+        report_title: str,
+        constraints_paragraph: str,
+        section: SectionPlan,
+        user_query: str = "",
+        *,
+        report_structure_context: str = "",
+        additional_context: str = "",
+        system_prompt: str | None = None,
+    ) -> Tuple[str, str, List[str]]:
+        """Original single-shot section writing (no critique loop)."""
         initial_evidence, subsection_grouping = self._search_initial_evidence(section)
         initial_evidence_text = self._format_evidence_cards(
             initial_evidence, grouped_by_subsection=subsection_grouping
         )
-        # Extract entity names from evidence cards to scope the entity context
         section_entity_names = self._extract_entity_names_from_cards(
             initial_evidence.get("cards") or []
         )
@@ -843,26 +1190,41 @@ class WriterAgent:
             if runtime_observer is None or not sections:
                 return
             done = sum(1 for row in progress_rows if row["status"] == "done")
+            metrics: Dict[str, Any] = {
+                "write_sections_progress_json": json.dumps(
+                    progress_rows, ensure_ascii=False
+                ),
+                "write_sections_completed": done,
+                "write_sections_total": len(sections),
+            }
+            tracker = getattr(self, "_token_tracker", None)
+            if tracker is not None:
+                metrics["token_stats_json"] = json.dumps(
+                    tracker.snapshot(), ensure_ascii=False
+                )
             runtime_observer.update_run(
-                metrics={
-                    "write_sections_progress_json": json.dumps(
-                        progress_rows, ensure_ascii=False
-                    ),
-                    "write_sections_completed": done,
-                    "write_sections_total": len(sections),
-                }
+                metrics=metrics
             )
+
+        def _substage_update(idx: int, substage: str) -> None:
+            if 0 <= idx < len(progress_rows):
+                progress_rows[idx]["substage"] = substage
+                _emit_write_progress()
+
+        self._substage_callback = _substage_update
 
         def _record_result(idx: int, markdown: str, urls: List[str]) -> None:
             section_results[idx] = markdown
             all_found_urls.extend(urls)
             progress_rows[idx]["status"] = "done"
+            progress_rows[idx].pop("substage", None)
             _emit_write_progress()
 
         def _record_failure(idx: int, exc: Exception) -> None:
             logger.error(f"Failed to write section {sections[idx].title}: {exc}")
             section_results[idx] = f"## {sections[idx].title}\n\n_Error writing this section._"
             progress_rows[idx]["status"] = "failed"
+            progress_rows[idx].pop("substage", None)
             _emit_write_progress()
 
         def _write_at_index(idx: int, **kwargs: Any) -> Tuple[str, str, List[str]]:
@@ -872,6 +1234,7 @@ class WriterAgent:
                 sections[idx],
                 user_query,
                 report_structure_context=outline_toc_summary(sections, current_index=idx),
+                section_index=idx,
                 **kwargs,
             )
 
@@ -896,7 +1259,6 @@ class WriterAgent:
             body_markdowns = [section_results[i] or "" for i in body_indices]
             body_plans = [sections[i] for i in body_indices]
 
-            # Introduction (body-aware)
             intro_i = 0
             progress_rows[intro_i]["status"] = "running"
             _emit_write_progress()
@@ -911,7 +1273,6 @@ class WriterAgent:
             except Exception as e:
                 _record_failure(intro_i, e)
 
-            # Conclusion (body-aware)
             concl_i = len(sections) - 1
             progress_rows[concl_i]["status"] = "running"
             _emit_write_progress()
@@ -940,7 +1301,6 @@ class WriterAgent:
                     except Exception as e:
                         _record_failure(idx, e)
 
-        # Filter out any None results (should not happen after failures handled)
         base_ordered = [res if res is not None else "" for res in section_results]
         titles_ordered = [s.title for s in sections]
 
@@ -954,12 +1314,13 @@ class WriterAgent:
         else:
             valid_sections = base_ordered
 
-        # Process citations: Convert [URL] to [N] and build reference list
         processed_sections, citations = self._process_citations(valid_sections, all_found_urls)
 
         final_markdown = self._report_markdown(report_title, processed_sections, citations)
         final_markdown = normalize_markdown_references(final_markdown)
         final_markdown = self._polish_report(final_markdown, user_query=user_query)
         draft_path.write_text(final_markdown, encoding="utf-8")
+
+        self._substage_callback = None
 
         return final_markdown

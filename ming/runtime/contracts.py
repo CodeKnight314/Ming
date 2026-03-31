@@ -198,13 +198,14 @@ class BatchItem:
 class RunBatchPayload:
     mode: str
     items: list[BatchItem]
+    max_concurrent: int = 1
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> RunBatchPayload:
         payload = _require_mapping(raw, "payload")
         mode = _require_non_empty(str(payload.get("mode", "")), "payload.mode")
-        if mode != "sequential":
-            raise RuntimeValidationError("payload.mode must currently be 'sequential'")
+        if mode not in ("sequential", "concurrent"):
+            raise RuntimeValidationError("payload.mode must be 'sequential' or 'concurrent'")
         raw_items = payload.get("items")
         if not isinstance(raw_items, list) or not raw_items:
             raise RuntimeValidationError("payload.items must be a non-empty list")
@@ -212,12 +213,14 @@ class RunBatchPayload:
         ids = [item.id for item in items]
         if len(ids) != len(set(ids)):
             raise RuntimeValidationError("payload.items contains duplicate ids")
-        return cls(mode=mode, items=items)
+        max_concurrent = max(1, min(5, int(payload.get("max_concurrent", 1))))
+        return cls(mode=mode, items=items, max_concurrent=max_concurrent)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
             "items": [item.to_dict() for item in self.items],
+            "max_concurrent": self.max_concurrent,
         }
 
 
@@ -397,6 +400,7 @@ class QueueSnapshot:
     updated_at: str
     queued_job_ids: list[str] = field(default_factory=list)
     active_job_id: str | None = None
+    active_job_ids: list[str] = field(default_factory=list)
     completed_job_ids: list[str] = field(default_factory=list)
     failed_job_ids: list[str] = field(default_factory=list)
 

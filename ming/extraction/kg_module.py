@@ -464,11 +464,18 @@ class KGRedisStore:
         chunks = {}
         canonical_entities = {}
 
+        pfx = getattr(self.database, "_pfx", "")
+        scan_match = (pfx + "*") if pfx else None
         cursor = 0
         while True:
-            cursor, keys = self.database.client.scan(cursor=cursor, count=200)
-            for key in keys:
-                if key.startswith(("url:", "url:lock:", "queries:")):
+            scan_kw = {"cursor": cursor, "count": 200}
+            if scan_match:
+                scan_kw["match"] = scan_match
+            cursor, keys = self.database.client.scan(**scan_kw)
+            for raw_key in keys:
+                # Strip prefix to get the logical key used by get_entry.
+                key = raw_key[len(pfx):] if pfx and raw_key.startswith(pfx) else raw_key
+                if key.startswith(("url:", "url:lock:", "queries:", "runtime:")):
                     continue
                 data = self.database.get_entry(key)
                 if not data:

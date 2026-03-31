@@ -32,6 +32,15 @@ const KG_STAGE_KEYS: [&str; 4] = [
     "entity_resolution",
 ];
 
+fn status_icon(status: &str, ui_tick: u32) -> &'static str {
+    match status {
+        "completed" | "success" | "done" => "✓",
+        "failed" | "error" => "✗",
+        "running" => SPINNER_FRAMES[ui_tick as usize % SPINNER_FRAMES.len()],
+        _ => "·",
+    }
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     let full = frame.area();
     let (query_h, query_lines, batch_label) = build_query_panel_lines(app, full.width);
@@ -61,6 +70,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         Rect::new(x, y + HEADER_ROWS + activity_h + query_h, w, FOOTER_ROWS),
         app,
     );
+
+    // Completion popup (rendered above the input panel).
+    if !app.completion_matches.is_empty() {
+        let input_area = Rect::new(x, y + HEADER_ROWS + activity_h, w, query_h);
+        render_completion_popup(frame, input_area, app);
+    }
 
     if app.show_help {
         render_help(frame);
@@ -100,28 +115,41 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ]);
 
-    let meta = Line::from(vec![
-        Span::styled("run ", Style::default().fg(theme::MUTED)),
-        Span::styled(
-            truncate(&run.run_id, 18),
-            Style::default().fg(theme::TEXT),
-        ),
-        Span::styled("   stage ", Style::default().fg(theme::MUTED)),
-        Span::styled(run.stage.clone(), Style::default().fg(stage_color)),
-        Span::styled(
-            format!(
-                "   {}",
-                format_elapsed(
-                    app.run_started_at
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(run.elapsed_seconds)
-                )
+    let active_count = app.dashboard.active_runs.len();
+    let meta = if active_count > 1 {
+        Line::from(vec![
+            Span::styled(
+                format!("workers {active_count} active"),
+                Style::default().fg(theme::ACCENT_BLUE).add_modifier(Modifier::BOLD),
             ),
-            Style::default().fg(theme::TEXT),
-        ),
-        Span::styled("   ↻ ", Style::default().fg(theme::MUTED)),
-        Span::styled(refresh_label, Style::default().fg(theme::MUTED)),
-    ]);
+            Span::styled("   Tab to focus worker list   ", Style::default().fg(theme::MUTED)),
+            Span::styled("↻ ", Style::default().fg(theme::MUTED)),
+            Span::styled(refresh_label, Style::default().fg(theme::MUTED)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("run ", Style::default().fg(theme::MUTED)),
+            Span::styled(
+                truncate(&run.run_id, 18),
+                Style::default().fg(theme::TEXT),
+            ),
+            Span::styled("   stage ", Style::default().fg(theme::MUTED)),
+            Span::styled(run.stage.clone(), Style::default().fg(stage_color)),
+            Span::styled(
+                format!(
+                    "   {}",
+                    format_elapsed(
+                        app.run_started_at
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(run.elapsed_seconds)
+                    )
+                ),
+                Style::default().fg(theme::TEXT),
+            ),
+            Span::styled("   ↻ ", Style::default().fg(theme::MUTED)),
+            Span::styled(refresh_label, Style::default().fg(theme::MUTED)),
+        ])
+    };
 
     frame.render_widget(Paragraph::new(vec![brand, meta]), area);
 }
@@ -147,6 +175,50 @@ fn render_input(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, batch_
     );
 }
 
+fn render_completion_popup(frame: &mut Frame, input_area: Rect, app: &App) {
+    let matches = &app.completion_matches;
+    if matches.is_empty() {
+        return;
+    }
+    let max_show: u16 = 6;
+    let height = (matches.len() as u16).min(max_show) + 2; // +2 for borders
+    let width = matches.iter().map(|s| s.len()).max().unwrap_or(10) as u16 + 4;
+    let width = width.min(input_area.width);
+
+    // Position above the input area.
+    let y = input_area.y.saturating_sub(height);
+    let popup = Rect::new(input_area.x + 2, y, width, height);
+
+    frame.render_widget(Clear, popup);
+
+    let lines: Vec<Line> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, cmd)| {
+            let selected = app.completion_selected == Some(i);
+            let style = if selected {
+                Style::default()
+                    .fg(theme::ACCENT_PURPLE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT)
+            };
+            let prefix = if selected { "› " } else { "  " };
+            Line::from(Span::styled(format!("{prefix}{cmd}"), style))
+        })
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(theme::SUBTLE)),
+        ),
+        popup,
+    );
+}
+
 fn render_help(frame: &mut Frame) {
     let area = centered_rect(52, 58, frame.area());
     frame.render_widget(Clear, area);
@@ -161,9 +233,17 @@ fn render_help(frame: &mut Frame) {
     };
     let help_text = vec![
         Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Keyboard",
+            Style::default().fg(theme::ACCENT_BLUE).add_modifier(Modifier::BOLD),
+        )]),
         Line::from(vec![
-            key("/exit"),
-            Span::styled("quit (submit with Enter)", Style::default().fg(theme::TEXT)),
+            key("Tab"),
+            Span::styled("cycle command completions", Style::default().fg(theme::TEXT)),
+        ]),
+        Line::from(vec![
+            key("Enter"),
+            Span::styled("submit prompt or command", Style::default().fg(theme::TEXT)),
         ]),
         Line::from(vec![
             key("F1"),
@@ -173,34 +253,43 @@ fn render_help(frame: &mut Frame) {
             key("Esc"),
             Span::styled("close help", Style::default().fg(theme::TEXT)),
         ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Commands",
+            Style::default().fg(theme::ACCENT_BLUE).add_modifier(Modifier::BOLD),
+        )]),
         Line::from(vec![
-            key("Enter"),
-            Span::styled("submit prompt, /batch <path>, or /exit", Style::default().fg(theme::TEXT)),
+            key("/batch"),
+            Span::styled("<path>  run batch JSONL/JSON file", Style::default().fg(theme::TEXT)),
         ]),
         Line::from(vec![
-            key("Backspace"),
-            Span::styled("delete character", Style::default().fg(theme::TEXT)),
+            key("/workers"),
+            Span::styled("N       set concurrent batch workers (1-5)", Style::default().fg(theme::TEXT)),
+        ]),
+        Line::from(vec![
+            key("/set-tavily-key"),
+            Span::styled("<key>  validate & save Tavily API key", Style::default().fg(theme::TEXT)),
+        ]),
+        Line::from(vec![
+            key("/set-openrouter-key"),
+            Span::styled("<key>  validate & save OpenRouter key", Style::default().fg(theme::TEXT)),
+        ]),
+        Line::from(vec![
+            key("/exit"),
+            Span::styled("quit", Style::default().fg(theme::TEXT)),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Batch file (/batch <path>):",
-            Style::default().fg(theme::ACCENT_BLUE),
+            "  Batch file format:",
+            Style::default().fg(theme::ACCENT_BLUE).add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
-            "  JSON array, or JSONL with one object per line. Each object:",
+            "  JSON array or JSONL with one object per line. Each object:",
             Style::default().fg(theme::MUTED),
         )]),
         Line::from(vec![Span::styled(
             r#"  {"id": <integer>, "prompt": "<research query>"}"#,
             Style::default().fg(theme::TEXT),
-        )]),
-        Line::from(vec![Span::styled(
-            "  Example array: [ {\"id\": 1, \"prompt\": \"…\"}, {\"id\": 2, \"prompt\": \"…\"} ]",
-            Style::default().fg(theme::MUTED),
-        )]),
-        Line::from(vec![Span::styled(
-            "  Activity panel: current stage + subtasks; status line keeps your last action.",
-            Style::default().fg(theme::MUTED),
         )]),
     ];
 
@@ -224,6 +313,12 @@ fn render_help(frame: &mut Frame) {
 }
 
 fn render_activity_panel(frame: &mut Frame, area: Rect, app: &App) {
+    // Multi-run concurrent mode: split into worker table + selected detail.
+    if app.dashboard.active_runs.len() > 1 {
+        render_multi_run_activity(frame, area, app);
+        return;
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
@@ -242,6 +337,149 @@ fn render_activity_panel(frame: &mut Frame, area: Rect, app: &App) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_multi_run_activity(frame: &mut Frame, area: Rect, app: &App) {
+    let runs = &app.dashboard.active_runs;
+    // Worker table: 1 header + 1 per worker + 1 batch progress + 2 borders = min ~6 rows.
+    let table_h = (runs.len() as u16 + 4).min(area.height.saturating_sub(6));
+    let detail_h = area.height.saturating_sub(table_h);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(table_h), Constraint::Min(detail_h)])
+        .split(area);
+
+    // ── Worker Table ─────────────────────────────────────────────────
+    let focus_worker = app.focus == crate::models::Focus::WorkerList;
+    let border_color = if focus_worker { theme::ACCENT_BLUE } else { theme::SUBTLE };
+    let table_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            " Workers ",
+            Style::default().fg(theme::ACCENT_BLUE).add_modifier(Modifier::BOLD),
+        ));
+    let _table_inner = table_block.inner(chunks[0]);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Header line.
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:<5} {:<30} {:<20} {:>7}", "Slot", "Query", "Stage", "Elapsed"),
+            Style::default().fg(theme::MUTED).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    for (i, run) in runs.iter().enumerate() {
+        let selected = i == app.selected_worker;
+        let prompt_label = truncate(&run.prompt, 28);
+        let stage = truncate(&run.stage, 18);
+        let elapsed = if run.elapsed_seconds >= 60 {
+            format!("{}m{}s", run.elapsed_seconds / 60, run.elapsed_seconds % 60)
+        } else {
+            format!("{}s", run.elapsed_seconds)
+        };
+        let prefix = if selected { "› " } else { "  " };
+        let style = if selected {
+            Style::default().fg(theme::ACCENT_BLUE).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}w{i:<3} {prompt_label:<30} {stage:<20} {elapsed:>7}"),
+            style,
+        )));
+    }
+
+    // Batch progress line.
+    if let Some(ref bp) = app.batch_progress {
+        let pct = if bp.total > 0 { (bp.completed * 100) / bp.total } else { 0 };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  Batch: {}/{} done  {} failed  ({}%)",
+                bp.completed, bp.total, bp.failed, pct
+            ),
+            Style::default().fg(theme::MUTED),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(table_block).wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+
+    // ── Selected Worker Detail ───────────────────────────────────────
+    let detail_run = runs.get(app.selected_worker).unwrap_or(&app.dashboard.active_run);
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(theme::SUBTLE))
+        .title(Span::styled(
+            format!(" Worker w{} Detail ", app.selected_worker),
+            Style::default().fg(theme::ACCENT_BLUE).add_modifier(Modifier::BOLD),
+        ));
+    let detail_inner = detail_block.inner(chunks[1]);
+    let body = build_single_run_detail(detail_run, app.ui_tick, detail_inner.height);
+    frame.render_widget(
+        Paragraph::new(body).block(detail_block).wrap(Wrap { trim: false }),
+        chunks[1],
+    );
+}
+
+/// Build activity lines for a single RunView (reused by multi-run detail panel).
+fn build_single_run_detail(run: &RunView, ui_tick: u32, inner_height: u16) -> Vec<Line<'static>> {
+    let mut stack: Vec<Line<'static>> = Vec::new();
+
+    // Stage progress.
+    for sp in &run.stage_progress {
+        let icon = status_icon(&sp.status, ui_tick);
+        let style = match sp.status.as_str() {
+            "completed" | "success" | "done" => Style::default().fg(theme::SUCCESS),
+            "running" => Style::default().fg(theme::WARN),
+            _ => Style::default().fg(theme::SUBTLE),
+        };
+        stack.push(Line::from(vec![
+            Span::styled(format!("  {icon} "), style.add_modifier(Modifier::BOLD)),
+            Span::styled(sp.label.clone(), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+
+    // Angles (if in research stage).
+    if !run.angles.is_empty() {
+        stack.push(Line::from(""));
+        for angle in &run.angles {
+            let icon = status_icon(&angle.status, ui_tick);
+            let style = match angle.status.as_str() {
+                "completed" | "success" | "done" => Style::default().fg(theme::SUCCESS),
+                "running" => Style::default().fg(theme::WARN),
+                _ => Style::default().fg(theme::SUBTLE),
+            };
+            stack.push(Line::from(vec![
+                Span::styled(format!("  {icon} "), style.add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(
+                        "{} [q:{} s:{}]",
+                        truncate(&angle.topic, 40),
+                        angle.queries_total,
+                        angle.context_ids_total,
+                    ),
+                    Style::default().fg(theme::TEXT),
+                ),
+            ]));
+        }
+    }
+
+    // Bottom-align: pad top with empty lines.
+    let content_h = stack.len() as u16;
+    if content_h < inner_height {
+        let pad = (inner_height - content_h) as usize;
+        let mut padded = vec![Line::from(""); pad];
+        padded.append(&mut stack);
+        stack = padded;
+    }
+    stack
 }
 
 fn build_activity_content(app: &App, inner_height: u16) -> Vec<Line<'static>> {
@@ -265,6 +503,7 @@ fn build_activity_content(app: &App, inner_height: u16) -> Vec<Line<'static>> {
         for block in ACTIVITY_STACK {
             append_activity_block(&mut stack, app, block, app.ui_tick);
         }
+        append_token_stats(&mut stack, app);
     } else {
         stack.push(Line::from(vec![Span::styled(
             "  Ready — submit a prompt below.",
@@ -586,12 +825,23 @@ fn append_write_details(out: &mut Vec<Line<'static>>, app: &App, run: &RunView, 
             for row in rows {
                 let row_st = row.status.as_str();
                 let (g, gs) = stage_glyph(row_st, tick);
-                let title = truncate(&row.title, 58);
-                out.push(Line::from(vec![
+                let has_substage = row_st == "running"
+                    && row.substage.as_ref().is_some_and(|s| !s.is_empty());
+                let title_width = if has_substage { 44 } else { 58 };
+                let title = truncate(&row.title, title_width);
+                let mut spans = vec![
                     Span::styled("      ", theme::SUBTLE),
                     Span::styled(g, gs),
                     Span::styled(title, Style::default().fg(theme::MUTED)),
-                ]));
+                ];
+                if has_substage {
+                    let tag = row.substage.as_deref().unwrap_or("");
+                    spans.push(Span::styled(
+                        format!("  {tag}"),
+                        Style::default().fg(theme::SUBTLE),
+                    ));
+                }
+                out.push(Line::from(spans));
             }
             return;
         }
@@ -607,6 +857,88 @@ fn append_write_details(out: &mut Vec<Line<'static>>, app: &App, run: &RunView, 
             format!("      Sections: {done}/{tot}"),
             Style::default().fg(theme::MUTED),
         )]));
+    }
+}
+
+fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn append_token_stats(out: &mut Vec<Line<'static>>, app: &App) {
+    let raw = match metric_value(app, "token_stats_json") {
+        Some(r) => r,
+        None => return,
+    };
+
+    #[derive(serde::Deserialize)]
+    struct ModelUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+        call_count: u64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TokenStats {
+        #[serde(default)]
+        models: std::collections::BTreeMap<String, ModelUsage>,
+        #[serde(default)]
+        total_input_tokens: u64,
+        #[serde(default)]
+        total_output_tokens: u64,
+        #[serde(default)]
+        total_llm_calls: u64,
+        #[serde(default)]
+        total_web_queries: u64,
+    }
+
+    let stats: TokenStats = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    // Only show if there's data
+    if stats.total_llm_calls == 0 && stats.total_web_queries == 0 {
+        return;
+    }
+
+    out.push(Line::from(""));
+    out.push(Line::from(vec![
+        Span::styled("  ─── ", Style::default().fg(theme::SUBTLE)),
+        Span::styled("Token Usage", Style::default().fg(theme::MUTED).add_modifier(Modifier::BOLD)),
+        Span::styled(" ───", Style::default().fg(theme::SUBTLE)),
+    ]));
+
+    // Summary line: total in/out + web queries
+    let summary = format!(
+        "  in: {}  out: {}  calls: {}  web: {}",
+        format_token_count(stats.total_input_tokens),
+        format_token_count(stats.total_output_tokens),
+        stats.total_llm_calls,
+        stats.total_web_queries,
+    );
+    out.push(Line::from(vec![
+        Span::styled(summary, Style::default().fg(theme::MUTED)),
+    ]));
+
+    // Per-model breakdown
+    for (name, usage) in &stats.models {
+        let short_name = name.rsplit('/').next().unwrap_or(name);
+        let line = format!(
+            "    {:<24} in: {:>7}  out: {:>7}  ×{}",
+            truncate(short_name, 24),
+            format_token_count(usage.input_tokens),
+            format_token_count(usage.output_tokens),
+            usage.call_count,
+        );
+        out.push(Line::from(vec![
+            Span::styled(line, Style::default().fg(theme::SUBTLE)),
+        ]));
     }
 }
 

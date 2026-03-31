@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use serde_json::Value as JsonValue;
@@ -39,4 +41,35 @@ pub fn normalize_event_level(status: &str) -> String {
         "info" | "success" | "completed" => "info".to_string(),
         _ => "debug".to_string(),
     }
+}
+
+/// Write or update a `KEY="value"` entry in `.env`. Creates the file if absent.
+/// Uses atomic rename for safety.
+pub fn write_env_key(key: &str, value: &str) -> Result<()> {
+    let env_path = PathBuf::from(".env");
+    let contents = fs::read_to_string(&env_path).unwrap_or_default();
+    let prefix = format!("{key}=");
+    let new_line = format!("{key}=\"{value}\"");
+
+    let mut found = false;
+    let mut lines: Vec<String> = contents
+        .lines()
+        .map(|line| {
+            if line.starts_with(&prefix) {
+                found = true;
+                new_line.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    if !found {
+        lines.push(new_line);
+    }
+
+    let tmp_path = env_path.with_extension("tmp");
+    fs::write(&tmp_path, lines.join("\n") + "\n")?;
+    fs::rename(&tmp_path, &env_path)?;
+    Ok(())
 }

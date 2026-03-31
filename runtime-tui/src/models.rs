@@ -17,6 +17,7 @@ pub const STAGE_ORDER: [&str; 9] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Input,
+    WorkerList,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -24,6 +25,9 @@ pub struct DashboardData {
     #[allow(dead_code)]
     pub queue: QueueView,
     pub active_run: RunView,
+    /// Multiple active runs when concurrent batch is in progress.
+    #[serde(default)]
+    pub active_runs: Vec<RunView>,
     #[allow(dead_code)]
     pub recent_events: Vec<EventEntry>,
 }
@@ -123,12 +127,17 @@ pub struct EventEntry {
 pub struct WriteSectionProgress {
     pub title: String,
     pub status: String,
+    /// Reasoning loop substage: "gathering", "drafting", "critiquing", "revising"
+    #[serde(default)]
+    pub substage: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct MockFileState {
     pub queue: QueueView,
     pub active_run: RunView,
+    #[serde(default)]
+    pub active_runs: Vec<RunView>,
     pub recent_events: Vec<EventEntry>,
     pub direct_query_draft: String,
     pub batch_json_draft: String,
@@ -138,6 +147,8 @@ pub struct MockFileState {
 pub struct QueueSnapshotWire {
     pub queued_job_ids: Vec<String>,
     pub active_job_id: Option<String>,
+    #[serde(default)]
+    pub active_job_ids: Vec<String>,
     pub completed_job_ids: Vec<String>,
     pub failed_job_ids: Vec<String>,
 }

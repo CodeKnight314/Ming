@@ -36,6 +36,7 @@ impl DataSource {
                     DashboardData {
                         queue: parsed.queue,
                         active_run: parsed.active_run,
+                        active_runs: parsed.active_runs,
                         recent_events: parsed.recent_events,
                     },
                     Some(parsed.direct_query_draft),
@@ -96,14 +97,14 @@ impl DataSource {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn submit_run_batch(&self, items: &[(String, String)]) -> Result<String> {
+    pub fn submit_run_batch(&self, items: &[(String, String)], max_concurrent: usize) -> Result<String> {
         if items.is_empty() {
             return Err(anyhow!("batch has no items"));
         }
+        let mode = if max_concurrent > 1 { "concurrent" } else { "sequential" };
         match self {
             Self::Mock { .. } => Ok(format!(
-                "Mock: would submit run_batch ({} items).",
+                "Mock: would submit run_batch ({} items, {mode}).",
                 items.len()
             )),
             Self::Live { client, namespace } => {
@@ -125,8 +126,9 @@ impl DataSource {
                         "user": "local"
                     },
                     "payload": {
-                        "mode": "sequential",
-                        "items": json_items
+                        "mode": mode,
+                        "items": json_items,
+                        "max_concurrent": max_concurrent
                     }
                 });
                 xadd_command(&mut con, namespace, &payload, &command_id)
@@ -315,6 +317,43 @@ pub fn load_live_dashboard(
     let active_run = load_active_run_view(con, namespace, active_job.as_ref(), preferred_run_id)?;
     let recent_events = load_recent_events(con, namespace, 24)?;
 
+    // Load all active runs for concurrent batch display.
+    let effective_active_ids: Vec<String> = if !queue_wire.active_job_ids.is_empty() {
+        queue_wire.active_job_ids.clone()
+    } else if let Some(ref id) = queue_wire.active_job_id {
+        vec![id.clone()]
+    } else {
+        vec![]
+    };
+    let mut active_runs: Vec<RunView> = Vec::new();
+    for job_id in &effective_active_ids {
+        if let Some(job_wire) = get_json::<JobSnapshotWire>(con, &format!("{namespace}:jobs:{job_id}"))? {
+            if let Some(run_id) = job_wire.run_id {
+                if let Some(run_wire) = get_json::<RunSnapshotWire>(con, &format!("{namespace}:runs:{run_id}"))? {
+                    let angles = load_angle_views(con, namespace, &run_wire.run_id)?;
+                    let stage_progress = derive_stage_progress(con, namespace, &run_wire, &angles)?;
+                    let elapsed_seconds = run_wire.metrics.get("elapsed_seconds")
+                        .and_then(JsonValue::as_f64).unwrap_or_default() as u64;
+                    let progress_ratio = stage_completion_ratio(&stage_progress);
+                    let metrics = run_wire.metrics.iter()
+                        .map(|(label, value)| MetricEntry { label: label.clone(), value: json_value_label(value) })
+                        .collect();
+                    active_runs.push(RunView {
+                        run_id: run_wire.run_id,
+                        prompt: run_wire.prompt,
+                        status: run_wire.status,
+                        stage: run_wire.stage.unwrap_or_else(|| "unknown".to_string()),
+                        elapsed_seconds,
+                        progress_ratio,
+                        stage_progress,
+                        angles,
+                        metrics,
+                    });
+                }
+            }
+        }
+    }
+
     Ok(DashboardData {
         queue: QueueView {
             all_queued_count: queue_wire.queued_job_ids.len(),
@@ -326,6 +365,7 @@ pub fn load_live_dashboard(
             failed,
         },
         active_run,
+        active_runs,
         recent_events,
     })
 }
